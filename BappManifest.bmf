@@ -1,0 +1,13 @@
+Uuid: ecaaff639a104efcb003e0d2dbb98ef3
+ExtensionType: 1
+Name: AI Scanner
+RepoName: ai-scanner
+ScreenVersion: 0.1.0
+SerialVersion: 1
+MinPlatformVersion: 2025.5
+ProOnly: True
+Author: Fernando Arnaboldi
+ShortDescription: "AI Scanner automatically tests websites from a blackbox perspective assisted by an LLM. It will try to cover as much surface as possible: crawling, authenticating, registering, following links, analyzing JavaScript, identyfing API specs, etc. The purpose is to drive the native Burp active scans to those endpoints/parameters to deterministacally assess a webapp."
+EntryPoint: target/ai-scanner-0.1.0.jar
+BuildCommand: mvn -B -DskipTests package
+SupportedProducts: Pro

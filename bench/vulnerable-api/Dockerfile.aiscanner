@@ -1,0 +1,21 @@
+FROM python:3.8.1-slim
+WORKDIR /usr/src/app
+COPY openapi ./openapi
+COPY vAPI.py .
+COPY vAPI.db .
+# Upgrade pip so it pulls prebuilt manylinux wheels (the shipped pip 20.0.2 can't parse
+# lxml's modern pyproject.toml). Pin connexion/flask/werkzeug to the 2.x line this code targets
+# (connexion.FlaskApp / app.add_api / connexion.request.body), matching the hosted Flask 2.2.5.
+# lxml pinned to 4.9.4 — it ships prebuilt cp38 manylinux/aarch64 wheels, so no source build (the
+# archived-buster slim image has no libxml2 dev headers). The app imports `from lxml import etree`.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+      "connexion[swagger-ui]==2.14.2" \
+      "flask==2.2.5" \
+      "werkzeug==2.2.3" \
+      "jsonschema==3.2.0" \
+      "swagger-ui-bundle==0.0.9" \
+      "lxml==4.9.4" \
+      pyjwt cryptography
+EXPOSE 8081
+CMD [ "python", "./vAPI.py", "-p", "8081" ]

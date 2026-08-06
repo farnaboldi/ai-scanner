@@ -1,0 +1,36 @@
+# BrokenCrystals (github.com/NeuraLegion/brokencrystals) — modern React + NestJS deliberately-vulnerable app.
+# Backend API + Swagger at http://localhost:3000 (spec: /swagger-json, 63 paths). Added to benchmark the
+# scanner's spec-driven discovery + deterministic probes against a realistic API. Deployed out-of-band (see
+# run.sh brokencrystals_up): built from source on a glibc base (node:18-slim) so the shipped libxmljs prebuilt
+# loads on Apple Silicon, run via compose.local.yml (HTTP mode, no TLS certs), db host-port remapped 5432->5433.
+#
+# Denominator = the vuln CLASSES BrokenCrystals documents that are IN SCOPE for our (black-box, server-side)
+# probes — the same families we already prove deterministically on vAPI/crAPI. Client-only/logic classes it also
+# has (prototype pollution, business-constraint bypass, CSRF, unvalidated redirect, LDAP/XPATH injection) are left
+# OUT: either not black-box-deterministic for us or no probe yet. "found" = results/brokencrystals.report.txt,
+# each class matched case-insensitive word-boundary substring (see run.sh score()).
+#
+#   class                              BrokenCrystals surface                         our probe/oracle
+#   --------------------------------   --------------------------------------------   --------------------------
+#   SQL injection                      /api/products/search, login                    blind boolean / Burp
+#   OS command injection               gRPC os.RunCommand (via /api or grpcweb)        time/marker / Burp
+#   XML External Entity                XML-accepting endpoints                          OOB Collaborator
+#   SSRF                               /api/file?path=&type= (metadata/file/http)      OOB Collaborator
+#   path traversal                     /api/file, LFI endpoints                         OS-file leak
+#   JWT                                /api/auth/* (alg confusion, jku, kid, x5u)       JWT analysis probe
+#   mass assignment                    user/product write endpoints                     BodyMutator boundary
+#   sensitive data exposure            excessive-data / secret-token endpoints          cleartext-secret oracle
+#   Broken Function Level Authorization admin/privileged functions                       3-way BFLA evidence
+#   template injection                 SSTI-evaluating endpoints                         {{7*7}}=>49 marker
+#   cross-site scripting               reflected params                                 Burp reflected XSS
+SQL injection
+OS command injection
+XML External Entity
+SSRF
+path traversal
+JWT
+mass assignment
+sensitive data exposure
+Broken Function Level Authorization
+template injection
+cross-site scripting

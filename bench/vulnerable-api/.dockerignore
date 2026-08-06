@@ -1,0 +1,6 @@
+.idea
+.vagrant
+.vscode
+.mypy_cache
+venv/
+vAPI.log

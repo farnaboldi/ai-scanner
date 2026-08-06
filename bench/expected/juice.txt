@@ -1,0 +1,46 @@
+# Juice Shop — automatable expected findings (denominator). Matched vs GET /api/Challenges solved.
+API-only XSS
+Access Log
+Admin Registration
+Admin Section
+Allowlist Bypass
+Christmas Special
+Confidential Document
+Database Schema
+Deluxe Fraud
+Easter Egg
+Empty User Registration
+Ephemeral Accountant
+Error Handling
+Exposed Metrics
+Exposed credentials
+Five-Star Feedback
+Forged Feedback
+Forged Review
+Forgotten Developer Backup
+Forgotten Sales Backup
+HTTP-Header XSS
+Login Admin
+Login Bender
+Login Jim
+Manipulate Basket
+Misplaced Signature File
+NoSQL DoS
+NoSQL Exfiltration
+NoSQL Manipulation
+Outdated Allowlist
+Password Hash Leak
+Payback Time
+Poison Null Byte
+Product Tampering
+Reflected XSS
+Repetitive Registration
+Security Policy
+Server-side XSS Protection
+Upload Size
+Upload Type
+User Credentials
+View Basket
+XXE Data Access
+XXE DoS
+Zero Stars

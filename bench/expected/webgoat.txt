@@ -1,0 +1,25 @@
+# WebGoat — reachable lesson classes (denominator). Matched (case-insensitive substring)
+# against COMPLETE lessons from GET /WebGoat/service/lessonmenu.mvc after a scan.
+SQL Injection
+Cross Site Scripting
+Path traversal
+Insecure Direct Object
+Missing Function Level Access Control
+XXE
+Server-Side Request Forgery
+JWT
+Insecure Deserialization
+Auth Bypass
+Vulnerable Components
+Spoof
+Password reset
+HTML tampering
+Bypass Restrictions
+Secure Passwords
+Client side filtering
+Security Misconfiguration
+Insecure Login
+Logging Security
+Session
+Cross-Site Request Forgery
+Crypto

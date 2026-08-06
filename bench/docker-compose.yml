@@ -1,0 +1,56 @@
+# AI Scanner benchmark targets. Bring up with:  docker compose -f bench/docker-compose.yml up -d
+# Each is an intentionally-vulnerable app used to measure automated-pentest coverage.
+services:
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: aiscanner-juice
+    ports: ["3000:3000"]
+    restart: unless-stopped
+
+  webgoat:
+    image: webgoat/webgoat:v2025.3        # pin a version; :latest is stale
+    container_name: aiscanner-webgoat
+    environment: [ "TZ=UTC" ]             # JWT lessons validate against container time
+    ports: ["8090:8080", "9090:9090"]    # 8080=/WebGoat  9090=/WebWolf (OOB)
+    restart: unless-stopped
+
+  # DVWA — native multi-arch image + a SEPARATE MariaDB. Replaces the deprecated amd64-only
+  # `vulnerables/web-dvwa` all-in-one image, which ran under qemu emulation on arm64 and dropped its
+  # bundled MySQL under active-scan load (non-deterministic 000/302/404, session drops). ghcr.io/digininja
+  # /dvwa publishes linux/arm64 natively, and splitting the DB out keeps it from being CPU/IO-starved by the
+  # web tier during a scan. Bonus: this image HAS the Open HTTP Redirect module the old one lacked.
+  # Needs a one-time DB create via setup.php — bench/run.sh dvwa_setup does it (login → create_db → login).
+  dvwa:
+    image: ghcr.io/digininja/dvwa:latest
+    container_name: aiscanner-dvwa
+    environment: [ "DB_SERVER=dvwa-db" ]
+    depends_on: [ dvwa-db ]
+    ports: ["4280:80"]
+    restart: unless-stopped
+
+  dvwa-db:
+    image: mariadb:10                     # native arm64; DVWA's default config expects dvwa/p@ssw0rd/dvwa
+    container_name: aiscanner-dvwa-db
+    environment:
+      MYSQL_ROOT_PASSWORD: dvwa
+      MYSQL_DATABASE: dvwa
+      MYSQL_USER: dvwa
+      MYSQL_PASSWORD: p@ssw0rd
+    volumes: [ "aiscanner-dvwa-db:/var/lib/mysql" ]
+    restart: unless-stopped
+
+  # jorritfolmer/vulnerable-api (Python/Flask/SQLite REST API) — the target xalgorix benchmarked at
+  # pentest-ground.com:9000. Built from ./vulnerable-api (patched Dockerfile.aiscanner: pip/lxml pinned for
+  # the archived-buster base). We add the hosted variant's /eval (Python RCE) and /search (blind XXE)
+  # endpoints so the local target reproduces the full 9-finding surface of the pentest-ground instance.
+  vapi:
+    build:
+      context: ./vulnerable-api
+      dockerfile: Dockerfile.aiscanner
+    image: aiscanner-vapi:local        # image refs must be lowercase
+    container_name: aiscanner-vAPI
+    ports: ["9000:8081"]
+    restart: unless-stopped
+
+volumes:
+  aiscanner-dvwa-db:

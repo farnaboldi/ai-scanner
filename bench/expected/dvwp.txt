@@ -1,0 +1,27 @@
+# Damn Vulnerable WordPress (github.com/vavkamil/dvwp) — WordPress + 4 activated vulnerable plugins on :31337.
+# Deployed out-of-band (see run.sh dvwp_up): built under linux/amd64 EMULATION because mysql:5.7 (and the old
+# wordpress:cli image) have no arm64 manifest; WordPress is installed + plugins activated via `wp-cli install-wp`.
+#
+# HONEST CAVEAT (this is the point of the target): DVWP's flaws are PLUGIN-CVE-specific — a known vuln in a
+# specific plugin version reachable at one endpoint with one payload. That is WPScan's domain (fingerprint the
+# plugin version, look up the CVE, fire the known exploit). Our scanner is a GENERIC BEHAVIORAL engine — it has no
+# WordPress/plugin CVE database; it can only catch a flaw if it CRAWLS to the plugin endpoint AND the flaw is
+# black-box-triggerable (SQLi/SSRF/traversal/access-control). So this target measures how much of the WP plugin
+# surface our behavioral probes actually reach — a low score here is expected and honest, not a bug. "found" =
+# results/dvwp.report.txt, matched case-insensitive word-boundary substring.
+#
+#   activated plugin                        WPVDB / CVE            behavioral class we could hit
+#   -------------------------------------   -------------------   ------------------------------
+#   InfiniteWP Client < 1.9.4.5             CVE-2020-8772          unauthenticated access / auth bypass
+#   WordPress File Upload < 4.13.0          CVE-2020-10564         path traversal (dir traversal to RCE)
+#   WP Advanced Search < 3.3.4              (no CVE)               SQL injection (unauth DB access)
+#   Social Warfare <= 3.5.2                 CVE-2019-9978          SSRF (swp_url fetch) / arbitrary settings
+#
+# Plus WordPress-core behavioural surface a generic scanner commonly trips: user/author enumeration, xmlrpc,
+# reflected XSS, exposed sensitive data — kept in the denominator since our probes CAN reach them.
+SQL injection
+path traversal
+SSRF
+unauthenticated access
+cross-site scripting
+sensitive data exposure
