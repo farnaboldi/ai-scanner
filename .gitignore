@@ -1,6 +1,7 @@
 ### Build output: ship only the prebuilt extension jar, ignore the rest of target/
 /target/*
 !/target/ai-scanner-0.1.0.jar
+!/target/README.md
 
 ### IDE
 .idea/
