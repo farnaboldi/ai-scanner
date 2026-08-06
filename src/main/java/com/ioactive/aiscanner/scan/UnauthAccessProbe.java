@@ -74,11 +74,14 @@ public final class UnauthAccessProbe {
                 String bt = baseBody.trim();
                 if (bt.length() < 40 || bt.toLowerCase().contains("\"error\"")) continue;
                 if (!bt.startsWith("{") && !bt.startsWith("[")) continue;                   // JSON data endpoint
-                // "authed==unauthed" alone does NOT mean broken access control — most APIs have legitimately
-                // PUBLIC endpoints (product catalog, languages, captcha, search) that return the same data to
-                // everyone. Only treat it as a protected-data exposure when the response actually carries
-                // PII/secret DATA (email, token, secret, card, address, …) — that is what should require auth.
-                if (!carriesSensitiveData(bt)) continue;
+                // CRITICAL: our scanner attaches the session credential to EVERY request, so "carried a
+                // credential" no longer proves the endpoint is private, and authed==anon==identical actually
+                // proves the endpoint is PUBLIC (the credential was irrelevant). So we do NOT claim generic
+                // "broken access control" here. We fire ONLY when the anonymous response leaks an actual SECRET
+                // VALUE (token/key/password-hash/2FA-secret/JWT with real entropy) — a genuine data exposure to
+                // the public. Field NAMES and plain emails are NOT enough (public reviews/feedback/catalog carry
+                // those) — that heuristic caused a false-positive flood; requiring a secret VALUE is zero-FP.
+                if (!carriesSecretValue(bt)) continue;
                 if (!tried.add(method + " " + stripQuery(url))) continue;
 
                 // re-send the SAME request WITHOUT any credential
@@ -89,11 +92,12 @@ public final class UnauthAccessProbe {
                 int anonSt = ar.response().statusCode();
                 if (anonSt < 200 || anonSt >= 300) continue;                                // properly denied → correct
                 if (shape(rr).equals(shape(ar))) {
-                    scanLog.found("Unauthenticated access to a protected endpoint", url,
-                            method + " returned PII/secret DATA with NO credential (authed=" + baseSt
-                                    + ", no-auth=" + anonSt + ", identical response shape; response carries "
-                                    + "sensitive fields such as email/token/secret). Sensitive data served to the "
-                                    + "anonymous public — broken access control / data exposure.", ar);
+                    scanLog.found("Secret value served to an unauthenticated caller", url,
+                            method + " returned a SECRET VALUE (token/key/password-hash/2FA-secret/JWT) with NO "
+                                    + "credential (authed=" + baseSt + ", no-auth=" + anonSt + ", identical response "
+                                    + "shape) — a secret is exposed to the anonymous public (sensitive-data exposure, "
+                                    + "CWE-200/CWE-312). Deterministic: a high-entropy secret value present in the "
+                                    + "credential-less response.", ar);
                     scanLog.incFinding();
                     hits++;
                 }
@@ -104,18 +108,35 @@ public final class UnauthAccessProbe {
         return hits;
     }
 
-    // A response carries protected DATA (should require auth) if it has a PII/secret field name or an
-    // email-format value. Public catalog/game data (product name/price/image, language, captcha, challenge
-    // text) has none of these, so it is NOT flagged — killing the "every public endpoint" false-positive flood.
-    private static final Pattern SENSITIVE_KEY = Pattern.compile(
-            "(?i)\"(e-?mail|password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|secret|api[_-]?key|apikey"
-            + "|ssn|social[_-]?security|credit[_-]?card|card[_-]?number|cardnumber|cvv|iban|account[_-]?number"
-            + "|phone|mobile|street|address|postal|zipcode|passport|salary|totp|otp[_-]?secret)\"\\s*:");
-    private static final Pattern EMAIL_VALUE = Pattern.compile("[A-Za-z0-9._%+*-]{1,64}@[A-Za-z0-9.-]{2,}\\.[A-Za-z]{2,}");
+    // Fire ONLY on an actual SECRET VALUE in the response: a secret-named field whose value is long and
+    // high-entropy (token/api-key/password-hash/2FA-secret), or a JWT. Field names or plain email addresses
+    // are deliberately NOT triggers — public reviews/feedback/catalog legitimately contain those, and using
+    // them caused a false-positive flood. Requiring a real secret value keeps genuine exposures and is zero-FP.
+    private static final Pattern SECRET_VALUE = Pattern.compile(
+            "(?i)\"(password|passwd|pwd|token|access[_-]?token|refresh[_-]?token|secret|client[_-]?secret"
+            + "|api[_-]?key|apikey|totp|otp[_-]?secret|private[_-]?key|session[_-]?id)\"\\s*:\\s*\"([^\"]{16,})\"");
+    private static final Pattern JWT_VALUE = Pattern.compile("eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}");
 
-    private static boolean carriesSensitiveData(String body) {
+    private static boolean carriesSecretValue(String body) {
         if (body == null) return false;
-        return SENSITIVE_KEY.matcher(body).find() || EMAIL_VALUE.matcher(body).find();
+        java.util.regex.Matcher m = SECRET_VALUE.matcher(body);
+        while (m.find()) {
+            if (looksHighEntropy(m.group(2))) return true;
+        }
+        return JWT_VALUE.matcher(body).find();
+    }
+
+    // A genuine secret value: >= 16 chars AND either long hex, or mixed letters+digits with no spaces
+    // (rejects human-readable sentences / placeholder text that happens to sit in a secret-named field).
+    private static boolean looksHighEntropy(String v) {
+        if (v == null || v.length() < 16) return false;
+        if (v.matches("[0-9a-fA-F]{16,}")) return true;
+        boolean d = false, a = false;
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (Character.isDigit(c)) d = true; else if (Character.isLetter(c)) a = true;
+        }
+        return d && a && !v.contains(" ");
     }
 
     /** status + sorted top-level JSON keys (value/order-insensitive), or a path-stripped token signature for

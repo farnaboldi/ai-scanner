@@ -132,6 +132,7 @@ public final class LlmFuzzProbe {
         scanLog.log("[AI Scanner] llm-fuzz: confirmed LLM endpoint " + label + " — firing "
                 + LlmFuzzPayloads.all().size() + " payload(s).");
         String baselineReply = baseText != null ? baseText : "";
+        String baselineRaw = base != null && base.rawBody() != null ? base.rawBody() : "";  // differentiates input-triggered errors from a chronically-erroring endpoint
 
         String canary = "AISC-" + Long.toHexString(System.nanoTime()).toUpperCase();
         // Burp Collaborator for OOB (SSRF / code-exec / RAG-fetch) — deterministic callback proof. Guarded: if
@@ -158,13 +159,17 @@ public final class LlmFuzzProbe {
             String raw = r.rawBody() == null ? "" : r.rawBody();
 
             // ---- HARD tier (deterministic) ----
-            // 1) server error / exception leaked (5xx, or an error signature in the raw response).
-            if (r.status() >= 500 || ERROR_MARKER.matcher(raw).find()) {
-                if (raise("LLM endpoint: server error triggered by " + pl.cls().name().toLowerCase() + " input",
-                        url, "Adversarial " + pl.cls() + " payload (" + pl.id() + ": " + pl.rationale() + ") caused "
-                      + (r.status() >= 500 ? "HTTP " + r.status() : "a server error/stack trace in the reply")
-                      + " — unhandled input reaches a server-side layer (CWE-20/CWE-388). Payload effect is "
-                      + "deterministic (not an LLM opinion).", r.rr())) hits++;
+            // 1) server error / exception SIGNATURE leaked in the reply that is NOT present in the benign
+            // baseline. A bare 5xx status is deliberately NOT a finding: LLM backends 5xx for many benign
+            // reasons (model/tool-integration errors), so a status-only signal floods false positives on a
+            // chronically-erroring endpoint. We require a leaked error SIGNATURE (stack trace / error class)
+            // that the baseline does NOT have — an input-triggered information disclosure (differential).
+            if (ERROR_MARKER.matcher(raw).find() && !ERROR_MARKER.matcher(baselineRaw).find()) {
+                if (raise("LLM endpoint: server error/stack trace disclosed on " + pl.cls().name().toLowerCase() + " input",
+                        url, "Adversarial " + pl.cls() + " payload (" + pl.id() + ": " + pl.rationale() + ") caused a server "
+                      + "error signature / stack trace in the reply (status " + r.status() + ") that is absent from the "
+                      + "benign baseline — unhandled input reaches a server-side layer and leaks internals (CWE-209/CWE-388). "
+                      + "Deterministic differential (baseline clean, payload leaks).", r.rr())) hits++;
                 continue;
             }
             // 2) canary-gated prompt-injection disclosure (injection payloads only).
