@@ -1,0 +1,35 @@
+# AI-PT-Lab (github.com/anpa1200/AI-PT-Lab) — OWASP LLM Top-10 (2025) agent lab. FastAPI backend :8000 (the LLM
+# endpoint /scenarios/{name}/run, JSON {scenario, input} -> model reply), UI :3000. Added to benchmark the LLM
+# probes (AgentFlowProbe + LlmFuzzProbe). Deploy out-of-band with its model pointed at the LOCAL OpenAI-compatible
+# LLM (the local LLM) — see run.sh. No scoreboard used here: "found" = the scanner's exported report (results/aiptlab.report.txt),
+# each LLM-vuln CLASS below matched (case-insensitive, word-boundary substring) against it.
+#
+# REACHABILITY CAVEAT (this is the point of the benchmark): the LLM endpoint requires a `scenario` field beside
+# the free-text `input`. Our LlmEndpointDetector keys on a prompt-like field (`input`) + a model-reply response,
+# so it should DETECT it — but whether the generic driver supplies a valid `scenario` (and reaches each vuln) is
+# exactly what this target measures. A 0 here means "generic LLM-endpoint driving needs the {scenario,input} shape".
+#
+#   class (below)             OWASP LLM id   our detector/oracle                       hard/soft
+#   -----------------------   ------------   ---------------------------------------   ---------
+#   prompt injection          LLM01          LlmFuzzPayloads INJECTION + canary hard    hard
+#   system prompt leakage      LLM07 (2025)  canary + SYS_MARKER disclosure gate        hard
+#   RAG injection              LLM01 indir.   LlmFuzzPayloads RAG (rag-*)                soft
+#   excessive agency           LLM06          agent tool-abuse / cross-tool             soft
+#   data exfiltration          LLM02-ish      judge: leak verdict (verbatim-evidence)   soft
+#   tool output injection      LLM05          judge: anomaly/leak                        soft
+#   weak output validation     LLM05          judge: anomaly (unicode/structural)        soft
+#   memory poisoning           LLM08-ish      (stateful; no probe yet)                   none
+#   supply chain compromise    LLM03          (out of scanner scope)                     none
+#
+# Denominator = the LLM classes AI-PT-Lab exposes; score = how many our report names. Naming gaps lower it
+# honestly — the soft-tier logs as "LLM-suspected: <verdict> via <class>" and the hard tier as
+# "LLM prompt injection: system-prompt/tool disclosure", so those substrings are what count.
+prompt injection
+system prompt
+RAG
+excessive agency
+data exfiltration
+tool output injection
+weak output validation
+memory poisoning
+supply chain

@@ -1,0 +1,38 @@
+# crAPI (OWASP "Completely Ridiculous API") — API-first target (React SPA + microservices; JWT auth).
+# 18 documented challenges (+3 secret) mapped to the OWASP API Security Top 10. crAPI has NO scoreboard
+# API (unlike Juice /api/Challenges or WebGoat lessonmenu), so — like DVWA — "found" = the scanner's own
+# exported findings report (bench/results/crapi.report.txt); each vuln-CLASS id below is matched
+# (case-insensitive substring) against the report lines.
+#
+# Denominator = the OWASP-API-Top-10 vuln CLASSES crAPI exposes that an automated base-URL scanner could
+# PLAUSIBLY reach (source-grounded: every entry has a confirmed vulnerable endpoint in the crAPI source).
+# Listed as DISTINCT classes (not per-challenge) because the scorer is substring-based; per-challenge
+# mapping + source evidence is in the comments so one finding can't over-count.
+#
+#   class (below)            crAPI challenge(s)                       shipped-probe coverage
+#   ---------------------    -------------------------------------    ------------------------------------
+#   SQL injection            C13 POST /workshop/api/shop/apply_coupon yes  — BlindSqliProbe (string-concat SQL)
+#   NoSQL injection          C12 POST /community .../validate-coupon  yes  — NoSqlProbe ($ne/$regex on coupon_code)
+#   mass assignment          C8  PUT  /workshop/api/shop/orders/{id}  yes  — BodyMutatorProbe (negative quantity)
+#                            C9  POST /workshop/api/shop/orders       yes  — BodyMutatorProbe (negative quantity)
+#                            C10 PUT  /identity/.../videos/{id}       no   — arbitrary internal string field (needs domain-aware mutation)
+#   IDOR                     C1  GET  /identity/.../vehicle/{uuid}/.. partial — UUID id, needs cross-endpoint correlation (UUID-IDOR probe)
+#                            C2  GET  /workshop/.../mechanic_report   partial — numeric ?report_id, needs query-param IDOR probe
+#   Excessive Data Exposure  C4  GET  /identity/api/v2/user/dashboard no   — JWT sub-claim tamper (JwtClaimTamperProbe)
+#                            C5  GET  /identity/.../videos/{id}       no   — internal conversion_params field (schema-aware oracle)
+#   BFLA                     C7  DELETE /identity/api/v2/admin/videos no   — method-level authz on DELETE (DeleteBflaProbe)
+#   Unauthenticated Access   C14 GET  /workshop/.../receive_report    no   — re-test endpoint with creds stripped (UnauthAccessProbe)
+#   JWT                      C15 alg-confusion / unsigned / kid / jku no   — forge/tamper JWT (JwtAlgorithmConfusionProbe)
+#
+# NON-GOALS (excluded from the denominator — documented in TODO §8): C3 OTP brute-force (known victim +
+# 10k-value exhaustion), C6 rate-limiting / L7 DoS (we do not DoS), C11 SSRF (in-band oracle needs an
+# OOB/canary host reachable from the server), C16/C17/C18 LLM chatbot prompt-injection (needs the LLM
+# chatbot + non-deterministic to oracle), + 3 undisclosed secret challenges.
+SQL injection
+NoSQL injection
+mass assignment
+IDOR
+Excessive Data Exposure
+BFLA
+Unauthenticated Access
+JWT

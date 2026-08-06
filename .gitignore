@@ -1,0 +1,19 @@
+### Build output: ship only the prebuilt extension jar, ignore the rest of target/
+/target/*
+!/target/ai-scanner-0.1.0.jar
+
+### IDE
+.idea/
+*.iml
+
+### OS
+.DS_Store
+browser/node_modules/
+browser/package-lock.json
+
+### Real-target scan outputs — never commit (may contain internal hosts/findings)
+bench/results/
+
+### Editor swap files + generated benchmark report
+*.swp
+bench/report.md

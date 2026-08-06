@@ -1,0 +1,9 @@
+connexion
+coverage
+cryptography
+Flask-Testing
+jsonschema==3.2.0
+lxml
+openapi-spec-validator
+prance
+PyJWT
