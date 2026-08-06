@@ -194,6 +194,7 @@ exec "$JAVA" \
   "-Daiscanner.discoveryOnly=${AISCANNER_DISCOVERY_ONLY:-false}" \
   "-Daiscanner.verbose=${AISCANNER_VERBOSE:-false}" \
   "-Daiscanner.wafEvasion=${AISCANNER_WAF_EVASION:-false}" \
+  "-Daiscanner.exitOnComplete=${AISCANNER_EXIT_ON_COMPLETE:-false}" \
   ${API_KEY:+-Daiscanner.apiKey="${API_KEY}"} \
   ${LOGIN_EMAIL:+-Daiscanner.loginEmail="${LOGIN_EMAIL}"} \
   ${LOGIN_PASS:+-Daiscanner.loginPassword="${LOGIN_PASS}"} \

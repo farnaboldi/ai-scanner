@@ -3,6 +3,7 @@ package com.ioactive.aiscanner.scan;
 import burp.api.montoya.scanner.audit.AuditIssueHandler;
 import burp.api.montoya.scanner.audit.issues.AuditIssue;
 import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
+import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 /**
@@ -34,14 +35,19 @@ public final class AiTriage implements AuditIssueHandler {
             // they are already logged + counted at their source, so don't double-handle them here. This
             // handler exists for Burp-NATIVE issues.
             if (issue.name() != null && issue.name().startsWith("AI:")) return;
-            if (!seen.add(issue.severity() + "|" + issue.name() + "|" + issue.baseUrl())) return;   // once per unique issue
             String line = format(issue);
-            if (issue.severity() == AuditIssueSeverity.INFORMATION) {
-                scanLog.log("[AI Scanner]  ·  " + line);        // INFO → always shown, lesser marker, not counted
-            } else {
-                scanLog.log("[AI Scanner] >>> " + line);            // real vuln → prominent
-                scanLog.incFinding();                          // counts toward the panel's Findings tally
+            // Zero-FP discipline: only FIRM/CERTAIN native issues become COUNTED findings in the report.
+            // INFORMATION and TENTATIVE (Burp's own low-confidence guesses) are shown for the analyst with a
+            // lesser marker but NOT counted and NOT written to the findings report — and NOT marked seen, so a
+            // later confidence upgrade (TENTATIVE→FIRM) can still be reported as a real finding.
+            if (issue.severity() == AuditIssueSeverity.INFORMATION
+                    || issue.confidence() == AuditIssueConfidence.TENTATIVE) {
+                scanLog.log("[AI Scanner]  ·  " + line);
+                return;
             }
+            if (!seen.add(issue.severity() + "|" + issue.name() + "|" + issue.baseUrl())) return;   // once per unique issue
+            scanLog.log("[AI Scanner] >>> " + line);            // real vuln → prominent + counted + in report
+            scanLog.incFinding();
         } catch (Throwable t) {
             // best-effort; never disrupt Burp's issue flow
         }
