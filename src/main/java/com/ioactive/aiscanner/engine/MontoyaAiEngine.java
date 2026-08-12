@@ -26,14 +26,7 @@ public final class MontoyaAiEngine extends PromptAiEngine {
     // token/credit field, so we ESTIMATE tokens from text length ~ chars/4 and keep a running JVM-session tally.
     // One scan == one JVM launch here (exitOnComplete quits Burp), so the session total == the per-scan total). ----
     private static final AtomicLong CALLS = new AtomicLong();
-    private static final AtomicLong IN_TOKENS = new AtomicLong();
-    private static final AtomicLong OUT_TOKENS = new AtomicLong();
-    /** Rough token estimate (~4 chars/token) — good enough to track credit burn and project scans-per-budget. */
-    static long estTokens(String s) { return (s == null || s.isEmpty()) ? 0L : Math.max(1L, (s.length() + 3L) / 4L); }
-    public static long totalCalls() { return CALLS.get(); }
-    public static long totalInTokens() { return IN_TOKENS.get(); }
-    public static long totalOutTokens() { return OUT_TOKENS.get(); }
-    public static long totalTokens() { return IN_TOKENS.get() + OUT_TOKENS.get(); }
+    public static long totalCalls() { return CALLS.get(); }   // EXACT call count — the only billing signal we trust
 
     // ---- Burp AI credit balance (Montoya exposes NO API for it; Burp caches it in WorkspaceConfig.json,
     // refreshed on sync/exit). We snapshot it on the FIRST AI call (true pre-scan balance, before it bills)
@@ -41,6 +34,18 @@ public final class MontoyaAiEngine extends PromptAiEngine {
     private static volatile String scanStartCredits = null;
     private static final AtomicBoolean CREDIT_START_LOGGED = new AtomicBoolean(false);
     public static String scanStartCredits() { return scanStartCredits; }
+    /** Snapshot the REAL Burp AI balance at SCAN START (before any prompt bills), so the log shows the true
+     *  pre-scan balance up front and end-of-scan "spent" is start−end. Idempotent within a run: the first call
+     *  (run start) wins over the later first-AI-call snapshot. Returns the balance string, or null if unreadable. */
+    public static String noteScanStart() {
+        String b = readCreditBalance();
+        // Run start is the AUTHORITATIVE pre-scan balance: overwrite any stale value from a PREVIOUS scan in this
+        // same JVM/GUI session (the snapshot is static), and mark it claimed so the later first-AI-call path
+        // (line ~132) does NOT replace it with a mid-scan reading. This makes end-of-scan "spent" = start−end
+        // correct PER scan even when several scans run back-to-back (e.g. #3 DAST then #4 DAST+SAST).
+        if (b != null) { scanStartCredits = b; CREDIT_START_LOGGED.set(true); }
+        return b;
+    }
     /** Best-effort read of Burp's cached AI credit balance. Returns null if unavailable. */
     public static String readCreditBalance() {
         try {
@@ -86,6 +91,10 @@ public final class MontoyaAiEngine extends PromptAiEngine {
     }
 
     @Override public String name() { return "Burp AI (built-in)"; }
+
+    @Override public String paramSummary() {
+        return "Burp AI (built-in) temperature=" + clampTemp(cfg.temperature) + " maxTokens=" + cfg.maxTokens;
+    }
 
     @Override
     public boolean isConfigured() {
@@ -135,19 +144,16 @@ public final class MontoyaAiEngine extends PromptAiEngine {
         // connection doesn't silently drop a call (and waste the intent). Non-transient errors fail fast.
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
-                PromptResponse resp = api.ai().prompt().execute(opts, msgs);
+                long t0 = System.currentTimeMillis();
+                PromptResponse resp;
+                try { resp = api.ai().prompt().execute(opts, msgs); }
+                finally { LlmTiming.record(System.currentTimeMillis() - t0); }   // benchmark speed column
                 String content = resp == null || resp.content() == null ? "" : resp.content().trim();
-                // Credit-watch: estimate this call's token cost and log a running session tally so the PAID Burp
-                // AI burn is always visible in the log (local logging is free; Burp calls cost credits).
-                long pin = estTokens(systemPrompt) + estTokens(userPrompt);
-                long pout = estTokens(content);
+                // Count CALLS only (exact). No token estimate — chars/4 was unreliable and we don't display it.
                 long n = CALLS.incrementAndGet();
-                long tin = IN_TOKENS.addAndGet(pin);
-                long tout = OUT_TOKENS.addAndGet(pout);
-                logger.accept(String.format(
-                        "[AI Scanner] Burp AI $$ call #%d: ~%d in + ~%d out = ~%d tok | session: %d calls, ~%d tok (~%d in / ~%d out)",
-                        n, pin, pout, pin + pout, n, tin + tout, tin, tout));
-                if (cfg.verbose) {
+                if (LogLevel.debug()) logger.accept("[AI Scanner] Burp AI call #" + String.format("%03d", n)
+                        + " (session: " + n + " call(s))");
+                if (LogLevel.trace()) {
                     String c = content.replaceAll("\\s+", " ").trim();
                     if (c.length() > 160) c = c.substring(0, 160) + "…";
                     logger.accept("[AI Scanner] Burp AI ← " + c);
@@ -155,6 +161,20 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                 return content;
             } catch (Throwable e) {   // PromptException is a RuntimeException — cover it and any transport error
                 setLastError(e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+                // VERBOSE: dump the COMPLETE error (exception type + message + full cause chain + stack trace) so a
+                // 500 / provider fault can be diagnosed. This is everything obtainable — Montoya's api.ai() does NOT
+                // surface the provider's raw HTTP response body, so the exception chain is the deepest signal we get.
+                if (LogLevel.debug()) {
+                    StringBuilder causes = new StringBuilder();
+                    for (Throwable c = e.getCause(); c != null; c = c.getCause())
+                        causes.append("\n    caused by: ").append(c.getClass().getName())
+                              .append(c.getMessage() == null ? "" : ": " + c.getMessage());
+                    java.io.StringWriter sw = new java.io.StringWriter();
+                    e.printStackTrace(new java.io.PrintWriter(sw));
+                    logger.accept("[AI Scanner] Burp AI call FULL ERROR (debug) on attempt " + attempt + "/" + MAX_ATTEMPTS
+                            + ": " + e.getClass().getName() + (e.getMessage() == null ? "" : ": " + e.getMessage())
+                            + causes + "\n" + sw);
+                }
                 String m = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
                 // CREDIT EXHAUSTION — the paid balance is gone: stop, don't retry (a retry can't refill it).
                 // Detected by the error signature, OR corroborated by a cached balance that reads 0 on this failure.
@@ -166,7 +186,7 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                         logger.accept("[AI Scanner] *** BURP AI CREDITS EXHAUSTED *** — " + lastError()
                                 + ". Credits at scan start: " + (scanStartCredits == null ? "?" : scanStartCredits)
                                 + (bal == null ? "" : " -> now: " + bal) + ". Burp AI spend this session: " + CALLS.get()
-                                + " call(s), ~" + (IN_TOKENS.get() + OUT_TOKENS.get()) + " tok. Further AI calls are "
+                                + " call(s). Further AI calls are "
                                 + "skipped" + (degrade
                                     ? "; deterministic probes/auth/native audit CONTINUE (haltOnCreditExhaustion=false)."
                                     : "; the scan will STOP at the next checkpoint. Set -Daiscanner.haltOnCreditExhaustion=false "

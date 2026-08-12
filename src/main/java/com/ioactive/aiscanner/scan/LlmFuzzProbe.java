@@ -289,7 +289,7 @@ public final class LlmFuzzProbe {
             HttpRequest req = template.withBody(body);
             if (!req.hasHeader("Content-Type")) req = req.withHeader("Content-Type", "application/json");
             req = withSession.apply(req);
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions());
+            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
             String raw = rr != null && rr.response() != null ? rr.response().bodyToString() : "";
             int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);

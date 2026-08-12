@@ -11,7 +11,10 @@ public final class EngineConfig {
         /** Burp's built-in AI ({@code api.ai()}) — App-Store preferred; uses the user's own Burp AI. */
         BURP_AI,
         /** A user-run OpenAI-compatible server (vLLM / llama.cpp / Ollama / LM Studio / OpenAI). */
-        LOCAL_LLM
+        LOCAL_LLM,
+        /** Deterministic-only: NO LLM at all — auth + probes + native audit run, LLM discovery/triage skipped.
+         *  The benchmark "no-ai" baseline, and a live A/B toggle vs the LLM providers. getEngine() returns null. */
+        NO_AI
     }
 
     public final Provider provider;
@@ -22,10 +25,11 @@ public final class EngineConfig {
     public final int maxTokens;         // LOCAL_LLM only
     public final boolean disableThinking; // send chat_template_kwargs.enable_thinking=false (Qwen/vLLM)
     public final int timeoutSeconds;    // LOCAL_LLM only
-    public final boolean verbose;         // log outgoing body + raw response to the extension Output
+    // NOTE: log verbosity is NOT here anymore — it's a single global {@link LogLevel} (INFO/DEBUG/TRACE), selected
+    // from Settings + CLI, independent of the engine connection config.
 
     public EngineConfig(Provider provider, String baseUrl, String model, String apiKey, double temperature,
-                        int maxTokens, boolean disableThinking, int timeoutSeconds, boolean verbose) {
+                        int maxTokens, boolean disableThinking, int timeoutSeconds) {
         this.provider = provider == null ? Provider.LOCAL_LLM : provider;
         this.baseUrl = baseUrl == null ? "" : baseUrl.trim();
         this.model = model == null ? "" : model.trim();
@@ -34,13 +38,12 @@ public final class EngineConfig {
         this.maxTokens = maxTokens <= 0 ? 512 : maxTokens;
         this.disableThinking = disableThinking;
         this.timeoutSeconds = timeoutSeconds <= 0 ? 120 : timeoutSeconds;
-        this.verbose = verbose;
     }
 
     /** Back-compat constructor — a LOCAL_LLM (OpenAI-compatible) engine (used by the launcher override). */
     public EngineConfig(String baseUrl, String model, String apiKey, double temperature,
-                        int maxTokens, boolean disableThinking, int timeoutSeconds, boolean verbose) {
-        this(Provider.LOCAL_LLM, baseUrl, model, apiKey, temperature, maxTokens, disableThinking, timeoutSeconds, verbose);
+                        int maxTokens, boolean disableThinking, int timeoutSeconds) {
+        this(Provider.LOCAL_LLM, baseUrl, model, apiKey, temperature, maxTokens, disableThinking, timeoutSeconds);
     }
 
     /** The chat-completions URL, tolerating base URLs with or without a trailing slash / suffix. */

@@ -87,7 +87,7 @@ public final class UnauthAccessProbe {
                 // re-send the SAME request WITHOUT any credential
                 HttpRequest anon = HttpRequest.httpRequestFromUrl(url).withMethod(method);
                 HttpRequestResponse ar = api.http().sendRequest(
-                        anon, RequestOptions.requestOptions());
+                        anon, RequestOptions.requestOptions().withResponseTimeout(12000L));
                 if (ar == null || ar.response() == null) continue;
                 int anonSt = ar.response().statusCode();
                 if (anonSt < 200 || anonSt >= 300) continue;                                // properly denied → correct

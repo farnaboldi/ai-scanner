@@ -17,6 +17,11 @@ import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
 import com.ioactive.aiscanner.engine.AiEngine;
 import com.ioactive.aiscanner.scan.flow.FlowEngine;
 import com.ioactive.aiscanner.scan.flow.StepResult;
+import com.ioactive.aiscanner.scan.sast.AgenticSourceAnalyzer;
+import com.ioactive.aiscanner.scan.sast.CoarseSourceAnalyzer;
+import com.ioactive.aiscanner.scan.sast.RepoFetcher;
+import com.ioactive.aiscanner.scan.sast.SourceAnalyzer;
+import com.ioactive.aiscanner.scan.sast.SourceFindings;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.net.URI;
@@ -50,6 +55,18 @@ public final class AiScanner {
     private final ScanLog scanLog;
     private final SessionStore session;
     private final java.util.function.BooleanSupplier cancelled;  // true once the extension is unloaded
+    /** host → local source-repo path (or null) — drives the optional SAST pass. null resolver = never. */
+    private final java.util.function.Function<String, String> repoResolver;
+
+    /** User-requested stop (the Agent-tab Stop button). Volatile: set from the UI thread, polled by the scan
+     *  thread via {@link #cancelled()}. Reset at the start of each scan so a prior Stop never kills a new run. */
+    private volatile boolean stopRequested = false;
+    /** Ask the running scan to stop at the next cooperative checkpoint. Pair with interrupting the scan thread
+     *  (the extension does that) so blocking calls unblock too. */
+    public void requestStop() { stopRequested = true; }
+    /** Clear the stop flag — called when a fresh scan starts. */
+    public void resetStop() { stopRequested = false; }
+    public boolean stopRequested() { return stopRequested; }
 
     /** Stop cooperatively when the extension has been unloaded (or the scan thread was interrupted). */
     private boolean cancelled() {
@@ -63,9 +80,15 @@ public final class AiScanner {
                         + "The partial report of what was already found is written. Top up Burp AI or use a local LLM to continue.");
             return true;
         }
+        if (stopRequested) {
+            if (stopLogged.compareAndSet(false, true))
+                scanLog.log("[AI Scanner] scan stopped by user (Stop button). Writing the partial report of what was already found.");
+            return true;
+        }
         return (cancelled != null && cancelled.getAsBoolean()) || Thread.currentThread().isInterrupted();
     }
     private final java.util.concurrent.atomic.AtomicBoolean creditHaltLogged = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final java.util.concurrent.atomic.AtomicBoolean stopLogged = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private static final Pattern STATIC = Pattern.compile(
             "(?i).*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)$");
@@ -77,17 +100,38 @@ public final class AiScanner {
 
     public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
                      SessionStore session) {
-        this(api, engine, config, scanLog, session, null);
+        this(api, engine, config, scanLog, session, null, null);
     }
 
     public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
                      SessionStore session, java.util.function.BooleanSupplier cancelled) {
+        this(api, engine, config, scanLog, session, cancelled, null);
+    }
+
+    public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
+                     SessionStore session, java.util.function.BooleanSupplier cancelled,
+                     java.util.function.Function<String, String> repoResolver) {
         this.api = api;
         this.engine = engine;
         this.config = config;
         this.scanLog = scanLog;
         this.session = session;
         this.cancelled = cancelled;
+        this.repoResolver = repoResolver;
+    }
+
+    /** Re-authentication callback (set by the orchestrator). The captured session can go stale DURING the long
+     *  probe battery — authenticated-only endpoints then bounce to login/302 and late probes silently miss them.
+     *  Invoked once just before the authenticated reflected-XSS phase to refresh the session cookie. */
+    private volatile Runnable reauth;
+    public void setReauth(Runnable r) { this.reauth = r; }
+    private void refreshSessionIfPossible(String why) {
+        try {
+            if (reauth != null && session != null && session.authenticated()) {
+                scanLog.phase("Re-authenticating (" + why + ")");
+                reauth.run();
+            }
+        } catch (Throwable t) { scanLog.debug("[AI Scanner] re-auth skipped: " + t); }
     }
 
     /** Wall-clock budget for a single slow probe phase (blind-SQLi time payloads sleep ~5s each), so one phase
@@ -111,6 +155,11 @@ public final class AiScanner {
     public Audit scanRequests(List<HttpRequest> reqs, String label) {
         try {
             Audit audit = newAudit();
+            if (audit == null) {   // Community edition: no native audit — our own HTTP probes carry detection
+                scanLog.log("[AI Scanner] Burp Community edition: native active audit unavailable — " + label
+                        + " is covered by the extension's own HTTP probes + local-LLM discovery instead.");
+                return null;
+            }
             int added = 0;
             for (HttpRequest req : reqs) {
                 if (addToAudit(audit, req)) added++;
@@ -141,6 +190,9 @@ public final class AiScanner {
             scanLog.log("[AI Scanner] scan aborted by preflight (required AI backend unusable).");
             return null;
         }
+        // In Pro, Burp's native audit will test every target we submit — so defer Burp-covered classes (SQLi/XSS/…)
+        // to Burp's own dashboard issue instead of raising a duplicate. (No-op / keeps our issues in Community.)
+        scanLog.setBurpNativeAudit(!communityEdition());
         // NOTE: an untrusted/self-signed/expired server TLS certificate is a CLASSIC transport finding Burp Pro
         // already reports natively — we do NOT duplicate it (same call as CORS, removed build 167). We still
         // TOLERATE bad certs (dropped withUpstreamTLSVerification) so we can reach the target; that does not stop
@@ -179,12 +231,56 @@ public final class AiScanner {
         if (xorigin > 0) scanLog.log("[AI Scanner] ingested " + xorigin + " same-site cross-origin request(s) the "
                 + "embedded browser observed the SPA make (sibling API origin) — auditing them too.");
 
+        // Source analysis (SAST): if a repo is associated with this host, run a coarse LLM pass that emits
+        // testing DIRECTIVES (hidden endpoints, tainted params, sink types). These STEER discovery + the
+        // probes + the flow engine below; a hint NEVER raises a finding on its own — the deterministic
+        // oracles still decide every verdict, so a weak/blank pass costs coverage, never soundness.
+        SourceFindings hints = SourceFindings.empty();
+        String repoPath = repoResolver != null ? repoResolver.apply(host) : null;
+        // Always surface the repo-association status on the Log page so it's obvious whether this run is
+        // SAST-assisted or plain black-box (-Daiscanner.sastMode=agentic follows the child-process boundary).
+        boolean agentic = "agentic".equalsIgnoreCase(System.getProperty("aiscanner.sastMode", "coarse"));
+        if (repoPath != null && !repoPath.isBlank()) {
+            scanLog.log("[AI Scanner] source repo associated with " + host + ": " + repoPath
+                    + "  → SAST-assisted scan (mode=" + (agentic ? "agentic" : "coarse") + ")");
+            AiEngine sastEng = engine != null ? engine.get() : null;
+            if (sastEng != null && sastEng.isConfigured()) {
+                try {
+                    // Local path → use it; git/GitHub URL → fetch it over HTTP (no git binary, no subprocess).
+                    String localRepo = RepoFetcher.ensureLocal(repoPath, scanLog);
+                    if (localRepo == null) {
+                        scanLog.log("[AI Scanner] source could not be resolved to a local checkout — SAST skipped (black-box).");
+                    } else {
+                        scanLog.phase("Source analysis (SAST" + (agentic ? ", agentic" : "") + ")");
+                        SourceAnalyzer analyzer = agentic
+                                ? new AgenticSourceAnalyzer(sastEng, scanLog)
+                                : new CoarseSourceAnalyzer(sastEng, scanLog);
+                        hints = analyzer.analyze(host, localRepo);
+                        scanLog.log("[AI Scanner] source analysis: " + hints.size() + " hint(s) from " + localRepo);
+                    }
+                } catch (Throwable t) {
+                    scanLog.debug("[AI Scanner] source analysis skipped: " + t);
+                }
+            } else {
+                scanLog.log("[AI Scanner] source repo associated but the LLM engine is not configured — SAST skipped (black-box).");
+            }
+        } else {
+            scanLog.log("[AI Scanner] no source repo associated with " + host + " — black-box scan.");
+        }
+
         // LLM + regex endpoint discovery: recover endpoints Burp's crawler can't reach
         // (JS-only AJAX/routes), probed live so nothing hallucinated gets audited.
         EndpointDiscovery disc = new EndpointDiscovery(api, engine, session, scanLog);
+        disc.addSourceHints(hints);   // SAST-driven: probe source-named routes/params too (dead ones filtered)
         for (HttpRequest ep : disc.discover(host)) {
             addTarget(targets, seen, ep);
         }
+        // SAST hint → CONCRETE request. Discovery adds hinted routes as specs, but seeds their params with
+        // generic/empty values — so a sink that JSON.parse()s its param (xvna /getdata?id=) 500s on the empty
+        // value and gets dropped as "not live", and command/eval sinks never get a param to mutate. Synthesize
+        // one concrete request per hint with a CLASS-APPROPRIATE baseline (numeric "1"; a resolvable host for
+        // command sinks) so the param-iterating probes (NoSql JSON-value, CommandInjection, Xss…) can fire.
+        synthesizeHintTargets(host, hints, targets, seen);
         // Discovery-depth: synthesize POST creates from each REST collection's learned schema so
         // create/update endpoints (never POSTed during the crawl) get audited + probed.
         for (HttpRequest w : disc.synthesizeWrites(host)) {
@@ -286,6 +382,12 @@ public final class AiScanner {
                 for (HttpRequest t : targets) if (orp.probe(withSession(t))) hits++;
                 scanLog.log("[AI Scanner] open-redirect probe: " + hits + " endpoint(s) redirect to an attacker host.");
             } catch (Throwable t) { scanLog.debug("[AI Scanner] open-redirect probe skipped: " + t); }
+            try {
+                // OAuth authorization-server logic (redirect_uri validation → auth-code/token leak). Drives the
+                // observed authorize flow with an off-origin sentinel redirect_uri; a leaked code/token to it = flaw.
+                scanLog.phase("OAuth-logic probe (authorization-server flaws)");
+                new OAuthLogicProbe(api, scanLog).probe(host, this::withSession);
+            } catch (Throwable t) { scanLog.debug("[AI Scanner] oauth-logic probe skipped: " + t); }
         }
 
         if (cancelled()) { scanLog.log("[AI Scanner] scan cancelled (extension unloaded)."); return null; }
@@ -294,30 +396,83 @@ public final class AiScanner {
         // probes build up load (fragile/rate-limited targets can drop sessions under sustained scanning).
         try {
             scanLog.phase("Blind SQLi probe");
-            BlindSqliProbe bsp = new BlindSqliProbe(api, scanLog);
-            int hits = 0, done = 0;
-            // Wall-clock budget: each time-based payload sleeps ~5s, so a large signed surface × params can run
-            // for many minutes and STALL the whole sequential probe chain (IDOR/BFLA/mass-assignment never run).
-            // Bound the phase and log what was skipped — never silently truncate.
             long deadline = System.currentTimeMillis() + PROBE_PHASE_BUDGET_MS;
-            for (HttpRequest t : targets) {
-                if (System.currentTimeMillis() > deadline) {
-                    scanLog.log("[AI Scanner] blind-SQLi probe: time budget hit — audited " + done + "/"
-                            + targets.size() + " target(s), " + (targets.size() - done) + " skipped (Burp's native audit still covers them).");
-                    break;
-                }
-                if (bsp.probe(withSession(t))) hits++;
-                done++;
+            BlindSqliProbe bsp = new BlindSqliProbe(api, scanLog);   // stateless (final fields) → thread-safe to share
+            bsp.setSourceHints(hints);   // SAST: source-tag the SQLi finding (provenance rides into the report)
+
+            // Unit list = discovered audit targets + parameterless GET pages to mine for hidden params (sqli-labs
+            // "input the ID" pages, /page.php?id= handlers). Collected sequentially (reads the site map). Each unit
+            // is a self-contained READ-ONLY differential (its own baseline+legs stay coherent inside bsp.probe);
+            // different units are independent → safe to run in parallel.
+            java.util.List<HttpRequest> units = new java.util.ArrayList<>(targets);
+            java.util.Set<String> minedPaths = new java.util.HashSet<>();
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (minedPaths.size() >= 80) break;
+                if (rr == null || rr.response() == null) continue;
+                HttpRequest r = rr.request();
+                if (!"GET".equalsIgnoreCase(r.method()) || r.url().contains("?")) continue;
+                if (STATIC.matcher(pathOf(r)).matches()) continue;
+                try { if (!api.scope().isInScope(r.url())) continue; } catch (Throwable ignore) { }
+                int st = rr.response().statusCode(); if (st < 200 || st >= 400) continue;
+                String ct = rr.response().headerValue("Content-Type");
+                if (ct == null || !ct.toLowerCase().contains("html")) continue;   // an HTML page that may hide a param
+                // Normalize an extensionless path to a trailing slash: the crawler records the link "Less-1"
+                // without the slash, but appending ?id= to /Less-1 makes Apache 301-redirect to /Less-1/ and DROP
+                // the query — so the injected param never reaches the handler. /Less-1/ keeps it.
+                String u = stripQuery(r.url());
+                String lastSeg = u.substring(u.lastIndexOf('/') + 1);
+                if (!u.endsWith("/") && !lastSeg.contains(".")) u = u + "/";
+                if (!minedPaths.add(u)) continue;
+                units.add(HttpRequest.httpRequestFromUrl(u).withMethod("GET"));
             }
-            scanLog.log("[AI Scanner] blind-SQLi probe: " + hits + " endpoint(s) blind-injectable.");
+
+            // READ-ONLY parallel slice behind -Daiscanner.concurrency (default 3): N units at once. One hung/slow
+            // unit occupies ONE worker (bounded by the 12s per-request timeout), never the whole tool — the fix for
+            // "one blocked request stalls the whole scan". Adaptive Throttle: on 429/503 it backs off + shrinks
+            // toward sequential (no self-inflicted rate-limit lockout). concurrency=1 = the sequential outcome
+            // baseline the benchmark's outcome-neutral gate compares against.
+            int concurrency = Math.max(1, Integer.getInteger("aiscanner.concurrency", 3));
+            java.util.concurrent.atomic.AtomicInteger hits = new java.util.concurrent.atomic.AtomicInteger();
+            if (concurrency <= 1) {
+                for (HttpRequest u : units) {
+                    if (System.currentTimeMillis() > deadline) break;
+                    if (bsp.probe(withSession(u), deadline)) hits.incrementAndGet();
+                }
+            } else {
+                Throttle throttle = new Throttle(concurrency, scanLog);
+                bsp.withThrottle(throttle);
+                java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency);
+                for (HttpRequest u : units) {
+                    pool.submit(() -> {
+                        if (System.currentTimeMillis() > deadline) return;
+                        try {
+                            throttle.acquire();
+                            try { if (bsp.probe(withSession(u), deadline)) hits.incrementAndGet(); }
+                            finally { throttle.release(); }
+                        } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                        catch (Throwable ignore) { }
+                    });
+                }
+                pool.shutdown();
+                try {
+                    long grace = Math.max(0, deadline - System.currentTimeMillis()) + 30_000L;
+                    if (!pool.awaitTermination(grace, java.util.concurrent.TimeUnit.MILLISECONDS)) pool.shutdownNow();
+                } catch (InterruptedException ie) { pool.shutdownNow(); Thread.currentThread().interrupt(); }
+            }
+            int sqliN = bsp.emitCollapsed();   // emit now: 1 systemic finding if it's a shared-sink flood, else each
+            scanLog.log("[AI Scanner] blind-SQLi probe: " + hits.get() + " endpoint(s) injectable ("
+                    + minedPaths.size() + " parameterless page(s) mined; concurrency=" + concurrency
+                    + (sqliN > 5 ? "; " + sqliN + " hits collapsed to 1 systemic SQLi (shared sink)" : "") + ").");
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner] blind-SQLi probe skipped: " + t);
         }
 
-        // Reflected XSS is normally left to Burp's native audit (richer evidence; we feed it every discovered
-        // endpoint). EXCEPTION: in WAF-evasion mode, Burp's canonical XSS payloads get blocked by the WAF, so
-        // a small evasion-only probe tries obfuscated tag vectors to slip the WAF (runs ONLY when the toggle
-        // is on → no duplication of Burp on normal scans).
+        // Reflected XSS is left to Burp's native ACTIVE audit — it is the canonical owner of that class and we
+        // feed it every discovered endpoint, so we NEVER duplicate it with our own reflected-XSS. EXCEPTION:
+        // WAF-evasion mode, where Burp's canonical XSS payloads get blocked by the WAF — there a small evasion-only
+        // probe tries obfuscated tag vectors Burp can't slip. That is COMPLEMENTARY (covers a case Burp fails at),
+        // not duplication, and it runs ONLY when the toggle is on. (Burp Community has no active audit, so reflected
+        // XSS is simply an edition limitation there — an honest Pro-scanner class, not something we re-implement.)
         try {
             EvasionXssProbe xss = new EvasionXssProbe(api, scanLog);
             if (Evasion.enabled()) {
@@ -330,6 +485,39 @@ public final class AiScanner {
             scanLog.debug("[AI Scanner] evasion-XSS probe skipped: " + t);
         }
 
+        // Deterministic reflected-XSS with CONTEXT-AWARE breakout. Burp's native check reports a reflection that
+        // lands in a comment/script context only as INFO and never escalates — so a real reflected XSS whose sink
+        // is an HTML comment (Zero Bank's Find-Transactions "description") is missed. This closes that class,
+        // zero-FP (unique marker tag reflected VERBATIM into an executable context + re-confirm). Runs always.
+        // The session captured at auth may have gone stale over the preceding probe phases (~10+ min), so
+        // authenticated-only POSTs (e.g. Zero Bank's find-transactions) now 302 to login and reflect nothing.
+        // Refresh it first so the reflected-XSS probe reaches the authenticated surface with a live session.
+        // TEST (build 468): mid-battery reauth was REPLACING a working session with a fresh non-working one
+        // (observed: exercise cookie 200-authenticated, reauth cookie 302→login). Disabled to confirm.
+        // refreshSessionIfPossible("refreshing session before authenticated audit");
+        try {
+            scanLog.phase("Reflected-XSS probe (context-aware breakout)");
+            ReflectedXssProbe rxss = new ReflectedXssProbe(api, scanLog);
+            int hits = 0;
+            for (HttpRequest t : targets) if (rxss.probe(withSession(t))) hits++;
+            scanLog.log("[AI Scanner] reflected-XSS probe: " + hits + " endpoint(s) with a breakout-confirmed reflected XSS.");
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] reflected-XSS probe skipped: " + t);
+        }
+
+        // Deterministic path-traversal oracle via path REFLECTION (generic; catches file-path params a JSON API
+        // exposes with no /etc/passwd readback — the value flows into a server path echoed in an error, and a
+        // ../<leaked-dir>/<value> up-and-back resolves like the baseline while a junk dir does not → CWE-22).
+        try {
+            scanLog.phase("Path-traversal probe (path reflection)");
+            PathReflectionProbe prp = new PathReflectionProbe(api, scanLog);
+            int hits = 0;
+            for (HttpRequest t : targets) if (prp.probe(withSession(t))) hits++;
+            scanLog.log("[AI Scanner] path-reflection probe: " + hits + " endpoint(s) path-traversable.");
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] path-reflection probe skipped: " + t);
+        }
+
         // Deterministic NoSQL oracle over the discovered surface (generic; Burp's NoSQL coverage is weak).
         // Records the records a bypass leaks so the create->consume chain below can replay them.
         List<String> injectionLeaks = new ArrayList<>();
@@ -337,6 +525,7 @@ public final class AiScanner {
             scanLog.phase("NoSQL injection probe");
             NoSqlProbe nosql = new NoSqlProbe(api, scanLog);
             nosql.setLeakSink(injectionLeaks);
+            nosql.setSourceHints(hints);   // SAST: tag provenance when a source NoSQL sink matches
             if (session != null) nosql.setKnownUser(session.loginUser());   // valid user → clean auth-bypass check
             int hits = 0;
             for (HttpRequest t : targets) if (nosql.probe(withSession(t))) hits++;
@@ -345,12 +534,28 @@ public final class AiScanner {
             scanLog.debug("[AI Scanner] NoSQL probe skipped: " + t);
         }
 
+        // OS command injection + server-side eval (SSJS/RCE). Deterministic (time-based sleep; arithmetic
+        // eval oracle). SAST-hint-driven: synthesizes a concrete request per command/eval sink the source pins
+        // (the exact route+param a JS-wired SPA hides from the crawler), plus a generic pass over discovered
+        // targets. Neither oracle can false-positive (a real sleep-delay / a computed product must appear).
+        try {
+            scanLog.phase("Command injection probe + eval (time-based / arithmetic)");
+            CommandInjectionProbe cmdi = new CommandInjectionProbe(api, scanLog);
+            cmdi.setSourceHints(hints);
+            String base = targets.isEmpty() ? null : originOf(targets.get(0).url());
+            int hits = cmdi.probeHints(host, this::withSession, base);
+            for (HttpRequest t : targets) if (cmdi.probe(withSession(t))) hits++;
+            scanLog.log("[AI Scanner] command/eval probe: " + hits + " injectable point(s).");
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] command/eval probe skipped: " + t);
+        }
+
         // create->consume chain: replay a record an injection bypass leaked into sibling write endpoints
         // the crawler never reached (the UI only calls them after a valid value it doesn't possess), then
         // fuzz those sinks. Reaches chained vulns like a NoSQL leak feeding a SQL-backed apply endpoint.
         try {
             if (!injectionLeaks.isEmpty()) {
-                scanLog.phase("Create->consume chain (leak replay)");
+                scanLog.phase("Create->consume chain probe (leak replay)");
                 new ChainReplayProbe(api, scanLog, this::withSession, injectionLeaks).run(host);
             }
         } catch (Throwable t) {
@@ -382,7 +587,9 @@ public final class AiScanner {
             scanLog.phase("IDOR probe");
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
-            int hits = new IdorGetProbe(api, scanLog).probe(host, cookie, bearer);
+            IdorGetProbe idor = new IdorGetProbe(api, scanLog);
+            idor.setSourceHints(hints);   // SAST: widen enumeration on source-flagged object-refs + tag provenance
+            int hits = idor.probe(host, cookie, bearer);
             scanLog.log("[AI Scanner] IDOR probe: " + hits + " id-bearing GET(s) returned another tenant's record.");
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner] IDOR probe skipped: " + t);
@@ -503,11 +710,26 @@ public final class AiScanner {
         try {
             scanLog.phase("Path traversal / LFI probe");
             PathTraversalProbe lfi = new PathTraversalProbe(api, scanLog);
+            lfi.setSourceHints(hints);   // SAST: tag provenance when a source path/LFI sink matches
             int hits = 0;
             for (HttpRequest t : targets) if (lfi.probe(withSession(t))) hits++;
             scanLog.log("[AI Scanner] path-traversal probe: " + hits + " endpoint(s) leaked an OS file.");
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner] path-traversal probe skipped: " + t);
+        }
+
+        // OAST SSRF confirmation (Burp Collaborator) — DRIVEN BY THE SAST SSRF HINTS so it tests endpoints the
+        // discovery surface dropped (e.g. a self-referential /import?url= that mirrors the app's catch-all page).
+        // A callback proves the server fetched our attacker-controlled URL (CWE-918) — deterministic, zero-FP.
+        try {
+            scanLog.phase("SSRF probe (OAST / Collaborator)");
+            SsrfProbe ssrf = new SsrfProbe(api, scanLog);
+            ssrf.setSourceHints(hints);
+            String base = targets.isEmpty() ? null : originOf(targets.get(0).url());
+            int hits = ssrf.probe(base, targets, this::withSession);
+            scanLog.log("[AI Scanner] SSRF probe: " + hits + " endpoint(s) made an out-of-band request (SSRF).");
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] SSRF probe skipped: " + t);
         }
 
         // (Open-redirect probe ran early — see the fast-findings block above.)
@@ -534,8 +756,9 @@ public final class AiScanner {
         try {
             AiEngine eng = engine != null ? engine.get() : null;
             if (eng != null && eng.isConfigured()) {
-                scanLog.phase("Flow-engine (agentic multi-step)");
+                scanLog.phase("Flow-engine probe (agentic multi-step)");
                 FlowEngine fe = new FlowEngine(eng, scanLog, this::withSession, this::sendAndMeasure);
+                if (!hints.isEmpty()) fe.setSourceHintText(hints.hintText(8));   // SAST leads → planner targets them first
                 int hits = fe.run(host, targets);
                 scanLog.log("[AI Scanner] flow-engine: " + hits + " finding(s) from multi-step chains.");
                 // The flow-engine reaches 2xx endpoints the crawl/mining never did. Bridge them into the site map
@@ -553,6 +776,9 @@ public final class AiScanner {
             scanLog.debug("[AI Scanner] flow-engine skipped: " + t);
         }
 
+        // User hit Stop during the probe battery (each probe swallowed the phase() ScanStopped) → don't now submit
+        // the long native Burp audit; return what the probes already raised as live issues.
+        if (cancelled()) return null;
         return scanRequests(targets, host);
     }
 
@@ -582,6 +808,7 @@ public final class AiScanner {
                 if (!bseen.add(req.method() + " " + stripQuery(req.url()))) continue;
                 bsp.probe(req);
             }
+            bsp.emitCollapsed();   // flush collected auth-page SQLi (else they'd be recorded but never emitted)
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner] auth-page blind-SQLi pass skipped: " + t);
         }
@@ -601,6 +828,7 @@ public final class AiScanner {
         if (auth.isEmpty()) return null;
         try {
             Audit audit = newAudit();
+            if (audit == null) return null;   // Community: no native audit (login SQLi still covered by BlindSqliProbe)
             int added = 0;
             for (HttpRequest req : auth) {
                 HttpRequest r = seedEmptyJson(req);          // no session — login is pre-auth
@@ -620,6 +848,44 @@ public final class AiScanner {
             api.logging().logToError("[AI Scanner] auth-page audit error: " + t);
             return null;
         }
+    }
+
+    /**
+     * PURE BURP-NATIVE BASELINE (no-extension equivalent). Audits ONLY what Burp's own crawler reached,
+     * with Burp's built-in active checks — NO LLM preflight, NO guided discovery, NO auth injection, NO
+     * probes. This is the faithful "what does Burp Pro find on its own" measurement: the extension is just
+     * a headless harness here (start Burp's native audit + let AiTriage collect Burp's own FIRM/CERTAIN
+     * issues into the report), it contributes zero detection of its own. Used for the benchmark's
+     * no-extension baseline column via -Daiscanner.nativeOnly / AISCANNER_NATIVE_ONLY.
+     */
+    public Audit scanNativeBaseline(String host) {
+        scanLog.setBurpNativeAudit(true);   // Burp owns every class; AiTriage counts its native issues (= "native" half)
+        Audit audit = newAudit();
+        if (audit == null) {                // Community edition has no native active audit → nothing to baseline
+            scanLog.log("[AI Scanner] native baseline: Burp Community has no active audit — baseline is 0 by definition.");
+            return null;
+        }
+        Set<String> seen = new HashSet<>();
+        int added = 0;
+        // Audit EVERY crawled request for this host, INCLUDING login/signin pages: with no session to protect
+        // (native baseline never authenticates), auditing auth forms is exactly what a plain Burp crawl+audit
+        // does, and it's where Burp finds login SQLi. Mirror auditAuthPages()'s range construction.
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            HttpRequest req = rr.request();
+            if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
+            if (STATIC.matcher(pathOf(req)).matches()) continue;
+            StringBuilder key = new StringBuilder(req.method()).append(' ').append(stripQuery(req.url()));
+            for (ParsedHttpParameter p : fuzzableParams(req)) key.append('|').append(p.name());
+            if (!seen.add(key.toString())) continue;
+            List<Range> ranges = fuzzableRanges(req);
+            ranges.addAll(jsonBodyRanges(req));
+            if (ranges.isEmpty()) continue;
+            try { audit.addRequest(req, ranges); added++; } catch (Throwable ignore) { }
+        }
+        scanLog.log("[AI Scanner] native baseline: submitted " + added + " crawled request(s) to Burp's built-in "
+                + "active audit (no auth, no discovery, no probes — pure Burp).");
+        if (added == 0) { try { audit.delete(); } catch (Throwable ignore) { } return null; }
+        return audit;
     }
 
     /**
@@ -730,6 +996,7 @@ public final class AiScanner {
                     : "no";
             scanLog.phase("Idle — scan complete");
             scanLog.log("[AI Scanner] ===================== SCAN COMPLETE (" + host + ") =====================");
+            logBenchmarkTally();   // copy-pasteable, matches the harness metric() exactly (no report file needed)
             scanLog.log("[AI Scanner] authenticated: " + authWith
                     + "   |   audit requests: " + audit.requestCount() + "   |   errors: " + audit.errorCount());
             if (!issues.isEmpty()) {
@@ -744,6 +1011,7 @@ public final class AiScanner {
             // (No per-finding recap here — each finding was already logged ONCE, in real time, by AiTriage.
             // Re-listing them added duplicate lines to the log AND the report; the count tally above suffices.)
             scanLog.log("[AI Scanner] ==========================================================================");
+            emitManualNextSteps();   // analyst hand-off: what the scanner does NOT auto-confirm → test by hand
             // DIAGNOSTIC: are our own AI issues actually in the site map (Target→Issues)? audit.issues()
             // above only lists the active-audit TASK's issues; our probe/flow findings are added via
             // siteMap().add(). Confirm they landed so we know if "not on dashboard" is a display nuance.
@@ -853,29 +1121,184 @@ public final class AiScanner {
         try {
             long calls = com.ioactive.aiscanner.engine.MontoyaAiEngine.totalCalls();
             if (calls <= 0) return;   // LOCAL_LLM run (or no AI calls) — nothing to bill
-            scanLog.log("[AI Scanner] ===== Burp AI usage (estimated) this scan: " + calls + " calls, ~"
-                    + com.ioactive.aiscanner.engine.MontoyaAiEngine.totalTokens() + " tokens"
-                    + " (~" + com.ioactive.aiscanner.engine.MontoyaAiEngine.totalInTokens() + " in / ~"
-                    + com.ioactive.aiscanner.engine.MontoyaAiEngine.totalOutTokens() + " out) =====");
+            // NOTE: no token estimate — chars/4 was unreliable, so we report only the EXACT call count. Real credit
+            // cost comes from Burp's balance (below), which lags its cache.
+            scanLog.log("[AI Scanner] ===== Burp AI usage this scan: " + calls + " call(s) =====");
             // REAL credits: start (snapshotted on the first call) vs end (Burp's last-synced balance).
             String start = com.ioactive.aiscanner.engine.MontoyaAiEngine.scanStartCredits();
             String end = com.ioactive.aiscanner.engine.MontoyaAiEngine.readCreditBalance();
             if (start != null)
                 scanLog.log("[AI Scanner] Burp AI credits available (start of scan): " + start);
             if (end != null) {
-                String spent = "";
-                if (start != null) {
-                    try { spent = String.format("  |  spent this scan: %.4f credits",
-                            Double.parseDouble(start) - Double.parseDouble(end)); }
-                    catch (NumberFormatException ignore) { }
-                }
-                scanLog.log("[AI Scanner] Burp AI credits available (end of scan): " + end + spent
-                        + " (end balance is Burp's last sync — may lag the final calls)");
+                // Burp's cached balance (WorkspaceConfig.json) only refreshes on sync/exit, so end==start is the
+                // COMMON case even after 100s of billed calls → a "spent: 0.0000" reading would be flat-out wrong.
+                // Only report a credit delta when the balance ACTUALLY dropped; otherwise say it hasn't reflected
+                // yet and point at the token estimate (the true in-scan spend signal).
+                String note;
+                try {
+                    double delta = start != null ? Double.parseDouble(start) - Double.parseDouble(end) : 0;
+                    if (start != null && delta > 0.00005)
+                        note = String.format("  |  spent this scan: %.4f credits", delta);
+                    else
+                        note = "  |  spent this scan: NOT yet reflected — Burp's cached balance lags (refreshes on "
+                             + "sync/exit); " + calls + " billed call(s) this scan (see above)";
+                } catch (NumberFormatException e) { note = ""; }
+                scanLog.log("[AI Scanner] Burp AI credits available (end of scan): " + end + note);
             }
         } catch (Throwable ignore) { }
     }
 
+    /**
+     * Analyst hand-off: at the end of a run, surface what the scanner did NOT (and deliberately does not)
+     * auto-confirm, so the pentester knows exactly where to take over manually. Emitted to the log (the analyst
+     * reads it live) and to a sibling "<report>.manual.txt" when a report path is set — NEVER into the scored
+     * findings report (class names there would pollute the benchmark's substring scoring). Fully generic.
+     */
+    private void emitManualNextSteps() {
+        try {
+            java.util.List<String> out = new java.util.ArrayList<>();
+            out.add("MANUAL NEXT STEPS — analyst hand-off (what the scanner does not auto-confirm)");
+            // 1) advisories the tool flagged for human verification (soft / LLM-judged, NOT deterministic)
+            java.util.List<String> adv = new java.util.ArrayList<>();
+            for (String f : scanLog.findingsReport()) {
+                if (f.toLowerCase().contains("needs review") || f.contains("ADVISORY")) adv.add(f);
+            }
+            if (adv.isEmpty()) {
+                out.add("  Advisories to verify: none flagged this run.");
+            } else {
+                out.add("  Advisories to verify by hand (" + adv.size() + " — LLM-suspected, not deterministically confirmed):");
+                for (String a : adv) out.add("    - " + a);
+            }
+            // 2) classes we deliberately DO NOT auto-confirm (no deterministic oracle of intent) — test by hand
+            out.add("  Classes not auto-confirmed (require human judgment) — probe these by hand where the surface fits:");
+            String[] manual = {
+                "Business logic / workflow abuse (price, quantity, negative values, step-skipping) — no generic oracle of intent",
+                "Complex / multi-step authorization (app-specific role & tenant policy beyond the IDOR/BFLA differential)",
+                "Multi-step exploit chains (create -> consume, state-dependent flows)",
+                "Client-side / DOM-only issues (DOM XSS, postMessage, prototype pollution) — need a rendering browser + interaction",
+                "File-upload business rules (allowed type/size/path logic beyond generic traversal/type checks)",
+                "Rate-limit / anti-automation / CAPTCHA robustness"
+            };
+            for (String m : manual) out.add("    - " + m);
+
+            for (String line : out) scanLog.log("[AI Scanner] " + line);
+
+            String path = System.getProperty("aiscanner.report");
+            if (path == null || path.isBlank()) path = System.getenv("AISCANNER_REPORT");
+            if (path != null && !path.isBlank()) {
+                String mp = path.replaceAll("\\.report\\.txt$", "").replaceAll("\\.txt$", "") + ".manual.txt";
+                try { java.nio.file.Files.write(java.nio.file.Path.of(mp), out); } catch (Throwable ignore) { }
+            }
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] manual-next-steps emit failed: " + t);
+        }
+    }
+
     /** Write the run's findings to -Daiscanner.report / AISCANNER_REPORT so the benchmark harness can score. */
+    /** Log a copy-pasteable BENCHMARK tally that mirrors the harness {@code metric()} EXACTLY (count of report
+     *  lines starting with VULNERABILITY: / HIGH / MED). Printed at scan end so a GUI run (no report file) can be
+     *  scored from the log alone — paste it and the score is the number on the header line. */
+    private void logBenchmarkTally() {
+        try {
+            // Decompose the score by SOURCE, because the two halves have very different run-to-run stability:
+            //   • deterministic-oracle — OUR probes (logged "VULNERABILITY: …"): fixed payloads + deterministic
+            //     oracles → should be REPEATABLE run-to-run on an identical target.
+            //   • native-Burp-audit  — Burp's own FIRM/CERTAIN issues (logged "HIGH/MED (CONF) …"): async +
+            //     time-bounded + confidence-upgrade churn → the VARIABLE half.
+            // Splitting them shows exactly which half moves when a re-measure differs (and the deterministic
+            // half is the zero-FP number to compare models on).
+            java.util.List<String> det = new java.util.ArrayList<>();
+            java.util.List<String> nat = new java.util.ArrayList<>();
+            for (String s : scanLog.findingsReport()) {
+                String t = s == null ? "" : s.trim();
+                if (t.startsWith("VULNERABILITY:")) det.add(t);
+                else if (t.startsWith("HIGH ") || t.startsWith("MED ")) nat.add(t);
+            }
+            int total = det.size() + nat.size();
+            scanLog.log("[AI Scanner] ===== BENCHMARK SCORE (VULNERABILITY + HIGH + MED) = " + total
+                    + "   →   deterministic-oracle: " + det.size() + " | native-Burp-audit: " + nat.size()
+                    + "   |   time: " + scanLog.scanElapsed() + " (" + scanLog.scanElapsedSeconds() + "s) =====");
+            // Breakdown by CRITICALITY + CATEGORY (over the scored findings) — so the benchmark compares not just a
+            // raw count but the severity mix and which vuln classes each model/config surfaced.
+            java.util.List<String> all = new java.util.ArrayList<>(det); all.addAll(nat);
+            java.util.Map<String,Integer> bySev = new java.util.LinkedHashMap<>();
+            for (String s : new String[]{"HIGH","MEDIUM","LOW","INFO"}) bySev.put(s, 0);
+            java.util.Map<String,Integer> byCat = new java.util.TreeMap<>();
+            for (String c : all) {
+                String sev = sevOf(c), cat = catOf(c);
+                bySev.merge(sev, 1, Integer::sum);
+                byCat.merge(cat, 1, Integer::sum);
+            }
+            scanLog.log("[AI Scanner]   by criticality:  HIGH: " + bySev.get("HIGH") + " | MEDIUM: " + bySev.get("MEDIUM")
+                    + " | LOW: " + bySev.get("LOW") + " | INFO: " + bySev.get("INFO"));
+            // …and split by SOURCE (deterministic probes vs Burp-native), the exact rows the benchmark table uses.
+            int[] ds = sevCounts(det), ns = sevCounts(nat);
+            scanLog.log("[AI Scanner]   by criticality — deterministic:  HIGH: " + ds[0] + " | MEDIUM: " + ds[1] + " | LOW: " + ds[2]);
+            scanLog.log("[AI Scanner]   by criticality — native:         HIGH: " + ns[0] + " | MEDIUM: " + ns[1] + " | LOW: " + ns[2]);
+            StringBuilder cats = new StringBuilder();
+            for (java.util.Map.Entry<String,Integer> e : byCat.entrySet())
+                cats.append(cats.length() > 0 ? " | " : "").append(e.getKey()).append(": ").append(e.getValue());
+            scanLog.log("[AI Scanner]   by category (" + byCat.size() + " classes):  " + cats);
+            int i = 1;
+            scanLog.log("[AI Scanner]   -- deterministic-oracle (" + det.size() + ") — our probes, repeatable --");
+            for (String c : det) scanLog.log("[AI Scanner]   " + (i++) + ". [" + sevOf(c) + "] " + (c.length() > 175 ? c.substring(0, 175) + "…" : c));
+            scanLog.log("[AI Scanner]   -- native-Burp-audit (" + nat.size() + ") — Burp FIRM/CERTAIN, variable --");
+            for (String c : nat) scanLog.log("[AI Scanner]   " + (i++) + ". [" + sevOf(c) + "] " + (c.length() > 175 ? c.substring(0, 175) + "…" : c));
+            String llm = com.ioactive.aiscanner.engine.LlmTiming.summary();
+            if (llm != null) scanLog.log("[AI Scanner]   " + llm + "  (LLM wait is part of the total time above)");
+            scanLog.log("[AI Scanner] ===== END BENCHMARK SCORE (" + total + " = " + det.size() + " det + " + nat.size() + " native) =====");
+        } catch (Throwable t) { scanLog.debug("[AI Scanner] benchmark tally failed: " + t); }
+    }
+
+    /** [HIGH, MEDIUM, LOW] counts for a list of report lines (INFO folded out — never scored). */
+    private static int[] sevCounts(java.util.List<String> lines) {
+        int h = 0, m = 0, l = 0;
+        for (String s : lines) {
+            switch (sevOf(s)) {
+                case "HIGH": h++; break;
+                case "MEDIUM": m++; break;
+                case "LOW": l++; break;
+                default: break;
+            }
+        }
+        return new int[]{h, m, l};
+    }
+
+    /** Criticality of a report line. Native lines carry it as a prefix; our "VULNERABILITY:" lines
+     *  get it from IssueLibrary (the same class→severity map that raiseAiIssue() files with). */
+    private static String sevOf(String line) {
+        String t = line == null ? "" : line.trim();
+        if (t.startsWith("HIGH ")) return "HIGH";
+        if (t.startsWith("MED ")) return "MEDIUM";
+        if (t.startsWith("LOW ")) return "LOW";
+        if (t.startsWith("INFO ")) return "INFO";
+        if (t.startsWith("VULNERABILITY:")) {
+            try {
+                burp.api.montoya.scanner.audit.issues.AuditIssueSeverity s = IssueLibrary.describe(catOf(t)).severity;
+                if (s == burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.HIGH) return "HIGH";
+                if (s == burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.MEDIUM) return "MEDIUM";
+                if (s == burp.api.montoya.scanner.audit.issues.AuditIssueSeverity.LOW) return "LOW";
+                return "INFO";
+            } catch (Throwable e) { return "HIGH"; }  // our probe findings are actionable by construction
+        }
+        return "INFO";
+    }
+
+    /** Vuln category/class of a report line, stripped of the severity/confidence prefix and the URL tail. */
+    private static String catOf(String line) {
+        String t = line == null ? "" : line.trim();
+        if (t.startsWith("VULNERABILITY:")) {
+            String c = t.substring("VULNERABILITY:".length()).trim();
+            int at = c.indexOf("  @"); if (at < 0) at = c.indexOf(" @");
+            if (at > 0) c = c.substring(0, at);
+            return c.trim();
+        }
+        String c = t.replaceFirst("^(HIGH|MED|LOW|INFO)\\s+\\([A-Za-z]+\\)\\s*", "")
+                    .replaceFirst("^(HIGH|MED|LOW|INFO)\\s+", "");
+        int at = c.indexOf(" @"); if (at > 0) c = c.substring(0, at);
+        return c.trim();
+    }
+
     private void writeReport() {
         String path = System.getProperty("aiscanner.report");
         if (path == null || path.isBlank()) path = System.getenv("AISCANNER_REPORT");
@@ -890,7 +1313,17 @@ public final class AiScanner {
 
     // ---- native audit plumbing ----
 
+    /** True on Burp Community edition (no Scanner API: no native active audit, crawl, or Collaborator). The
+     *  extension then runs its own HTTP-based deterministic probes + local-LLM discovery only; Pro/Enterprise
+     *  get the full native path. Public so the crawl launcher can gate startCrawl on it too. */
+    public boolean communityEdition() {
+        try { return api.burpSuite().version().edition() == burp.api.montoya.core.BurpSuiteEdition.COMMUNITY_EDITION; }
+        catch (Throwable t) { return false; }
+    }
+
+    /** Native active audit — Pro/Enterprise only. Returns null on Community; callers then rely on own probes. */
     private Audit newAudit() {
+        if (communityEdition()) return null;
         return api.scanner().startAudit(
                 AuditConfiguration.auditConfiguration(BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS));
     }
@@ -901,6 +1334,7 @@ public final class AiScanner {
      * headers/cookies/path). Applies the captured session cookie first.
      */
     private boolean addToAudit(Audit audit, HttpRequest req) {
+        if (audit == null) return false;   // Community edition — no native audit
         if (STATIC.matcher(pathOf(req)).matches()) return false;
         if (NOISE.matcher(req.url()).matches()) {
             scanLog.debug("[AI Scanner]   skip audit (transport/handshake noise): " + stripQuery(req.url()));
@@ -993,7 +1427,7 @@ public final class AiScanner {
             String probe = origin + "/aiscanner-nonexistent-" + Integer.toHexString(("probe" + sampleUrl).hashCode());
             HttpRequestResponse r = api.http().sendRequest(
                     withSession(HttpRequest.httpRequestFromUrl(probe).withMethod("GET")),
-                    RequestOptions.requestOptions());
+                    RequestOptions.requestOptions().withResponseTimeout(12000L));
             if (r == null || r.response() == null) return "";
             int st = r.response().statusCode();
             String ct = r.response().headerValue("Content-Type");
@@ -1025,6 +1459,22 @@ public final class AiScanner {
 
     /** Add a fuzzable request to the audit surface. Returns true iff it was newly added (not static/unfuzzable/dup). */
     private boolean addTarget(List<HttpRequest> targets, Set<String> seen, HttpRequest req) {
+        // Honor Burp's configured scope — the central chokepoint for EVERY audit target. A page can carry a form
+        // or link to an external host (e.g. mutillidae's PayPal donate form POSTing to www.paypal.com); harvesting
+        // it as a target would send attack payloads to a third party (scope violation + guaranteed false positive:
+        // an external service's response varies by its own params, which fools differential oracles). Skip anything
+        // Burp says is out of scope. Generic — respects whatever scope the operator/launcher set.
+        try { if (!api.scope().isInScope(req.url())) { scanLog.debug("[AI Scanner]   skip out-of-scope: " + stripQuery(req.url())); return false; } }
+        catch (Throwable ignore) { }
+        // NEVER put login/logout/signin in the probe surface: a probe fuzzing them submits credentials / hits the
+        // logout, which INVALIDATES our authenticated session mid-battery — every authenticated endpoint tested
+        // afterwards then bounces to login (302) and its sink is missed (observed: reflected-XSS on Zero Bank's
+        // /bank/* went from 5→0 in a full run because a prior probe fuzzed /signin.html and logged us out). Login
+        // SQLi / weak-creds are covered separately by the auth phase + auditAuthPages() (run in isolation, after).
+        if (AuthenticatedExplorer.SESSION_RESET.matcher(stripQuery(req.url())).matches()) {
+            scanLog.debug("[AI Scanner]   skip auth page (would drop session if fuzzed): " + stripQuery(req.url()));
+            return false;
+        }
         if (STATIC.matcher(pathOf(req)).matches()) return false;
         if (!hasFuzzable(req)) return false;
         StringBuilder key = new StringBuilder(req.method()).append(' ').append(hostOf(req.url())).append(pathTemplate(req));
@@ -1039,11 +1489,58 @@ public final class AiScanner {
         return false;
     }
 
+    /** Build a concrete, baseline-seeded request for every SAST hint that names a route + param, and add it to
+     *  the audit surface. This bridges "source knows the route/param" → "a real request the probes can mutate",
+     *  using class-appropriate seeds so JSON.parse/mongo sinks return a valid baseline instead of erroring out. */
+    private void synthesizeHintTargets(String host, SourceFindings hints, List<HttpRequest> targets, Set<String> seen) {
+        if (hints == null || hints.isEmpty() || targets.isEmpty()) return;
+        String base = originOf(targets.get(0).url());
+        if (base == null) return;
+        int added = 0;
+        for (com.ioactive.aiscanner.scan.sast.StaticHint h : hints.all()) {
+            if (!h.hasEndpoint() || !h.hasParam()) continue;
+            try {
+                String path = h.path.replaceAll("\\{[^}]*}", "1");
+                if (!path.startsWith("/")) path = "/" + path;
+                String method = h.method.isBlank() ? "GET" : h.method.toUpperCase();
+                String abs = base.replaceFirst("/+$", "") + path;
+                List<String> ps = new ArrayList<>();
+                ps.add(h.paramName);
+                for (String p : h.params) if (!ps.contains(p) && !p.isBlank()) ps.add(p);
+                HttpRequest req;
+                if ("POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method)) {
+                    StringBuilder sb = new StringBuilder("{");
+                    for (int i = 0; i < ps.size(); i++) {
+                        if (i > 0) sb.append(',');
+                        sb.append('"').append(ps.get(i)).append("\":\"").append(hintSeed(ps.get(i))).append('"');
+                    }
+                    req = HttpRequest.httpRequestFromUrl(abs).withMethod(method)
+                            .withAddedHeader("Content-Type", "application/json").withBody(sb.append('}').toString());
+                } else {
+                    req = HttpRequest.httpRequestFromUrl(abs).withMethod(method);
+                    for (String p : ps) req = req.withAddedParameters(HttpParameter.urlParameter(p, hintSeed(p)));
+                }
+                if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
+                if (addTarget(targets, seen, req)) added++;
+            } catch (Throwable ignore) { }
+        }
+        if (added > 0) scanLog.log("[AI Scanner] SAST: synthesized " + added
+                + " concrete hint-target(s) (route+param+baseline) into the audit surface.");
+    }
+
+    /** Baseline value for a synthesized hint param: a resolvable host for command/host-lookup sinks (so the
+     *  time-based command oracle has a valid base), else a harmless numeric "1" (valid for id/JSON.parse sinks). */
+    private static String hintSeed(String name) {
+        String n = name == null ? "" : name.toLowerCase();
+        if (n.matches(".*(host|ip|addr|ping|target|dns|url|domain).*")) return "127.0.0.1";
+        return "1";
+    }
+
     /** Send one request and measure it, computing the flow-engine's anti-hallucination {@code live} gate. */
     StepResult sendAndMeasure(HttpRequest req) {
         long t0 = System.nanoTime();
         HttpRequestResponse r;
-        try { r = api.http().sendRequest(req, RequestOptions.requestOptions()); }
+        try { r = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return StepResult.dead((System.nanoTime() - t0) / 1_000_000L); }
         long ms = (System.nanoTime() - t0) / 1_000_000L;
         if (r == null || r.response() == null) return StepResult.dead(ms);
@@ -1064,6 +1561,52 @@ public final class AiScanner {
         if (session != null && session.hasSigningKey())
             r = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey()).sign(r);
         return r;
+    }
+
+    /**
+     * Return a response with an UNCOMPRESSED body. Burp's sendRequest() returns the raw response, so a
+     * gzip/deflate body (any compressing proxy/CDN — ngrok, Cloudflare, nginx gzip) reaches bodyToString() as
+     * compressed bytes, and HTML/JS mining then finds 0 &lt;script src&gt;/endpoints. Decompressing at the fetch
+     * source (so the site-map entry is plain text) fixes every downstream reader without wrapping any of them.
+     * No-op when the body isn't compressed or the codec is one the JDK lacks (brotli).
+     */
+    public static burp.api.montoya.http.message.responses.HttpResponse decompress(
+            burp.api.montoya.http.message.responses.HttpResponse resp) {
+        try {
+            if (resp == null) return resp;
+            byte[] raw = resp.body().getBytes();
+            if (raw == null || raw.length < 2) return resp;
+            String enc = resp.hasHeader("Content-Encoding") ? resp.headerValue("Content-Encoding") : null;
+            String el = enc == null ? "" : enc.toLowerCase();
+            int b0 = raw[0] & 0xFF, b1 = raw[1] & 0xFF;
+            // Detect the codec by MAGIC BYTES, not just the header: Burp can hand back a compressed body with the
+            // Content-Encoding header stripped, so a header-only check misses it. gzip=1f8b; zlib/deflate=78 xx.
+            // Generic — works for ngrok/CDN/nginx compression whether or not the header survives.
+            boolean gzip    = (b0 == 0x1f && b1 == 0x8b) || el.contains("gzip");
+            boolean zlib    = b0 == 0x78 && (b1 == 0x01 || b1 == 0x9c || b1 == 0xda);
+            boolean deflate = !gzip && (zlib || el.contains("deflate"));
+            if (!gzip && !deflate) return resp; // plain, or brotli (no JDK codec) — leave as-is
+            byte[] out;
+            if (gzip) out = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(raw)).readAllBytes();
+            else {
+                // zlib-wrapped inflates directly; a raw (headerless) deflate stream needs nowrap=true — try both.
+                try { out = new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(raw)).readAllBytes(); }
+                catch (Throwable t) {
+                    out = new java.util.zip.InflaterInputStream(new java.io.ByteArrayInputStream(raw),
+                            new java.util.zip.Inflater(true)).readAllBytes();
+                }
+            }
+            burp.api.montoya.http.message.responses.HttpResponse r =
+                    resp.withBody(burp.api.montoya.core.ByteArray.byteArray(out));
+            if (enc != null) r = r.withRemovedHeader("Content-Encoding");
+            return r;
+        } catch (Throwable t) { return resp; }
+    }
+
+    /** Convenience: decompress the response inside an HttpRequestResponse (keeps the original request). */
+    public static HttpRequestResponse decompress(HttpRequestResponse rr) {
+        if (rr == null || rr.response() == null) return rr;
+        return HttpRequestResponse.httpRequestResponse(rr.request(), decompress(rr.response()));
     }
 
     // ---- JSON body insertion points (Montoya doesn't parse JSON into parameters()) ----

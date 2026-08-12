@@ -103,6 +103,15 @@ public final class VulnClasses {
         Oracle oracle = (base, mutated, timing, payload) -> {
             String m = mutated == null ? "" : mutated;
             String b = base == null ? "" : base;
+            // FILE-path traversal only. If the OS-file disclosure came via a shell-metacharacter payload it is OS
+            // command injection (a distinct class Burp's audit + our cmdi check own) — don't mislabel it as LFI.
+            // Require a path-shaped payload (traversal sequence, scheme wrapper, or an absolute OS path) with no
+            // command separators; otherwise defer (miss). Generic — no per-endpoint rules.
+            String pl = payload == null ? "" : payload;
+            boolean pathShaped = pl.contains("..") || pl.contains("://")
+                    || pl.toLowerCase().matches("(?s).*(/etc/|/proc/|\\\\windows\\\\|%2e).*");
+            boolean cmdiShaped = pl.matches("(?s).*[;&|`\\n\\r].*") || pl.contains("$(");
+            if (!pathShaped || cmdiShaped) return Signal.miss();
             if (m.matches("(?s).*root:.*:0:0:.*") && !b.matches("(?s).*root:.*:0:0:.*")) {
                 return Signal.hit("Contents of /etc/passwd returned (root:...:0:0:)", Signal.Confidence.FIRM);
             }

@@ -51,7 +51,7 @@ public final class FileServePathProbe {
                         HttpRequest req = HttpRequest.httpRequestFromUrl(base + suf).withMethod("GET");
                         if (cookieHeader != null && !cookieHeader.isBlank()) req = req.withHeader("Cookie", cookieHeader);
                         if (bearer != null && !bearer.isBlank()) req = req.withHeader("Authorization", "Bearer " + bearer);
-                        HttpRequestResponse r = api.http().sendRequest(req, RequestOptions.requestOptions());
+                        HttpRequestResponse r = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
                         if (r == null || r.response() == null) continue;
                         int st = r.response().statusCode();
                         int len = r.response().body().length();

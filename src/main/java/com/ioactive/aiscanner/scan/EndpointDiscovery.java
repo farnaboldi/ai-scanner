@@ -55,6 +55,10 @@ public final class EndpointDiscovery {
     // quoted absolute URL or root-relative path (optionally with a query string)
     private static final Pattern URLISH = Pattern.compile(
             "[\"'`]((?:https?://[^\"'`\\s]+)|(?:/[A-Za-z0-9_][A-Za-z0-9_\\-/.]*(?:\\?[^\"'`\\s]*)?))[\"'`]");
+    // A quoted page-ish leaf ending in a server-page extension (login.html, transfer.jsp, do…). Used AFTER collapsing
+    // string concatenations, to recover URLs JS builds by concat (e.g. path + "login" + ".html") that URLISH misses.
+    private static final Pattern CONCAT_PAGE = Pattern.compile(
+            "[\"'`]([A-Za-z0-9_][A-Za-z0-9_\\-/]{0,60}\\.(?:html?|jspx?|php|do|action|aspx?|mvc))(?:\\?[^\"'`]*)?[\"'`]");
     private static final String SEP = "\u0001"; // spec field delimiter
     // third-party libraries: no business endpoints, and they used to eat the mining budget
     private static final Pattern LIBRARY_JS = Pattern.compile("(?i).*\\b(jquery|bootstrap|angular|backbone"
@@ -67,6 +71,17 @@ public final class EndpointDiscovery {
                                                       // API surface (deterministic, not a random 80-of-N subset)
     private static final int MAX_SOURCES = 40;        // pages/scripts considered per scan
     private static final int MAX_LLM_CALLS = 8;       // chunks mined per scan (≈240k chars total coverage)
+    /** LLM discovery rounds to UNION (temp>0 samples differently each round → more coverage, and the union
+     *  converges → reproducible). Default 3; override -Daiscanner.discoveryRounds / AISCANNER_DISCOVERY_ROUNDS.
+     *  At temp=0 the early-stop collapses this to 1 round (greedy = identical each pass). Clamped to [1,10]. */
+    private static int discoveryRounds() {
+        String v = System.getProperty("aiscanner.discoveryRounds");
+        if (v == null || v.isBlank()) v = System.getenv("AISCANNER_DISCOVERY_ROUNDS");
+        if (v == null || v.isBlank()) return 3;
+        try { return Math.max(1, Math.min(10, Integer.parseInt(v.trim()))); } catch (NumberFormatException e) { return 3; }
+    }
+    /** Public accessor so the run-start banner can log the configured round count alongside the engine params. */
+    public static int discoveryRoundsPublic() { return discoveryRounds(); }
     private static final int MAX_FETCH_SCRIPTS = 30;  // referenced JS chunks to ACTIVELY fetch for mining (SPAs)
     // Any .js referenced by a page (script src / preload link href) — the SPA bundles that hold the real API.
     private static final Pattern SCRIPT_REF = Pattern.compile("(?i)(?:src|href)\\s*=\\s*[\"']([^\"']+\\.js(?:\\?[^\"']*)?)[\"']");
@@ -83,6 +98,14 @@ public final class EndpointDiscovery {
 
     /** AI-path-discovered HTML pages, for the caller to bridge to the site map + derive forms from. */
     public List<HttpRequestResponse> lastDiscoveredPages() { return discoveredPages; }
+
+    /** Source-derived endpoint hints (hidden routes/params from SAST). Empty = no effect on discovery. */
+    private final java.util.List<com.ioactive.aiscanner.scan.sast.StaticHint> sourceHints = new java.util.ArrayList<>();
+
+    /** Feed source-analysis directives so their routes/params get probed as candidate endpoints too. */
+    public void addSourceHints(com.ioactive.aiscanner.scan.sast.SourceFindings f) {
+        if (f != null) sourceHints.addAll(f.hiddenEndpoints());
+    }
 
     /**
      * Stash a probe response for the site-map bridge — ONLY when it passes the same guards discovery
@@ -106,7 +129,39 @@ public final class EndpointDiscovery {
      * Mine candidate endpoint specs ("METHOD SEP path SEP csv-params") from the host's client-side
      * code (regex + LLM over ~30k chunks). Shared by {@link #discover} and {@link #discoverAuthRequests}.
      */
+    // Per-host memo of the mined spec set + the source-count it was built from. mineSpecs() is called by BOTH
+    // discover() and discoverAuthRequests(); without this the whole mine (regex + full-body harvest + LLM calls)
+    // ran TWICE per host — double LLM cost and every "harvested endpoint" logged twice. We re-mine ONLY when the
+    // source set actually grew (e.g. authed scripts entered the site map), so post-auth coverage is preserved.
+    // STATIC (scan-scoped) memo: AiScanner.discoverAuthRequests() news a FRESH EndpointDiscovery per call, and
+    // the auth orchestration calls it 4× (+ discover() once) — so an instance-field memo reset every time and the
+    // full mine (gatherSources fetch + regex + full-body harvest + 3× LLM chunk calls) ran ~5× per host: 5× LLM
+    // cost + the mine-src fetch spam. A static memo shares the result across all instances for the host. Safe
+    // across targets/cells: keyed by host, and each matrix cell is its own Burp process (fresh statics).
+    private static final java.util.Map<String, Set<String>> specsCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<String, Integer> specsSiteMapCount = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Same-host site-map entry count — a CHEAP freshness signal (no body reads / fetches / LLM) so a memo hit
+     *  skips gatherSources() entirely. Re-mine only when the surface actually grew (e.g. authed pages arrived). */
+    private int siteMapCountForHost(String host) {
+        int n = 0;
+        try { for (HttpRequestResponse rr : api.siteMap().requestResponses())
+                if (rr.request() != null && host.equalsIgnoreCase(hostOf(rr.request().url()))) n++; }
+        catch (Throwable ignore) { }
+        return n;
+    }
+
     Set<String> mineSpecs(String host) {
+        // Cheap pre-check BEFORE the expensive gatherSources(): reuse the memoized specs when the site map hasn't
+        // grown since the last mine — this is what actually kills the 5× re-mine + mine-src fetch spam.
+        int smc = siteMapCountForHost(host);
+        Set<String> cachedEarly = specsCache.get(host);
+        Integer prevSmc = specsSiteMapCount.get(host);
+        if (cachedEarly != null && prevSmc != null && prevSmc == smc) {
+            scanLog.debug("[AI Scanner] endpoint discovery: reusing " + cachedEarly.size() + " mined spec(s) for "
+                    + host + " (site map unchanged since last pass — skipping re-mine + re-LLM + re-fetch)");
+            return new LinkedHashSet<>(cachedEarly);
+        }
         Set<String> specs = new LinkedHashSet<>();
         List<String[]> sources = gatherSources(host);   // {url, body}, deep/authenticated pages first
         if (sources.isEmpty()) {
@@ -124,15 +179,40 @@ public final class EndpointDiscovery {
         // run-to-run). This is the coverage floor; the LLM pass below only ADDS non-literal/inferred routes.
         int harvested = harvestApiPaths(host, specs);
         List<String> chunks = packChunks(sources);
-        for (int i = 0; i < chunks.size() && i < MAX_LLM_CALLS && canLlm; i++) {
-            int before = specs.size();
-            llmCandidates(eng, chunks.get(i), specs);
-            llm += specs.size() - before;
+        // N-ROUND UNION: at temp>0 the LLM samples DIFFERENT candidates each pass, so we run discovery N times and
+        // UNION the results (specs is a Set → dedup is automatic). This tames the sampling variance WITHOUT losing
+        // the LLM's exploratory coverage: as N grows, two "N-round" runs converge to the same set (the model's
+        // high-probability endpoints appear every round; only the rare tail differs). EARLY-STOP when a round adds
+        // nothing new (converged) — so at temp=0 (greedy, identical each pass) this collapses to a single round.
+        int rounds = discoveryRounds();
+        int roundsRun = 0;
+        int emptyStreak = 0;                            // consecutive rounds that added nothing new
+        for (int r = 0; r < rounds && canLlm; r++) {
+            int roundBefore = specs.size();
+            int rawThisRound = 0;                       // RAW endpoints the LLM parsed this round (pre-dedup)
+            for (int i = 0; i < chunks.size() && i < MAX_LLM_CALLS; i++) {
+                int before = specs.size();
+                rawThisRound += llmCandidates(eng, chunks.get(i), specs);   // returns RAW parsed count
+                llm += specs.size() - before;
+            }
+            roundsRun++;
+            int added = specs.size() - roundBefore;
+            // Log RAW parsed (what the model actually returned) AND new-after-union — so we can see whether a round
+            // added nothing because the LLM returned nothing vs. returned dupes (the variance we've been chasing).
+            if (rounds > 1) scanLog.log("[AI Scanner]   discovery round " + (r + 1) + "/" + rounds
+                    + ": LLM parsed " + rawThisRound + " endpoint(s), +" + added + " new (union now " + specs.size() + ")");
+            // Each round uses a DIFFERENT seed → a single empty/weak round is just a bad roll, NOT convergence: the
+            // next round (fresh seed) can recover. So only stop after TWO CONSECUTIVE empty rounds (true convergence,
+            // or greedy temp=0 where every round is identical). Stopping on the FIRST +0 wasted the seed diversity.
+            emptyStreak = (added == 0) ? emptyStreak + 1 : 0;
+            if (emptyStreak >= 2) break;
         }
         scanLog.log("[AI Scanner] endpoint discovery: regex " + regex + " + full-body harvest " + harvested
                 + " + LLM " + llm + " candidate(s) from " + sources.size() + " source(s) in "
-                + Math.min(chunks.size(), MAX_LLM_CALLS) + " chunk(s); probing with "
+                + Math.min(chunks.size(), MAX_LLM_CALLS) + " chunk(s) × " + roundsRun + " round(s); probing with "
                 + (session.has() ? "authenticated session" : "no session") + "…");
+        specsCache.put(host, new LinkedHashSet<>(specs));   // memoize; re-mined only when the site map grows
+        specsSiteMapCount.put(host, smc);
         return specs;
     }
 
@@ -331,6 +411,87 @@ public final class EndpointDiscovery {
                 Object v = o.get(k);
                 if ((v instanceof String || v instanceof Number) && k.matches("[A-Za-z_][A-Za-z0-9_]{0,40}") && out.size() < max) out.add(k);
             }
+        } catch (Throwable ignore) { }
+        return out;
+    }
+
+    /**
+     * Turn every REACHED JSON collection into parameterized reads for the active audit. A REST endpoint that
+     * returns {@code [{id,title,description,…}]} tells us its OWN filter/query field names — the response keys
+     * ARE the candidate query params (Spring {@code @RequestParam(required=false)} filters, IDs, etc. that no
+     * HTML or JS ever reveals on a JSON-only API / SPA-orphaned backend). A param-less {@code GET /rest/movie}
+     * is a dead read; {@code GET /rest/movie?id=&title=&…} goes to Burp's active audit, which fuzzes each param
+     * (SQLi / reflected-XSS / etc.). Fully generic: params come from the server's OWN response shape — no
+     * wordlist, no app knowledge. Covers the seed endpoint and anything the crawl reached. Bounded per the
+     * BApp large-project rule. This is the piece that lets Burp fuzz a JSON API it would otherwise see as a
+     * single unparameterized GET.
+     */
+    private void synthesizeParamReadsFromJson(String host, List<HttpRequest> live, Set<String> seen) {
+        int collections = 0, added = 0;
+        try {
+            // Dedupe candidate collection URLs first (the crawl may hold many copies of the same path).
+            Set<String> candidates = new LinkedHashSet<>();
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (candidates.size() >= 40) break;
+                if (rr == null || rr.response() == null) continue;
+                HttpRequest req = rr.request();
+                if (!"GET".equalsIgnoreCase(req.method())) continue;
+                if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
+                if (req.url().contains("?")) continue;                    // already parameterized — Burp fuzzes it already
+                if (STATIC.matcher(req.url()).matches() || req.url().toLowerCase().contains(".js")) continue;
+                int st = rr.response().statusCode();
+                if (st < 200 || st >= 300 || isHtmlShell(rr)) continue;
+                if (!respIsStructured(rr)) continue;                       // JSON or XML collection, not the HTML shell
+                candidates.add(stripQuery(req.url()));
+            }
+            for (String abs : candidates) {
+                // Re-probe forcing JSON (Spring/JAXB apps content-negotiate to XML under a browser Accept, so the
+                // crawl's copy is XML): a JSON body lets responseKeys mine the field names cleanly. Fall back to XML
+                // element names when the server ignores Accept. Either way the field names ARE the query params.
+                HttpRequestResponse jr = probe(jsonGet(abs));
+                List<String> keys = (jr != null && jr.response() != null) ? responseKeys(jr, 6) : java.util.Collections.emptyList();
+                if (keys.isEmpty()) keys = xmlElementNames(jr, 6);        // JAXB/XML-only API fallback
+                if (keys.isEmpty()) continue;
+                collections++;
+                for (String key : keys) {
+                    if (seen.add("GET " + abs + "?" + key)) {
+                        live.add(jsonGet(abs + "?" + key + "=" + READ_SEED));   // one param present → active audit fuzzes it
+                        added++;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] JSON param-read synthesis failed: " + t);
+        }
+        if (added > 0) scanLog.log("[AI Scanner] JSON param-read synthesis: " + added
+                + " param-seeded read(s) from " + collections + " reached JSON/XML collection(s) → active audit (SQLi/XSS surface).");
+    }
+
+    /** True when a 2xx body is structured data (JSON or XML) a handler produced — not the SPA HTML shell. */
+    private static boolean respIsStructured(HttpRequestResponse rr) {
+        if (respIsJson(rr)) return true;
+        if (isHtmlShell(rr)) return false;
+        try {
+            String ct = rr.response().headerValue("Content-Type");
+            if (ct != null && ct.toLowerCase().contains("xml")) return true;
+            String b = rr.response().bodyToString();
+            return b != null && b.trim().startsWith("<") && !b.trim().toLowerCase().startsWith("<!doctype")
+                    && !b.trim().toLowerCase().startsWith("<html");
+        } catch (Throwable ignore) { return false; }
+    }
+
+    // Leaf XML elements that carry text — <id>1</id>, <title>…</title>. Their names are the candidate query params
+    // for a JAXB/XML REST collection, exactly as JSON keys are. Container tags (List/item/rows) carry no text → skipped.
+    private static final Pattern XML_LEAF = Pattern.compile("<([A-Za-z_][A-Za-z0-9_]{0,40})>[^<>\\s]");
+
+    private List<String> xmlElementNames(HttpRequestResponse rr, int max) {
+        List<String> out = new ArrayList<>();
+        try {
+            if (rr == null || rr.response() == null) return out;
+            String b = rr.response().bodyToString();
+            if (b == null) return out;
+            Matcher m = XML_LEAF.matcher(b);
+            while (m.find() && out.size() < max) { String k = m.group(1); if (!out.contains(k)) out.add(k); }
         } catch (Throwable ignore) { }
         return out;
     }
@@ -551,12 +712,110 @@ public final class EndpointDiscovery {
     }
 
     /** Discover + probe endpoints for the host; returns live requests (with params) to audit. */
+    private static final int MAX_FORMS = 80;
+    private static final Pattern FORM_BLOCK  = Pattern.compile("(?is)<form\\b([^>]*)>(.*?)</form>");
+    private static final Pattern F_ACTION    = Pattern.compile("(?is)\\baction\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
+    private static final Pattern F_METHOD    = Pattern.compile("(?is)\\bmethod\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
+    private static final Pattern F_INPUT     = Pattern.compile("(?is)<(input|select|textarea|button)\\b([^>]*)>");
+    private static final Pattern F_NAME      = Pattern.compile("(?is)\\bname\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
+    private static final Pattern F_VALUE     = Pattern.compile("(?is)\\bvalue\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
+    private static final Pattern F_TYPE      = Pattern.compile("(?is)\\btype\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
+    private static String attrOf(Pattern p, String s) {
+        Matcher m = p.matcher(s); if (!m.find()) return null; String v = m.group(1).trim();
+        if (v.length() >= 2 && (v.charAt(0) == '"' || v.charAt(0) == '\'')) v = v.substring(1, v.length() - 1);
+        return v;
+    }
+    private static String urlenc(String s) { try { return java.net.URLEncoder.encode(s, "UTF-8"); } catch (Exception e) { return s; } }
+
+    /**
+     * Generic HTML-form → parameterized-request synthesis. Server-rendered apps (DVWA's /vulnerabilities/*,
+     * classic MPAs) put their real injectable surface in {@code <form>}s; the crawler records the action URL but
+     * no PARAMETERS, so the fields are never exercised. This parses every same-host HTML form already in the site
+     * map, fills each named field with its own value or a benign seed, and emits a GET (query) or POST (body)
+     * request — an insertion-point set Burp's active audit + our probes then fuzz. Universal HTML, no app rules.
+     */
+    private void harvestHtmlForms(String host, List<HttpRequest> live, Set<String> seen) {
+        int added = 0;
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            if (added >= MAX_FORMS) break;
+            if (rr.response() == null || rr.request() == null) continue;
+            String pageUrl = rr.request().url();
+            if (!host.equalsIgnoreCase(hostOf(pageUrl))) continue;
+            String ct = rr.response().statedMimeType() == null ? "" : rr.response().statedMimeType().name();
+            String body = rr.response().bodyToString();
+            if (!"HTML".equals(ct) && !body.toLowerCase().contains("<form")) continue;
+            Matcher fm = FORM_BLOCK.matcher(body);
+            while (fm.find() && added < MAX_FORMS) {
+                String attrs = fm.group(1), inner = fm.group(2);
+                String action = attrOf(F_ACTION, attrs);
+                String method = attrOf(F_METHOD, attrs);
+                method = (method == null ? "GET" : method).toUpperCase();
+                if (!"GET".equals(method) && !"POST".equals(method)) method = "GET";
+                String abs;
+                try { abs = (action == null || action.isBlank()) ? stripQuery(pageUrl) : URI.create(pageUrl).resolve(action).toString(); }
+                catch (Exception e) { continue; }
+                if (!host.equalsIgnoreCase(hostOf(abs))) continue;
+                if (AuthenticatedExplorer.SESSION_RESET.matcher(abs).matches()) continue;   // never re-submit login/logout
+                java.util.LinkedHashMap<String, String> fields = new java.util.LinkedHashMap<>();
+                Matcher im = F_INPUT.matcher(inner);
+                String firstPw = null;   // mirror the first password value into confirm/matching fields
+                while (im.find()) {
+                    String tag = im.group(2);
+                    String name = attrOf(F_NAME, tag); if (name == null || name.isBlank()) continue;
+                    String type = attrOf(F_TYPE, tag); type = type == null ? "text" : type.toLowerCase();
+                    if (type.equals("button") || type.equals("reset")) continue;
+                    String val = attrOf(F_VALUE, tag);
+                    if ("password".equals(type)) {
+                        // register / change-password forms validate password == confirm/matching: reuse ONE value
+                        // across every password field, else the form is rejected before any injection is reached.
+                        if (val == null) { if (firstPw == null) firstPw = String.valueOf(seedFor(name, type)); val = firstPw; }
+                        else if (firstPw == null) firstPw = val;
+                    } else if (val == null) {
+                        val = String.valueOf(seedFor(name, type));   // keep submit values (isset checks)
+                    }
+                    fields.put(name, val);
+                }
+                if (fields.isEmpty()) continue;
+                String key = method + " " + stripQuery(abs) + " " + fields.keySet();
+                if (!seen.add(key)) continue;
+                StringBuilder enc = new StringBuilder();
+                for (Map.Entry<String, String> e : fields.entrySet()) {
+                    if (enc.length() > 0) enc.append('&');
+                    enc.append(urlenc(e.getKey())).append('=').append(urlenc(e.getValue()));
+                }
+                HttpRequest req;
+                if ("POST".equals(method)) {
+                    req = withSessionCookie(HttpRequest.httpRequestFromUrl(stripQuery(abs)).withMethod("POST"))
+                            .withAddedHeader("Content-Type", "application/x-www-form-urlencoded")
+                            .withBody(enc.toString());
+                } else {
+                    req = withSessionCookie(HttpRequest.httpRequestFromUrl(stripQuery(abs) + "?" + enc).withMethod("GET"));
+                }
+                live.add(req); added++;
+                scanLog.log("[AI Scanner]   -> FORM " + method + " " + stripQuery(abs) + " {" + String.join(",", fields.keySet()) + "}");
+            }
+        }
+        if (added > 0) scanLog.log("[AI Scanner] html-form synthesis: " + added + " parameterized form request(s) for the active audit.");
+    }
+
     public List<HttpRequest> discover(String host) {
         List<HttpRequest> live = new ArrayList<>();
         try {
             String baseUrl = baseUrlFor(host);
             Set<String> specs = mineSpecs(host);
             if (baseUrl == null) return live;
+
+            // SAST-driven surface expansion: source analysis may name routes/params the crawler never linked
+            // to. Add them as candidate specs — they ride the SAME live-probe + keep() path below, so any
+            // hallucinated/dead route is filtered out exactly like a mined one (no phantom coverage).
+            if (!sourceHints.isEmpty()) {
+                int addedFromSource = 0;
+                for (com.ioactive.aiscanner.scan.sast.StaticHint h : sourceHints) {
+                    if (specs.add(h.toEndpointSpec(SEP))) addedFromSource++;
+                }
+                if (addedFromSource > 0) scanLog.log("[AI Scanner]   +" + addedFromSource
+                        + " source-derived endpoint spec(s) to probe (SAST-driven surface).");
+            }
 
             Set<String> seen = new LinkedHashSet<>();
             int probed = 0;
@@ -628,6 +887,8 @@ public final class EndpointDiscovery {
             probeWellKnown(host, baseUrl, live, seen);   // standards/infra paths + i18n negative-diff
             probeAiProposedPaths(host, baseUrl, live, seen);   // LLM-proposed UNLINKED sensitive paths (admin/*, etc.)
             discoverClientRouteApis(host, baseUrl, live, seen); // SPA route nouns → API resources (frontend-orphaned endpoints)
+            harvestHtmlForms(host, live, seen);          // server-rendered <form>s → parameterized GET/POST for the active audit
+            synthesizeParamReadsFromJson(host, live, seen); // reached JSON collections → param-seeded reads (response keys ARE the query params)
             scanLog.log("[AI Scanner] endpoint discovery: " + live.size()
                     + " live endpoint(s) Burp's crawler missed.");
         } catch (Throwable t) {
@@ -1902,8 +2163,20 @@ public final class EndpointDiscovery {
         return out;
     }
 
+    // An auth verb in the path (login/register/…). // and a clearly POST-AUTH / profile / change-password path.
+    private static final Pattern AUTH_VERB_PATH = Pattern.compile(
+            "(?i).*(log-?in|sign-?in|authenticate|/auth\\b|register|sign-?up|/session|/token|users?/create|account/create).*");
+    private static final Pattern POST_AUTH_PATH = Pattern.compile(
+            "(?i).*(useredit|user-edit|profile|/account|settings|preferences|change-?pass|update-?pass|/edit|myaccount|dashboard).*");
+
     private void addAuthCandidate(List<HttpRequest> out, Set<String> seen, HttpRequest req, String host) {
         if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) return;
+        // A change-password / profile form (password + confirm) looks like a register form but is NOT an auth
+        // endpoint — it needs an existing session, so registering/logging-in against it just wastes the whole
+        // battery (DVNA /app/useredit was hammered as a login/register candidate). Skip clearly post-auth paths
+        // unless the path ALSO carries an auth verb. Generic path heuristic, no app-specific names.
+        String path; try { path = java.net.URI.create(req.url()).getPath(); } catch (Exception e) { path = req.url(); }
+        if (path != null && POST_AUTH_PATH.matcher(path).matches() && !AUTH_VERB_PATH.matcher(path).matches()) return;
         String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
         String kind = ct != null && ct.toLowerCase().contains("json") ? "json" : "form";
         if (seen.add(req.method() + " " + stripQuery(req.url()) + " " + kind)) out.add(req);
@@ -1924,6 +2197,19 @@ public final class EndpointDiscovery {
             if (p == null || p.isBlank() || STATIC.matcher(p).matches()) continue;
             if (!looksLikeEndpoint(p)) continue;
             if (out.add("GET" + SEP + p + SEP)) n++;
+        }
+        // Concatenated URLs: JS commonly builds a page URL by string concat — e.g. Zero Bank does
+        //   window.location.href = path + "login" + ".html";
+        // The literal "/login.html" never appears, so URLISH (and the whole HTTP crawl that relies on static links)
+        // misses it → the app is unreachable. Collapse adjacent string-literal concatenations ("a" + "b" → "ab"),
+        // then recover any page-ish leaf that results (login.html → /login.html). Generic, deterministic (no LLM).
+        String merged = code.replaceAll("[\"'`]\\s*\\+\\s*[\"'`]", "");
+        Matcher cm = CONCAT_PAGE.matcher(merged);
+        while (cm.find() && out.size() < 400) {
+            String leaf = cm.group(1).trim();
+            if (leaf.isBlank() || STATIC.matcher(leaf).matches()) continue;
+            String path = leaf.startsWith("/") ? leaf : "/" + leaf;
+            if (out.add("GET" + SEP + path + SEP)) n++;
         }
         return n;
     }
@@ -2095,24 +2381,59 @@ public final class EndpointDiscovery {
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.optJSONObject(i);
                 if (o == null) continue;
-                String path = o.optString("path", "").trim();
+                // SCHEMA-TOLERANT: at temp>0 the model often drifts from our {method,path,params} shape and names
+                // the path "endpoint" or "url" (verified via TRACE — those replies were silently parsed to 0). Accept
+                // the common aliases and normalize a full URL down to its path. Hallucinated externals (example.com,
+                // a wrong host) still get filtered downstream by live-probing, so tolerance costs coverage nothing.
+                String path = firstNonBlank(o.optString("path", ""), o.optString("endpoint", ""),
+                        o.optString("url", ""), o.optString("route", ""), o.optString("uri", ""));
+                path = normalizePath(path);
                 if (path.isBlank() || STATIC.matcher(path).matches()) continue;
-                String method = o.optString("method", "GET").trim().toUpperCase();
+                String method = o.optString("method", o.optString("verb", "GET")).trim().toUpperCase();
                 if (!method.equals("GET") && !method.equals("POST")) method = "GET";
                 StringBuilder ps = new StringBuilder();
+                // params can be a "params" array OR the keys of a "data"/"body"/"params" object (also seen at temp>0).
                 JSONArray pj = o.optJSONArray("params");
                 if (pj != null) {
                     for (int k = 0; k < pj.length(); k++) {
                         String pn = pj.optString(k, "").trim();
-                        if (pn.isBlank()) continue;
-                        if (ps.length() > 0) ps.append(',');
-                        ps.append(pn);
+                        if (!pn.isBlank()) { if (ps.length() > 0) ps.append(','); ps.append(pn); }
+                    }
+                } else {
+                    JSONObject pobj = o.optJSONObject("data");
+                    if (pobj == null) pobj = o.optJSONObject("body");
+                    if (pobj == null) pobj = o.optJSONObject("params");
+                    if (pobj != null) for (String k : pobj.keySet()) {
+                        if (!k.isBlank()) { if (ps.length() > 0) ps.append(','); ps.append(k); }
                     }
                 }
-                if (out.add(method + SEP + path + SEP + ps)) n++;
+                out.add(method + SEP + path + SEP + ps);   // dedup into the union set
+                n++;                                       // count EVERY valid parsed entry (RAW, pre-dedup)
             }
         } catch (Exception ignore) { }
         return n;
+    }
+
+    static String firstNonBlank(String... vs) {
+        if (vs != null) for (String v : vs) if (v != null && !v.trim().isEmpty()) return v.trim();
+        return "";
+    }
+
+    /** Normalize a candidate path value into a server path: a full URL → its path; a bare "foo/bar" → "/foo/bar";
+     *  placeholders with no '/' ("endpoint1") or host-only URLs ("http://target-http-address") → "" (rejected). */
+    static String normalizePath(String v) {
+        if (v == null) return "";
+        v = v.trim();
+        if (v.isEmpty()) return "";
+        if (v.matches("(?i)^https?://.*")) {                    // full URL → path only (external host filtered by probing)
+            try { String p = java.net.URI.create(v).getRawPath(); return p == null ? "" : p.trim(); }
+            catch (Exception e) {
+                int s = v.indexOf('/', v.indexOf("://") + 3);
+                return s >= 0 ? v.substring(s).trim() : "";
+            }
+        }
+        if (!v.contains("/")) return "";                        // "endpoint1" / "intercept-request" placeholder → reject
+        return v.startsWith("/") ? v : "/" + v;
     }
 
     private static boolean looksLikeEndpoint(String p) {
@@ -2148,7 +2469,7 @@ public final class EndpointDiscovery {
 
             if (!"POST".equals(method)) {
                 HttpRequest get = HttpRequest.httpRequestFromUrl(abs).withMethod(method);
-                get = addParams(get, params, HttpParameterType.URL);
+                get = addParams(get, params, HttpParameterType.URL, baseUrl);
                 out.add(withSessionCookie(get));
                 return out;
             }
@@ -2156,7 +2477,7 @@ public final class EndpointDiscovery {
             List<String> ps = paramList(params);
             HttpRequest form = HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
                     .withAddedHeader("Content-Type", "application/x-www-form-urlencoded");
-            form = addParams(form, params, HttpParameterType.BODY);
+            form = addParams(form, params, HttpParameterType.BODY, baseUrl);
             HttpRequest json = ps.isEmpty() ? null : withSessionCookie(
                     HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
                             .withAddedHeader("Content-Type", "application/json")
@@ -2170,10 +2491,22 @@ public final class EndpointDiscovery {
         return out;
     }
 
-    private HttpRequest addParams(HttpRequest req, String params, HttpParameterType type) {
+    // A parameter whose value is fetched/opened as a URL (SSRF surface). Seeding it with "1" makes the server's
+    // http.Get("1") fail (502) so the endpoint is dropped as dead; a VALID absolute URL keeps it live so it
+    // reaches the audit surface (and any OAST SSRF check). Generic by name, no app-specifics.
+    // Package-private: also reused by SsrfProbe (single source of truth for the url-like-param heuristic).
+    static final Pattern URL_PARAM = Pattern.compile(
+            "(?i)^(url|uri|link|href|src|dest|destination|target|redirect|redirect_?uri|return|return_?url|"
+            + "next|callback|webhook|feed|proxy|fetch|load|resource|endpoint|remote|host|site|image_?url|img)$");
+
+    private String addParamSeed(String name, String baseUrl) {
+        return (baseUrl != null && URL_PARAM.matcher(name).matches()) ? baseUrl : READ_SEED;
+    }
+
+    private HttpRequest addParams(HttpRequest req, String params, HttpParameterType type, String baseUrl) {
         for (String pn : params.split(",")) {
             pn = pn.trim();
-            if (!pn.isEmpty()) req = req.withAddedParameters(HttpParameter.parameter(pn, "1", type));
+            if (!pn.isEmpty()) req = req.withAddedParameters(HttpParameter.parameter(pn, addParamSeed(pn, baseUrl), type));
         }
         return req;
     }
@@ -2223,7 +2556,8 @@ public final class EndpointDiscovery {
 
     private HttpRequestResponse probe(HttpRequest req) {
         try {
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions());
+            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            rr = AiScanner.decompress(rr);   // plain-text body so HTML/JS mining works behind a compressing proxy/CDN
             // Register DISCOVERED endpoints into the Target site map so they're visible for manual follow-up.
             // A non-404 response means the route actually exists (200/401/403/405/…); a 404 is a guess miss and
             // is left out so the map isn't flooded with negative probes. Signed requests register with their
@@ -2279,8 +2613,17 @@ public final class EndpointDiscovery {
             if (isJs && LIBRARY_JS.matcher(lower).matches()) continue;   // skip libs
             if (!seen.add(stripQuery(url))) continue;
             // A/B: legacy head-truncation when -Daiscanner.legacyMining=true, else the regex-anchored excerpt.
+            byte[] rb = rr.response().body().getBytes();
+            String magic = rb.length >= 2 ? String.format("%02x%02x", rb[0] & 0xFF, rb[1] & 0xFF) : "";
+            rr = AiScanner.decompress(rr);   // site-map re-reads can hand back the compressed body → force plain
             String raw = rr.response().bodyToString();
-            if (isHtml) collectScriptRefs(raw, url, host, scriptRefs);   // note the page's own <script>/preload JS
+            if (isHtml) {
+                int b0 = scriptRefs.size();
+                collectScriptRefs(raw, url, host, scriptRefs);   // note the page's own <script>/preload JS
+                scanLog.debug("[AI Scanner] mine-src " + url + " rawBytes=" + rb.length + " magic=" + magic
+                        + " afterLen=" + raw.length() + " hasScript=" + raw.contains("<script")
+                        + " newRefs=" + (scriptRefs.size() - b0));
+            }
             String body = Boolean.getBoolean("aiscanner.legacyMining")
                     ? trunc(raw, PER_SOURCE_CHARS)
                     : endpointExcerpt(raw, PER_SOURCE_CHARS);

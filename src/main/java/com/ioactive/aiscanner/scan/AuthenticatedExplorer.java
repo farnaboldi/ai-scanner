@@ -73,6 +73,23 @@ public final class AuthenticatedExplorer {
     private static final Pattern REL_TEMPLATE = Pattern.compile(
             "[\"']([A-Za-z0-9_\\-]+(?:/[A-Za-z0-9_\\-]+)*\\.[A-Za-z]{2,8})[\"']");
 
+    // ---- POST-form exercise (so search/filter forms' BODY params enter the audit) ----
+    private static final Pattern FORM_BLOCK  = Pattern.compile("(?is)<form\\b.*?</form>");
+    private static final Pattern FORM_METHOD = Pattern.compile("(?is)\\bmethod\\s*=\\s*" + Q);
+    private static final Pattern FIELD_TAG   = Pattern.compile("(?is)<(input|textarea|select)\\b([^>]*)>");
+    private static final Pattern ATTR_NAME   = Pattern.compile("(?is)\\bname\\s*=\\s*" + Q);
+    private static final Pattern ATTR_VALUE  = Pattern.compile("(?is)\\bvalue\\s*=\\s*" + Q);
+    private static final Pattern ATTR_TYPE   = Pattern.compile("(?is)\\btype\\s*=\\s*" + Q);
+    // SAFETY: NEVER auto-submit a state-changing / dangerous form. This explorer also runs against live prod
+    // engagements — blindly POSTing forms could move money, delete data, change a password, or register users.
+    // Only read/search/filter forms are exercised. Matched against BOTH the action URL and the whole form markup.
+    private static final Pattern FORM_UNSAFE = Pattern.compile(
+            "(?i).*(transfer|pay[-_]?bill|payment|payee|purchase|checkout|withdraw|delete|remove|destroy|"
+          + "update|edit|change|reset|password|passwd|register|sign[-_]?up|create|new-account|admin|"
+          + "settings|profile|deactivate|disable|logout|sign[-_]?out|upload).*");
+    private static final int MAX_FORMS = 12;
+    private int formsExercised = 0;
+
     private static final int MAX_FETCHES = 120;
     private static final int MAX_DEPTH = 3;
     private static final int MAX_REDIRECTS = 6;
@@ -91,6 +108,7 @@ public final class AuthenticatedExplorer {
     public int explore(String host, String landingUrl) {
         Set<String> visited = new LinkedHashSet<>();
         int fetches = 0, scripts = 0;
+        formsExercised = 0;
 
         Deque<String[]> queue = new ArrayDeque<>();   // {url, depth}
         for (String seed : seeds(host, landingUrl)) queue.add(new String[]{seed, "0"});
@@ -135,6 +153,11 @@ public final class AuthenticatedExplorer {
             List<String> refs = new ArrayList<>();
             if (isHtml(rr)) {
                 refs.addAll(extractRefs(body));
+                // Exercise SAFE (search/filter) POST forms so their BODY fields (e.g. a "description" filter that
+                // reflects into the page) enter the site map → the audit fuzzes them. Without this, a POST-only
+                // insertion point is never tested (Burp only audits requests it captured). State-changing forms
+                // are skipped by FORM_UNSAFE. Generic — no app-specific field/endpoint names.
+                exerciseForms(host, base, body, visited);
                 // RequireJS/AMD app: follow the data-main module graph (a runtime graph the BFS can't reach
                 // via depth alone) so app-code endpoint/route literals enter the site map. Runs once/host.
                 if (!amdWalked) {
@@ -205,10 +228,105 @@ public final class AuthenticatedExplorer {
             // data endpoints return "Missing request signature" and the authenticated explore stays shallow.
             if (session != null && session.hasSigningKey())
                 req = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey()).sign(req);
-            return api.http().sendRequest(req, RequestOptions.requestOptions());
+            // Decompress so crawl/mining parses real HTML (not gzip bytes) behind a compressing proxy/CDN.
+            return AiScanner.decompress(
+                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    /** POST the URL authenticated with a form-urlencoded body (cookie/bearer/signing applied like getAuthed). */
+    private HttpRequestResponse postAuthed(String url, String body) {
+        try {
+            HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
+                    .withAddedHeader("Content-Type", "application/x-www-form-urlencoded")
+                    .withBody(body == null ? "" : body);
+            if (session != null && session.has()) req = req.withHeader("Cookie", session.cookieHeader());
+            if (session != null && session.hasBearer()) req = req.withHeader("Authorization", "Bearer " + session.bearer());
+            if (session != null && session.hasSigningKey())
+                req = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey()).sign(req);
+            return AiScanner.decompress(
+                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Submit SAFE (read/search/filter) POST forms found in a page so their BODY fields become audited insertion
+     * points. Fills empty text-like fields with a benign marker (a non-empty value the app will reflect/process),
+     * preserves existing hidden values (CSRF tokens etc.), and NEVER submits a state-changing form (FORM_UNSAFE).
+     * The POST response is added to the site map → the audit later fuzzes its body params. Generic + bounded.
+     */
+    private void exerciseForms(String host, String base, String html, Set<String> visited) {
+        Matcher fm = FORM_BLOCK.matcher(html);
+        while (fm.find() && formsExercised < MAX_FORMS) {
+            String form = fm.group();
+            // Exercise via POST regardless of the form's DECLARED method. A GET form's params are already audited
+            // as URL params, but many apps process the same endpoint on POST too and a reflection/injection sink
+            // can be POST-ONLY (Zero Bank's find-transactions "description" reflects on POST, not GET) — so the
+            // URL-param pass misses it. Submitting a POST twin (only for SAFE forms, guarded below) closes that gap.
+            String action = attr(FORM_ACT, form);
+            String actUrl = null;
+            for (String abs : candidateUrls(base, (action == null || action.isBlank()) ? base : action, host)) { actUrl = abs; break; }
+            if (actUrl == null) actUrl = stripFragment(base);
+            if (!sameHost(actUrl, host)) continue;
+            // SAFETY GUARD: skip auth-reset and any state-changing/dangerous form (matched on URL AND markup).
+            if (SESSION_RESET.matcher(actUrl).matches() || FORM_UNSAFE.matcher(actUrl).matches()
+                    || FORM_UNSAFE.matcher(form).matches()) continue;
+            String key = "POSTFORM " + stripFragment(actUrl);
+            if (!visited.add(key)) continue;
+            StringBuilder body = new StringBuilder();
+            int fields = 0;
+            Matcher tm = FIELD_TAG.matcher(form);
+            while (tm.find()) {
+                String tag = lc(tm.group(1)), attrs = tm.group(2);
+                String name = attr(ATTR_NAME, attrs);
+                if (name == null || name.isBlank()) continue;
+                String type = lc(attr(ATTR_TYPE, attrs));
+                if (type.equals("file") || type.equals("submit") || type.equals("button")
+                        || type.equals("image") || type.equals("reset")) continue;
+                // Fill by field SHAPE so the POST is a VALID request (else the app 400s and never reflects, so the
+                // audited param never reaches its sink). Preserve existing values (hidden CSRF tokens / preselected).
+                String val = attr(ATTR_VALUE, attrs);
+                if (val == null || val.isBlank()) {
+                    String ln = lc(name);
+                    if (tag.equals("select")) val = "";                                    // wrong option value → 400; let it default
+                    else if (type.equals("number") || type.equals("range")
+                            || ln.contains("id") || ln.contains("account") || ln.contains("acct")) val = "1";
+                    else if (type.matches("date|datetime|datetime-local|month|week|time")
+                            || ln.contains("date") || ln.contains("amount") || ln.contains("amt")
+                            || ln.contains("price") || ln.contains("min") || ln.contains("max")) val = "";  // valid "no filter"
+                    else if (type.equals("email") || ln.contains("email")) val = "aiscan@example.com";
+                    else val = "aiscan";                                                   // text/search/textarea → reflectable marker
+                }
+                if (body.length() > 0) body.append('&');
+                body.append(enc(name)).append('=').append(enc(val));
+                fields++;
+            }
+            if (fields == 0) continue;
+            HttpRequestResponse rr = postAuthed(actUrl, body.toString());
+            if (rr != null && rr.response() != null) {
+                api.siteMap().add(rr);
+                formsExercised++;
+                scanLog.log("[AI Scanner]   exercised POST form → " + stripFragment(actUrl)
+                        + " (" + fields + " field(s), HTTP " + rr.response().statusCode() + ") → site map/audit");
+                // GENERIC debug: the cookie this POST used to reach its status — lets a later probe on the same
+                // endpoint be compared (same cookie but different status ⇒ session/jar drift). No app-specific paths.
+                String usedCookie = rr.request() != null ? rr.request().headerValue("Cookie") : null;
+                if (usedCookie != null) scanLog.debug("[AI Scanner]     exercise cookie @ " + stripFragment(actUrl)
+                        + " = " + trunc(usedCookie, 60));
+            }
+        }
+    }
+
+    private static String enc(String v) { try { return java.net.URLEncoder.encode(v == null ? "" : v, "UTF-8"); } catch (Exception e) { return ""; } }
+    private static String lc(String s) { return s == null ? "" : s.toLowerCase(); }
+    private static String attr(Pattern p, String s) {
+        Matcher m = p.matcher(s);
+        if (!m.find()) return null;
+        return m.group(2) != null ? m.group(2) : m.group(3) != null ? m.group(3) : m.group(4);
     }
 
     // ---- markup parsing ----

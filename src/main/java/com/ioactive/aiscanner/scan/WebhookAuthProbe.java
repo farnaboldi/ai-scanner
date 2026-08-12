@@ -129,7 +129,7 @@ public final class WebhookAuthProbe {
                          .withHeader("X-Hub-Signature-256", "sha256=" + BOGUS_SIG)
                          .withHeader("X-Webhook-Signature", BOGUS_SIG);
             }
-            return api.http().sendRequest(req, RequestOptions.requestOptions());
+            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) { return null; }
     }
 

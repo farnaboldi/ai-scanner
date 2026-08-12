@@ -165,7 +165,7 @@ public final class DisposableMailbox {
         try {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod("GET").withHeader("Accept", "application/json");
             if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            HttpRequestResponse rr = api.http().sendRequest(r, RequestOptions.requestOptions());
+            HttpRequestResponse rr = api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
             return rr == null || rr.response() == null ? null : rr.response().bodyToString();
         } catch (Throwable t) { return null; }
     }
@@ -174,7 +174,7 @@ public final class DisposableMailbox {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
                     .withHeader("Accept", "application/json").withHeader("Content-Type", "application/json").withBody(json);
             if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            HttpRequestResponse rr = api.http().sendRequest(r, RequestOptions.requestOptions());
+            HttpRequestResponse rr = api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
             return rr == null || rr.response() == null ? null : rr.response().bodyToString();
         } catch (Throwable t) { return null; }
     }

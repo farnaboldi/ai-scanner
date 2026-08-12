@@ -19,6 +19,18 @@ public final class LocalAiEngine extends PromptAiEngine {
 
     private static final String THINK_REGEX = "(?s)<think>.*?</think>";
 
+    // Per-call seed sequence. Two purposes at once: (1) every request is UNIQUE → it can't hit a prompt/response
+    // cache (server or Burp-transport), so a repeated N-round discovery pass actually re-samples instead of
+    // returning a cached/empty reply; (2) the sequence is DETERMINISTIC (1,2,3… in a fixed call order, reset per
+    // scan) → two scans send the same seeds → identical results, so temp>0 becomes REPRODUCIBLE across runs while
+    // still diverse ACROSS rounds within a run (round 2's calls get later seeds than round 1 → fresh samples).
+    // llama-server honors `seed` (verified: same seed → identical output, different seed → different). At temp=0
+    // the seed is irrelevant to the greedy output, so determinism there is unchanged.
+    private static final java.util.concurrent.atomic.AtomicLong SEED_SEQ = new java.util.concurrent.atomic.AtomicLong();
+    /** Reset the per-call seed sequence at scan start so the seeds (and thus temp>0 output) are reproducible per scan. */
+    public static void resetSeed() { SEED_SEQ.set(0); }
+
+
     private final EngineConfig cfg;
     private final LlmHttp http;
     private final Consumer<String> logger;
@@ -31,10 +43,32 @@ public final class LocalAiEngine extends PromptAiEngine {
 
     @Override public String name() { return "Local (OpenAI-compatible)"; }
 
+    @Override public String paramSummary() {
+        return "Local LLM model=" + (cfg.model == null || cfg.model.isBlank() ? "(default)" : cfg.model)
+                + " temperature=" + cfg.temperature + " maxTokens=" + cfg.maxTokens;
+    }
+
     @Override public boolean isConfigured() { return cfg.isConfigured(); }
 
     /** A self-hosted LLM the user explicitly selected: if it's unreachable, ABORT rather than degrade silently. */
     @Override public boolean requiresReachableEndpoint() { return true; }
+
+    /** Reachability probe that SURFACES the real error (the default swallows it) — so a failed api.http() health
+     *  check tells us why (connection vs HTTP status vs empty reply), not just "reachable=false". */
+    @Override
+    public boolean testConnection() {
+        try {
+            String r = chat("", "reply with the single word OK");
+            if (r == null || r.isBlank()) {
+                logger.accept("[AI Scanner] LLM health check: empty reply (lastError=" + lastError() + ")");
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            logger.accept("[AI Scanner] LLM health check FAILED: " + t);
+            return false;
+        }
+    }
 
     @Override
     public String chat(String systemPrompt, String userPrompt) {
@@ -53,6 +87,8 @@ public final class LocalAiEngine extends PromptAiEngine {
             body.put("max_tokens", cfg.maxTokens);
             body.put("temperature", cfg.temperature);
             body.put("stream", false);
+            long seed = SEED_SEQ.incrementAndGet();
+            body.put("seed", seed);   // unique per call → cache-proof + reproducible (see SEED_SEQ)
             if (cfg.disableThinking) {
                 body.put("chat_template_kwargs", new JSONObject().put("enable_thinking", false));
             }
@@ -60,16 +96,25 @@ public final class LocalAiEngine extends PromptAiEngine {
             List<String> headers = new ArrayList<>();
             if (!cfg.apiKey.isBlank()) headers.add("Authorization: Bearer " + cfg.apiKey);
 
-            if (cfg.verbose) {   // log the OUTGOING prompt too (not just the response), so the query is debuggable
+            if (LogLevel.trace()) {   // TRACE: dump the OUTGOING prompt body (deepest detail)
                 String u = (userPrompt == null ? "" : userPrompt).replaceAll("\\s+", " ").trim();
                 if (u.length() > 300) u = u.substring(0, 300) + "…";
                 logger.accept("[AI Scanner] LLM → " + u);
             }
+            long t0 = System.currentTimeMillis();
             String raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+            LlmTiming.record(System.currentTimeMillis() - t0);   // benchmark speed column: time WAITING on the model
             String content = extractContent(raw);
-            if (cfg.verbose) {
+            // Targeted per-call DEBUG (metadata only — NOT the request/response bodies, which are noise): seed +
+            // sizes, so an empty/degenerate reply (the "round 2 parsed 0" mystery) is visible as resp=0 (transport
+            // returned nothing) vs resp=NNN content=0 (a real reply we failed to parse). On with -Daiscanner.debug.
+            if (LogLevel.debug()) logger.accept("[AI Scanner] llm-call seed=" + seed
+                    + " req=" + (userPrompt == null ? 0 : userPrompt.length()) + "ch"
+                    + " -> resp=" + (raw == null ? 0 : raw.length()) + "ch content=" + content.length() + "ch"
+                    + (raw == null || raw.isEmpty() ? "  [EMPTY TRANSPORT REPLY]" : ""));
+            if (LogLevel.trace()) {   // TRACE: dump the full response body (so a parse-to-0 reply can be read)
                 String c = content.replaceAll("\\s+", " ").trim();
-                if (c.length() > 160) c = c.substring(0, 160) + "…";
+                if (c.length() > 800) c = c.substring(0, 800) + "…";
                 logger.accept("[AI Scanner] LLM ← " + c);
             }
             return content;

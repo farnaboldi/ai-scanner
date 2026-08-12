@@ -70,16 +70,47 @@ public final class CsrfProbe {
         try {
             boolean sameSiteProtected = sessionCookieSameSiteProtected(host);
             Set<String> fired = new LinkedHashSet<>();
+            java.util.LinkedHashMap<String, String> whyBy = new java.util.LinkedHashMap<>();
+            java.util.LinkedHashMap<String, HttpRequestResponse> evBy = new java.util.LinkedHashMap<>();
             if (formTargets != null)
-                for (HttpRequest t : formTargets) if (tryCsrf(host, t, sessionApplier, sameSiteProtected, fired)) hits++;
+                for (HttpRequest t : formTargets) tryCsrf(host, t, sessionApplier, sameSiteProtected, fired, whyBy, evBy);
             for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                 if (rr.response() == null) continue;
-                if (tryCsrf(host, rr.request(), sessionApplier, sameSiteProtected, fired)) hits++;
+                tryCsrf(host, rr.request(), sessionApplier, sameSiteProtected, fired, whyBy, evBy);
             }
+            hits = emitCsrf(host, whyBy, evBy);
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner] CSRF probe error: " + t);
         }
         return hits;
+    }
+
+    private static final int CSRF_CAP = 5;   // above this many CSRF-able endpoints it's an app-wide gap, not N bugs
+
+    /** Emit CSRF findings, collapsing a FLOOD into one systemic finding. Apps that ship no anti-CSRF framework
+     *  (WebGoat by design, many bearer-less MPAs) make EVERY cookie-auth POST forgeable — reporting N of them is
+     *  noise. Below the cap, emit each (genuine handful); above it, emit ONE "no app-wide anti-CSRF protection". */
+    private int emitCsrf(String host, java.util.Map<String, String> whyBy, java.util.Map<String, HttpRequestResponse> evBy) {
+        int n = whyBy.size();
+        if (n == 0) return 0;
+        if (n <= CSRF_CAP) {
+            for (java.util.Map.Entry<String, String> e : whyBy.entrySet()) {
+                scanLog.found("Cross-Site Request Forgery (CSRF)", e.getKey(), e.getValue()
+                        + " (CWE-352). Confirmed by replaying a forged request (token stripped, Origin/Referer/X-* removed) that still succeeded.",
+                        evBy.get(e.getKey()));
+                scanLog.incFinding();
+            }
+            return n;
+        }
+        java.util.List<String> keys = new ArrayList<>(whyBy.keySet());
+        String examples = String.join(", ", keys.subList(0, Math.min(5, keys.size())));
+        HttpRequestResponse ev = evBy.values().iterator().next();
+        scanLog.found("Cross-Site Request Forgery (CSRF) — no app-wide anti-CSRF protection", "http://" + host + "/",
+                n + " cookie-authenticated, state-changing endpoints accept a cross-site-forged request (token stripped, "
+                + "Origin/Referer removed): the application enforces no anti-CSRF tokens app-wide (CWE-352). Reported as ONE "
+                + "systemic finding, not " + n + " — examples: " + examples + " …", ev);
+        scanLog.incFinding();
+        return 1;
     }
 
     /** Full CSRF test on ONE request: filter to a forgeable cookie-auth form POST, apply the LIVE session, then
@@ -87,7 +118,8 @@ public final class CsrfProbe {
      *  every header a simple form can't set (Origin/Referer/X-* and Sec-Fetch), AND any Authorization (a form can't set
      *  it, so a bearer-only endpoint is not CSRF-able). If the server still accepts it, the action is cross-site-
      *  forgeable (CWE-352). The forgery being accepted IS the proof (zero-FP). De-dups by URL via {@code fired}. */
-    private boolean tryCsrf(String host, HttpRequest req, UnaryOperator<HttpRequest> sessionApplier, boolean sameSiteProtected, Set<String> fired) {
+    private boolean tryCsrf(String host, HttpRequest req, UnaryOperator<HttpRequest> sessionApplier, boolean sameSiteProtected,
+                            Set<String> fired, java.util.Map<String, String> whyBy, java.util.Map<String, HttpRequestResponse> evBy) {
         if (req == null || !"POST".equalsIgnoreCase(req.method())) return false;
         String url = req.url();
         if (!host.equalsIgnoreCase(hostOf(url)) || SKIP.matcher(url).matches() || AUTHY.matcher(url).find()) return false;
@@ -138,12 +170,8 @@ public final class CsrfProbe {
                   + "and no Origin/Referer — the token is not enforced"
                 : "a cookie-authenticated, state-changing POST has NO anti-CSRF token and the server accepts it "
                   + "with no Origin/Referer — a cross-site page can forge the action";
-        scanLog.found("Cross-Site Request Forgery (CSRF)", key,
-                why + " (CWE-352). Form-encoded + cookie-auth (not bearer); the session cookie is not "
-                + "SameSite=Strict/Lax. Confirmed by replaying a forged request (token stripped, Origin/"
-                + "Referer/X-* removed) that still succeeded (HTTP " + status(forgedRr) + ").",
-                forgedRr);
-        scanLog.incFinding();
+        whyBy.put(key, why);        // collect; emitCsrf() decides per-URL vs one systemic finding (anti-flood)
+        evBy.put(key, forgedRr);
         return true;
     }
 
@@ -185,7 +213,7 @@ public final class CsrfProbe {
     }
 
     private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions()); }
+        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return null; }
     }
     private static boolean hasHeader(HttpRequest r, String n) { try { return r.hasHeader(n); } catch (Throwable t) { return false; } }

@@ -33,7 +33,10 @@ API_KEY="${AISCANNER_API_KEY:-}"
 # rejects disposable-email registration). The scanner POSTs these to the discovered login endpoint via Burp.
 LOGIN_EMAIL="${AISCANNER_LOGIN_EMAIL:-}"
 LOGIN_PASS="${AISCANNER_LOGIN_PASSWORD:-}"
-HEAP="${HEAP:-4g}"
+# Optional source repo (local path OR git URL) — drives SAST-assisted DAST. A URL is cloned HERE (shallow, temp)
+# and only a LOCAL PATH is handed to the extension, which reads files with java.nio and never clones/spawns.
+SOURCE_REPO="${AISCANNER_SOURCE_REPO:-}"
+HEAP="${HEAP:-2g}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Batch mode (>1 target) with no explicit dir → default one report file per host under bench/results/batch.
@@ -85,7 +88,8 @@ done
 CONF="${TMPDIR:-/tmp}/aiscanner-burp-conf.$$.json"
 CONF_PROJECT="${TMPDIR:-/tmp}/aiscanner-proj-conf.$$.json"
 PROJECT="${TMPDIR:-/tmp}/aiscanner-project.$$.burp"
-trap 'rm -f "$CONF" "$CONF_PROJECT"' EXIT
+SRC_CLONE=""   # set if we shallow-clone a source-repo URL; removed on exit
+trap 'rm -f "$CONF" "$CONF_PROJECT"; [ -n "$SRC_CLONE" ] && rm -rf "$SRC_CLONE"' EXIT
 
 # Burp's default proxy listener is 127.0.0.1:8080 — which COLLIDES with any target served on host port 8080
 # (e.g. a local Spring API). On the collision the extension's own HTTP (auth/probes/discovery) hits Burp's own
@@ -121,6 +125,39 @@ json.dump(proj, open(projout, "w"), indent=2)
 print("config: cloned %s + injected AI Scanner extension (proxy listener → 127.0.0.1:%d)" % (base or "(defaults)", proxy_port))
 PY
 
+# ---- source repo: clone a git URL to a temp dir; the extension only ever receives a LOCAL PATH ----
+# Keeps the extension subprocess-free / air-gappable: cloning is a normal shell step out here, cleaned up by
+# the EXIT trap. A non-URL value is treated as a local path and validated. Any failure degrades to black-box.
+if [ -n "$SOURCE_REPO" ]; then
+  case "$SOURCE_REPO" in
+    http://*|https://*|git@*|ssh://*|git://*)
+      if command -v git >/dev/null 2>&1; then
+        SRC_CLONE="$(mktemp -d "${TMPDIR:-/tmp}/aiscanner-src.XXXXXX")"
+        echo "source: cloning $SOURCE_REPO → $SRC_CLONE (shallow)…"
+        if git clone --depth 1 --quiet "$SOURCE_REPO" "$SRC_CLONE" 2>/dev/null; then
+          SOURCE_REPO="$SRC_CLONE"
+        else
+          echo "!! (warning) git clone failed — continuing WITHOUT source analysis" >&2
+          rm -rf "$SRC_CLONE"; SRC_CLONE=""; SOURCE_REPO=""
+        fi
+      else
+        echo "!! (warning) git not found — cannot clone $SOURCE_REPO; continuing WITHOUT source analysis" >&2
+        SOURCE_REPO=""
+      fi
+      ;;
+    *)
+      if [ ! -d "$SOURCE_REPO" ]; then
+        echo "!! (warning) source repo path not found: $SOURCE_REPO — continuing WITHOUT source analysis" >&2
+        SOURCE_REPO=""
+      fi
+      ;;
+  esac
+  # (Nested-archive source repos — e.g. vegabird/xvna = README + xvna.zip — are unpacked INSIDE the extension
+  # by RepoFetcher, so this works identically whether the source is a URL handed straight to the extension or a
+  # local clone. No shell-side unzip here on purpose: the fix belongs in the extension, not the launcher.)
+  [ -n "$SOURCE_REPO" ] && echo "source: repo = $SOURCE_REPO"
+fi
+
 # ---- preflight: when the LOCAL_LLM provider is used, the model MUST answer before we launch ----
 # The entire scan degrades silently if the model is unreachable/unauthorized (endpoint discovery, signup
 # verification, and signing-function location all no-op) — so fail fast HERE instead of discovering it from
@@ -152,6 +189,7 @@ AI Scanner launcher (Strix-for-Burp)
   target(s): $TARGET   ($TARGET_COUNT target(s)$([ "$TARGET_COUNT" -gt 1 ] && echo ", sequential batch"))
   reports  : $([ -n "$REPORT_DIR" ] && echo "$REPORT_DIR/<host>.report.txt" || echo "${AISCANNER_REPORT:-<none>}")
   base url : $BASE_URL
+  src repo : $([ -n "$SOURCE_REPO" ] && echo "$SOURCE_REPO" || echo '<none — black-box>')
   model    : $MODEL
   api key  : $([ -n "$API_KEY" ] && echo set || echo '<none>')
   ext jar  : $EXT_JAR
@@ -168,6 +206,13 @@ EOF
 # marker is never touched.
 SESS_DIR="$HOME/.BurpSuite/sessions"
 if [ -d "$SESS_DIR" ]; then
+  # AISCANNER_FORCE_CLEAN_SESSIONS=1: benchmark harness mode. We guarantee a single Burp at a time and use
+  # throwaway temp projects, so nuke ALL session markers unconditionally — a hard-killed Burp (SIGKILL) leaves
+  # a marker whose PID may still be reaping when the dead-PID prune below runs (a race that lets the safe-mode
+  # dialog through). Only enable when you know no OTHER Burp you care about is running.
+  if [ "${AISCANNER_FORCE_CLEAN_SESSIONS:-0}" = "1" ]; then
+    rm -f "$SESS_DIR"/*.run 2>/dev/null && echo "  force-cleaned all Burp session markers (AISCANNER_FORCE_CLEAN_SESSIONS=1)"
+  else
   for f in "$SESS_DIR"/*.run; do
     [ -e "$f" ] || continue
     pid="${f##*-}"; pid="${pid%.run}"
@@ -176,6 +221,7 @@ if [ -d "$SESS_DIR" ]; then
       (*) kill -0 "$pid" 2>/dev/null || { rm -f "$f" && echo "  pruned stale Burp session marker: $(basename "$f")"; } ;;
     esac
   done
+  fi
 fi
 
 # ---- launch Burp (GUI, interactive) with AI Scanner self-configured + auto-scan ----
@@ -189,16 +235,25 @@ exec "$JAVA" \
   "-Daiscanner.baseUrl=${BASE_URL}" \
   "-Daiscanner.model=${MODEL}" \
   "-Daiscanner.disableThinking=${AISCANNER_DISABLE_THINKING:-true}" \
+  ${AISCANNER_TEMPERATURE:+-Daiscanner.temperature="${AISCANNER_TEMPERATURE}"} \
+  ${AISCANNER_DISCOVERY_ROUNDS:+-Daiscanner.discoveryRounds="${AISCANNER_DISCOVERY_ROUNDS}"} \
   "-Daiscanner.maxTokens=${AISCANNER_MAX_TOKENS:-2048}" \
   "-Daiscanner.synthEndpoints=${AISCANNER_SYNTH:-true}" \
   "-Daiscanner.discoveryOnly=${AISCANNER_DISCOVERY_ONLY:-false}" \
-  "-Daiscanner.verbose=${AISCANNER_VERBOSE:-false}" \
+  "-Daiscanner.nativeOnly=${AISCANNER_NATIVE_ONLY:-false}" \
+  "-Daiscanner.noAi=${AISCANNER_NO_AI:-false}" \
+  "-Daiscanner.logLevel=${AISCANNER_LOG_LEVEL:-INFO}" \
   "-Daiscanner.wafEvasion=${AISCANNER_WAF_EVASION:-false}" \
   "-Daiscanner.exitOnComplete=${AISCANNER_EXIT_ON_COMPLETE:-false}" \
+  "-Daiscanner.auditDeadlineMinutes=${AISCANNER_AUDIT_MINUTES:-50}" \
+  "-Daiscanner.concurrency=${AISCANNER_CONCURRENCY:-3}" \
   ${API_KEY:+-Daiscanner.apiKey="${API_KEY}"} \
   ${LOGIN_EMAIL:+-Daiscanner.loginEmail="${LOGIN_EMAIL}"} \
   ${LOGIN_PASS:+-Daiscanner.loginPassword="${LOGIN_PASS}"} \
   ${REPORT_DIR:+-Daiscanner.reportDir="${REPORT_DIR}"} \
+  ${SOURCE_REPO:+-Daiscanner.sourceRepo="${SOURCE_REPO}"} \
+  "-Daiscanner.sastMode=${AISCANNER_SAST_MODE:-coarse}" \
+  "-Daiscanner.deferToBurp=${AISCANNER_DEFER_TO_BURP:-true}" \
   "-Daiscanner.autoscan=${TARGET}" \
   -jar "$BURP_JAR" \
   --project-file="$PROJECT" \

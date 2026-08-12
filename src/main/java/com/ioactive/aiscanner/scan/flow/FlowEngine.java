@@ -39,6 +39,8 @@ public final class FlowEngine {
     // 2xx endpoints the LLM REACHED that the crawl/mining never did — exposed so the caller can bridge them into
     // the site map + targets, so the specialized probes + Burp active audit cover them too (not siloed here).
     private final List<HttpRequestResponse> reached = new ArrayList<>();
+    /** Optional source-analysis leads appended to the planner goal (targeting only; oracle still confirms). */
+    private volatile String sourceHintText = "";
 
     public FlowEngine(AiEngine engine, ScanLog scanLog,
                       Function<HttpRequest, HttpRequest> sessionizer,
@@ -49,6 +51,9 @@ public final class FlowEngine {
         this.sender = sender;
     }
 
+    /** Feed compact SAST leads (endpoints/params/classes) so the planner targets them first. Blank = no-op. */
+    public void setSourceHintText(String s) { this.sourceHintText = s == null ? "" : s.trim(); }
+
     /** Run the bounded loop over each seed. Returns the number of oracle-confirmed findings. */
     public int run(String host, List<HttpRequest> seeds) {
         if (engine == null || !engine.isConfigured() || seeds == null || seeds.isEmpty()) return 0;
@@ -58,7 +63,10 @@ public final class FlowEngine {
                 + "response returned; try a neighbour id (IDOR); if a role/privilege field appears, resend the body "
                 + "with it elevated (mass-assignment); submit the exact answer a lesson/assignment asks. Canaries to "
                 + "embed when probing — XSS: " + VulnClasses.XSS_CANARY + ", SSTI: " + VulnClasses.SSTI_INPUT
-                + " (=> " + VulnClasses.SSTI_RESULT + ").";
+                + " (=> " + VulnClasses.SSTI_RESULT + ")."
+                + (sourceHintText.isBlank() ? ""
+                        : " SOURCE-CODE LEADS from static analysis (prioritize reaching these endpoints/params; "
+                          + "they must still be confirmed dynamically): " + sourceHintText);
 
         Set<String> visited = new LinkedHashSet<>();   // anti-loop across all seeds
         int findings = 0, seedCount = 0;

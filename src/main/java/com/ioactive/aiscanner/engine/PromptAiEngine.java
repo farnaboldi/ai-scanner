@@ -85,8 +85,74 @@ public abstract class PromptAiEngine implements AiEngine {
                 + "Use server PATHS only (no scheme/host). Skip static assets (.css/.js/.png/…). [] if none.";
         String raw = chat(system, "Client-side code:\n" + clientCode + "\n\nReturn the JSON array now.");
         if (raw == null) return "";
-        int s = raw.indexOf('['), e = raw.lastIndexOf(']');
+        return sliceEndpointArray(raw);
+    }
+
+    /**
+     * Pull the JSON array-of-objects out of a raw LLM reply, tolerant of prose/markdown/reasoning around it.
+     * The naive {@code indexOf('[')..lastIndexOf(']')} mis-slices when the model's text has a stray '[' before
+     * the array (e.g. "based on the code [analysis], here: [{…}]") → the whole chunk drops to 0 candidates. So we
+     * find the first '[' that opens an array of OBJECTS ('[' then optional whitespace then '{') and return its
+     * bracket-balanced, string-aware slice. Falls back to the legacy first-'['..last-']' (covers "[]"), then "".
+     */
+    static String sliceEndpointArray(String raw) {
+        for (int i = 0; i < raw.length(); i++) {
+            if (raw.charAt(i) != '[') continue;
+            int j = i + 1;
+            while (j < raw.length() && Character.isWhitespace(raw.charAt(j))) j++;
+            if (j >= raw.length() || raw.charAt(j) != '{') continue;   // not an array of objects — skip prose "[…]"
+            String slice = balancedArray(raw, i);
+            if (slice != null) return slice;                            // balanced → done (ignores trailing prose)
+            String salvaged = salvageObjects(raw, i);                   // TRUNCATED (finish_reason=length) → keep the
+            if (salvaged != null) return salvaged;                      // complete objects before the cut, not zero
+        }
+        int s = raw.indexOf('['), e = raw.lastIndexOf(']');             // fallback (handles "[]" / no objects)
         return (s >= 0 && e > s) ? raw.substring(s, e + 1) : "";
+    }
+
+    /**
+     * Salvage a TRUNCATED array-of-objects (the model hit max_tokens mid-array, finish_reason=length): collect the
+     * complete top-level {…} objects that DID close and re-wrap them as a valid array. Turns "big roll got cut → 0
+     * candidates" into "keep the N complete endpoints before the cut" — critical because the model's endpoint count
+     * is wildly variable (1..100+), so the big rolls are exactly the ones that truncate and must not be lost whole.
+     */
+    private static String salvageObjects(String raw, int start) {
+        int lastObjEnd = -1;                 // index just past the last COMPLETE top-level object's '}'
+        int brace = 0;
+        boolean inStr = false, esc = false;
+        for (int i = start + 1; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') inStr = true;
+            else if (c == '{') brace++;
+            else if (c == '}' && --brace == 0) lastObjEnd = i + 1;
+        }
+        return lastObjEnd < 0 ? null : raw.substring(start, lastObjEnd) + "]";
+    }
+
+    /** {@code raw[start..matching ']']} with bracket-depth + JSON-string awareness, or null if never closed (a
+     *  truncated reply — let the caller fall back rather than return a half-array). */
+    private static String balancedArray(String raw, int start) {
+        int depth = 0;
+        boolean inStr = false, esc = false;
+        for (int i = start; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') inStr = true;
+            else if (c == '[') depth++;
+            else if (c == ']' && --depth == 0) return raw.substring(start, i + 1);
+        }
+        return null;
     }
 
     @Override

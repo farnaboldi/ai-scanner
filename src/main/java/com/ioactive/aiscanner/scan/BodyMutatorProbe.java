@@ -74,7 +74,7 @@ public final class BodyMutatorProbe {
             if (body == null || !body.trim().startsWith("{")) return;
             // baseline the ORIGINAL body: only report a mutation whose response DIVERGES (real effect),
             // so endpoints that 200 on anything (web3 stubs) don't create false positives.
-            HttpRequestResponse b = api.http().sendRequest(req, RequestOptions.requestOptions());
+            HttpRequestResponse b = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
             this.baseStatus = b != null && b.response() != null ? b.response().statusCode() : -1;
             this.baseLen = b != null && b.response() != null ? b.response().body().length() : -1;
             this.baseBody = b != null && b.response() != null ? b.response().bodyToString() : "";
@@ -84,18 +84,24 @@ public final class BodyMutatorProbe {
             // control account without the field — a confirmed escalation, not a response-divergence guess.
             massAssign(req, body);
 
-            // (b) empty-required: blank credential-like string fields together
+            // (b) empty-required: blank credential-like string fields together. GATE on a genuine credential
+            // PAIR — at least one password-like field must be present. A lone user-like field is NOT an auth
+            // submission: e.g. an LLM prompt field "user_input" matches USER_LIKE via "user", and emptying it
+            // returns a normal 200 (the model just answers nothing) → a false "empty credentials accepted".
+            // Requiring a pass-like field keeps the real auth-bypass signal (empty password accepted) and drops
+            // the FP on any endpoint that merely has a user/email/login-ish field without a password.
             String empt = body;
             Matcher sm = STR_FIELD.matcher(body);
-            boolean any = false;
+            boolean anyPass = false;
             while (sm.find()) {
                 String k = sm.group(1);
-                if (USER_LIKE.matcher(k).matches() || PASS_LIKE.matcher(k).matches()) {
+                boolean u = USER_LIKE.matcher(k).matches(), p = PASS_LIKE.matcher(k).matches();
+                if (u || p) {
                     empt = empt.replaceFirst("(\"" + Pattern.quote(k) + "\"\\s*:\\s*)\"(?:[^\"\\\\]|\\\\.)*\"", "$1\"\"");
-                    any = true;
+                    anyPass |= p;
                 }
             }
-            if (any) accepted(req.withBody(empt), req.url(), "empty-required credential fields", false);
+            if (anyPass) accepted(req.withBody(empt), req.url(), "empty-required credential fields", false);
 
             // (c) boundary values on numeric fields: 0 and -1
             Matcher nm = NUM_FIELD.matcher(body);
@@ -217,13 +223,13 @@ public final class BodyMutatorProbe {
     }
 
     private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions()); }
+        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return null; }
     }
 
     private void accepted(HttpRequest req, String url, String family, boolean checkMoney) {
         try {
-            HttpRequestResponse r = api.http().sendRequest(req, RequestOptions.requestOptions());
+            HttpRequestResponse r = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
             if (r == null || r.response() == null) return;
             int st = r.response().statusCode();
             if (st < 200 || st >= 300) return;

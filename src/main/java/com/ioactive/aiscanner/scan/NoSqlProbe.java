@@ -7,6 +7,8 @@ import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
 import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import com.ioactive.aiscanner.scan.sast.SourceFindings;
+import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.net.URI;
@@ -34,15 +36,31 @@ public final class NoSqlProbe {
 
     // $where string breakouts (always-true) for string-interpolated Mongo $where.
     private static final String[] WHERE_BREAKOUTS = { "' || 'a'=='a", "'||'1'=='1'||'", "\" || \"a\"==\"a" };
+    // Operator objects sent as a param's RAW VALUE for apps that JSON.parse a query/body param into a Mongo
+    // filter ({x: JSON.parse(req.query.x)}). $gt:0 / $ne:null / $ne:-1 all match "everything" → result set grows.
+    private static final String[] NOSQL_JSON_VALUES = { "{\"$gt\":0}", "{\"$ne\":null}", "{\"$ne\":-1}" };
     // Time-based $where: a JS busy-loop that delays the response ~3.5s if the expression is evaluated.
     private static final String WHERE_SLEEP = "'||(function(){var _d=Date.now();while(Date.now()-_d<3500){}return true})()||'a'=='a";
     private static final long SLEEP_THRESHOLD_MS = 2500;
     private static final Pattern ID_SEG = Pattern.compile(
             "^(?:[0-9]+|[0-9a-fA-F]{12,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$");
 
+    private SourceFindings sourceHints;   // optional SAST directives — used only to tag finding provenance
+
     public NoSqlProbe(MontoyaApi api, ScanLog scanLog) {
         this.api = api;
         this.scanLog = scanLog;
+    }
+
+    public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
+
+    /** Source provenance suffix when a matching NoSQL sink exists (else empty). Never affects detection. */
+    private String prov(String url) {
+        if (sourceHints == null) return "";
+        for (StaticHint h : sourceHints.all())
+            if ("NoSQL".equalsIgnoreCase(h.vulnClass) && (!h.hasEndpoint() || h.matchesUrl(url)))
+                return "  " + h.provenance();
+        return "";
     }
 
     private static final Pattern SKIP = Pattern.compile(
@@ -82,6 +100,15 @@ public final class NoSqlProbe {
                 if (!IDENTITY_FIELD.matcher(p.name()).find()) {
                     HttpRequest op = opInject(req, p);
                     if (op != null && hit(base, baseLen, baseStatus, send(op), req.url(), p.name() + "[$ne]")) return true;
+                    // JSON-VALUE operator injection: an app that JSON.parse()s a single param and uses it in a
+                    // Mongo query takes the operator as the VALUE ({"$gt":0}) — NOT bracket-notation (name[$ne]=),
+                    // which Express turns into an object that JSON.parse then chokes on. Send the operator object
+                    // as the raw param value (Montoya URL-encodes it); the differential oracle confirms. Generic:
+                    // matches any Express/Mongo `find({x: JSON.parse(req.query.x)})` sink (e.g. xvna /getdata?id=).
+                    for (String jv : NOSQL_JSON_VALUES) {
+                        HttpRequest jm = req.withUpdatedParameters(HttpParameter.parameter(p.name(), jv, p.type()));
+                        if (hit(base, baseLen, baseStatus, send(jm), req.url(), p.name() + " (JSON-value " + jv + ")")) return true;
+                    }
                 }
             }
 
@@ -132,7 +159,7 @@ public final class NoSqlProbe {
                 long dt = (System.nanoTime() - s0) / 1_000_000;
                 if (dt > baseMs + SLEEP_THRESHOLD_MS) {
                     scanLog.found("NoSQL injection (time-based)", req.url(), "path:" + segs[i] + " (+" + dt
-                            + "ms — the injected $where sleep delayed the response; attached)", tr);
+                            + "ms — the injected $where sleep delayed the response; attached)" + prov(req.url()), tr);
                     scanLog.incFinding();
                     return true;
                 }
@@ -230,7 +257,7 @@ public final class NoSqlProbe {
                     scanLog.found("NoSQL injection (authentication bypass)", req.url(),
                             "JSON operator injection [" + labels.get(i) + "] logged in without valid credentials "
                             + "— the login query treats the operator as a Mongo selector. Sent as a JSON body, so it "
-                            + "also bypasses urlencoded-only WAF NoSQL rules (e.g. CRS 942290).", r);
+                            + "also bypasses urlencoded-only WAF NoSQL rules (e.g. CRS 942290)." + prov(req.url()), r);
                     scanLog.incFinding();
                     return true;
                 }
@@ -280,7 +307,7 @@ public final class NoSqlProbe {
         boolean flipped = baseStatus >= 400 && st == 200 && len > baseLen;
         if (jsonResp && (grew || flipped)) {
             recordLeak(resp);
-            scanLog.found("NoSQL injection", url, point + (grew ? " (result set grew " + baseLen + "→" + len + ")" : " (auth/query bypass)"), resp);
+            scanLog.found("NoSQL injection", url, point + (grew ? " (result set grew " + baseLen + "→" + len + ")" : " (auth/query bypass)") + prov(url), resp);
             scanLog.incFinding();
             return true;
         }
@@ -314,7 +341,7 @@ public final class NoSqlProbe {
     }
 
     private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions()); }
+        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return null; }
     }
 

@@ -12,6 +12,11 @@ public interface AiEngine {
 
     boolean isConfigured();
 
+    /** Human-readable model + sampling params for the run log / benchmark (model, temperature). Default: just the
+     *  name; the local/Burp engines override it with their configured model + temperature so every run records
+     *  the exact sampling config used (temperature drives discovery variance — it MUST be visible in the log). */
+    default String paramSummary() { return name(); }
+
     /**
      * Ask the model for a batch of attack payloads for a given vuln class,
      * tailored to the actual request/insertion point.

@@ -181,7 +181,7 @@ public final class RestrictionBypassProbe {
     private static String safe(String s) { return s == null ? "" : s; }
 
     private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions()); }
+        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return null; }
     }
 
