@@ -136,7 +136,7 @@ public final class PrivilegeParityProbe {
             HttpRequest g = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
             if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-            return api.http().sendRequest(g, RequestOptions.requestOptions());
+            return api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) { return null; }
     }
 

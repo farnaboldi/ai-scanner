@@ -85,7 +85,7 @@ public final class XxeProbe {
                         + "<!DOCTYPE r [<!ENTITY xxe SYSTEM \"http://" + domain + "/x\">]>"
                         + "<root><user>&xxe;</user></root>";
                 HttpRequest inj = req.withBody(xxe).withUpdatedHeader("Content-Type", "application/xml");
-                HttpRequestResponse injRr = api.http().sendRequest(inj, RequestOptions.requestOptions());
+                HttpRequestResponse injRr = api.http().sendRequest(inj, RequestOptions.requestOptions().withResponseTimeout(12000L));
                 tagToInj.put(tag, injRr);                                // keep the payload request as attachable evidence
                 testedUrls.add(url);
             } catch (Throwable t) { scanLog.log("[AI Scanner] XXE probe send error: " + t); }

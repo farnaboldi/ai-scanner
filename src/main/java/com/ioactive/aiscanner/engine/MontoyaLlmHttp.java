@@ -41,7 +41,7 @@ public final class MontoyaLlmHttp implements LlmHttp {
                 }
             }
         }
-        RequestOptions opts = RequestOptions.requestOptions();
+        RequestOptions opts = RequestOptions.requestOptions().withResponseTimeout(120000L);
         HttpRequestResponse rr = api.http().sendRequest(req, opts);
         if (rr.response() == null) {
             throw new RuntimeException("No response from LLM endpoint (" + url + ")");

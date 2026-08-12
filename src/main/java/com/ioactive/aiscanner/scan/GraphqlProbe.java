@@ -213,7 +213,7 @@ public final class GraphqlProbe {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
                     .withHeader("Content-Type", "application/json").withBody(jsonBody);
-            return api.http().sendRequest(req, RequestOptions.requestOptions());
+            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) { return null; }
     }
 

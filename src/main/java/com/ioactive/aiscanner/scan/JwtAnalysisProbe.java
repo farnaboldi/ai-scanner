@@ -192,8 +192,8 @@ public final class JwtAnalysisProbe {
             HttpRequest base = carrier.request().withMethod("GET");   // idempotent replay only — never re-mutate state
             HttpRequest withForged = base.withRemovedHeader("Authorization").withHeader("Authorization", "Bearer " + forged);
             HttpRequest withNone   = base.withRemovedHeader("Authorization");   // control: no credential at all
-            HttpRequestResponse rForged = api.http().sendRequest(withForged, RequestOptions.requestOptions());
-            HttpRequestResponse rNone   = api.http().sendRequest(withNone, RequestOptions.requestOptions());
+            HttpRequestResponse rForged = api.http().sendRequest(withForged, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse rNone   = api.http().sendRequest(withNone, RequestOptions.requestOptions().withResponseTimeout(12000L));
             int sf = status(rForged), sn = status(rNone);
             // FIRE only if the forged token is ACCEPTED (2xx) AND the no-credential control is DENIED — otherwise
             // the endpoint is simply public and proves nothing about signature checking.

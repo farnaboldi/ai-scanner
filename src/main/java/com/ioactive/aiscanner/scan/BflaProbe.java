@@ -253,7 +253,7 @@ public final class BflaProbe {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod(method);
             if (cookie != null && !cookie.isBlank()) r = r.withHeader("Cookie", cookie);
             if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            return api.http().sendRequest(r, RequestOptions.requestOptions());
+            return api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) { return null; }
     }
 

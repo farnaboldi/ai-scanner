@@ -7,6 +7,8 @@ import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
 import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import com.ioactive.aiscanner.scan.sast.SourceFindings;
+import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.net.URI;
@@ -38,9 +40,28 @@ public final class IdorGetProbe {
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
+    private SourceFindings sourceHints;   // optional SAST directives — only ADD coverage / provenance, never remove
+
     public IdorGetProbe(MontoyaApi api, ScanLog scanLog) {
         this.api = api;
         this.scanLog = scanLog;
+    }
+
+    /** Optional source-analysis directives: widen enumeration on source-flagged object-refs + tag provenance. */
+    public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
+
+    /** True if source analysis flagged an IDOR/object-ref at this url → enumerate a WIDER id set (additive). */
+    private boolean idorHinted(String url) {
+        return sourceHints != null && !sourceHints.isEmpty() && sourceHints.touches(url, "IDOR");
+    }
+
+    /** Provenance suffix for a confirmed finding when a matching source hint exists (else empty). */
+    private String prov(String url) {
+        if (sourceHints == null) return "";
+        for (StaticHint h : sourceHints.all())
+            if ("IDOR".equalsIgnoreCase(h.vulnClass) && (!h.hasEndpoint() || h.matchesUrl(url)))
+                return "  " + h.provenance();
+        return "";
     }
 
     public int probe(String host, String cookieHeader, String bearer) {
@@ -66,13 +87,14 @@ public final class IdorGetProbe {
                         Set<String> distinct = new LinkedHashSet<>();
                         boolean tenant = false;
                         HttpRequestResponse evidence = null;
-                        for (long other : new long[]{ 1, 2, 3 }) {
+                        long[] ids = idorHinted(base) ? new long[]{ 1, 2, 3, 4, 5 } : new long[]{ 1, 2, 3 };
+                        for (long other : ids) {
                             try {
                                 HttpRequest g = req.withUpdatedParameters(
                                         HttpParameter.parameter(p.name(), String.valueOf(other), HttpParameterType.URL));
                                 if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
                                 if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-                                HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions());
+                                HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
                                 if (r == null || r.response() == null || r.response().statusCode() != 200) continue;
                                 String b = r.response().bodyToString();
                                 if (b == null || b.length() < 40 || b.toLowerCase().contains("\"error\"")) continue;
@@ -87,7 +109,7 @@ public final class IdorGetProbe {
                         }
                         if (distinct.size() >= 2 && tenant) {
                             scanLog.found("Insecure Direct Object Reference (IDOR)", base,
-                                    p.name() + "= enumerated → distinct tenant records returned (no ownership check)",
+                                    p.name() + "= enumerated → distinct tenant records returned (no ownership check)" + prov(base),
                                     evidence);
                             scanLog.incFinding();
                             hits++;
@@ -101,14 +123,17 @@ public final class IdorGetProbe {
                 String origBody = rr.response().bodyToString();
                 if (origBody == null || origBody.length() < 20) continue;
                 long id = Long.parseLong(m.group(2));
-                for (long other : new long[]{ id + 1, id - 1, 1, 2 }) {
+                long[] neighbors = idorHinted(base)
+                        ? new long[]{ id + 1, id - 1, id + 2, id - 2, 1, 2, 3 }   // source-flagged → probe wider
+                        : new long[]{ id + 1, id - 1, 1, 2 };
+                for (long other : neighbors) {
                     if (other <= 0 || other == id) continue;
                     String target = m.group(1) + other;
                     try {
                         HttpRequest g = HttpRequest.httpRequestFromUrl(target).withMethod("GET");
                         if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
                         if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-                        HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions());
+                        HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
                         if (r == null || r.response() == null) continue;
                         String b = r.response().bodyToString();
                         // valid (200), non-trivial, DIFFERENT from our own record, AND carrying ownership/PII
@@ -122,7 +147,7 @@ public final class IdorGetProbe {
                                     "id " + id + " → " + other + " returned a different record with tenant/PII data "
                                     + "using the SAME session — evidence: your own object (id " + id + ") and another "
                                     + "tenant's object (id " + other + ") both accessible with your credential (no "
-                                    + "ownership check). Attached: the cross-tenant request/response.",
+                                    + "ownership check). Attached: the cross-tenant request/response." + prov(base),
                                     rr, r);   // your record, then the other tenant's record fetched with your session
                             scanLog.incFinding();
                             hits++;

@@ -7,6 +7,8 @@ import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
 import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import com.ioactive.aiscanner.scan.sast.SourceFindings;
+import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.util.regex.Matcher;
@@ -41,9 +43,23 @@ public final class PathTraversalProbe {
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
+    private SourceFindings sourceHints;   // optional SAST directives — used only to tag finding provenance
+
     public PathTraversalProbe(MontoyaApi api, ScanLog scanLog) {
         this.api = api;
         this.scanLog = scanLog;
+    }
+
+    public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
+
+    /** Source provenance suffix when a matching path/LFI hint exists (else empty). Never affects detection. */
+    private String prov(String url, String param) {
+        if (sourceHints == null) return "";
+        StaticHint h = sourceHints.bestForParam(url, param);
+        if (h == null) for (StaticHint x : sourceHints.all())
+            if ("Path traversal / File inclusion (LFI)".equalsIgnoreCase(x.vulnClass)
+                    && (!x.hasEndpoint() || x.matchesUrl(url))) { h = x; break; }
+        return h != null ? "  " + h.provenance() : "";
     }
 
     /** Probe one request (already carrying the authenticated session) across its parameters. */
@@ -59,7 +75,7 @@ public final class PathTraversalProbe {
                     HttpRequestResponse mr = send(m);
                     if (leaks(mr)) {
                         scanLog.found("Path traversal / File inclusion (LFI)", req.url(),
-                                p.name() + " (" + p.type() + ") → " + payload, mr);   // attach proving req/resp
+                                p.name() + " (" + p.type() + ") → " + payload + prov(req.url(), p.name()), mr);
                         scanLog.incFinding();
                         return true;
                     }
@@ -79,7 +95,7 @@ public final class PathTraversalProbe {
     }
 
     private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions()); }
+        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return null; }
     }
 

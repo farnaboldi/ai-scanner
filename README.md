@@ -12,24 +12,69 @@ It may use Burp AI or a local model to find potential routes and triage decision
 
 ## Features
 
-- **Autonomous authentication** — form login/registration, JSON/JWT APIs, and spec-driven token bootstrap
-  (learns the auth-header name + login operation from the app's own OpenAPI spec). To reach the authenticated
-  surface it may **try common default credentials** on the login and **register a disposable-email account**.
-- **Deep endpoint discovery** — JS/HTML mining + OpenAPI/Swagger ingestion (`$ref` + Swagger 2.0/OpenAPI 3.0),
-  with a site-map bridge so all probes see the recovered endpoints.
+- **Autonomous authentication** — form login/registration, JSON/JWT APIs, OpenAPI spec-driven token bootstrap
+  (learns the auth-header name + login operation from the app's own spec), and **OAuth2 password-grant**
+  (harvests `client_id`/`client_secret` from the page). It can also take **operator-supplied credentials** or a
+  **cookie/bearer you paste in**. To reach the authenticated surface on its own it may try **common default
+  credentials**, a generic **SQLi auth-bypass**, and **register a disposable-email account**. Re-authenticates
+  if a crawl logs it out, and applies app security settings where relevant (e.g. DVWA security level).
+- **Source-assisted mode (SAST → DAST)** — point it at the target's source repo (local path or a GitHub/GitLab
+  URL it fetches itself, no `git` needed; nested source archives are unpacked) and an LLM analysis maps hidden
+  routes, parameters, and sinks that a black-box crawl can't reach (`agentic` or `coarse` mode). These hints
+  only **steer** discovery/probes — the deterministic oracles still decide every finding, so source hints add
+  coverage but never a false positive.
+- **Deep endpoint discovery** — JS/HTML mining, deterministic `/api/vN/` harvesting, LLM-inferred routes,
+  SPA-route→API resolution, and OpenAPI/Swagger ingestion (`$ref` + Swagger 2.0/OpenAPI 3.0), with a site-map
+  bridge so all probes see the recovered endpoints. Optional **headless-browser driver** (Playwright) drives a
+  real browser through Burp's proxy to capture JS-rendered surface.
 - **Deterministic, zero-FP probes** (each confirmed by an oracle, not a guess):
-  - NoSQL injection (operator/`$where`, plus JSON auth-bypass)
+  - NoSQL injection — operator/`$where`, JSON-value operator injection, and JSON authentication-bypass
   - Blind SQL injection (boolean + time)
+  - OS command injection (time-based) and server-side **`eval`/SSJS code execution** (arithmetic oracle)
+  - Reflected XSS (with WAF-evasion variants)
+  - Path traversal / LFI, open redirect, SSRF and out-of-band (blind) XXE via Burp Collaborator
+  - Insecure deserialization, GraphQL abuse, and CSRF
   - Mass assignment → privilege escalation (confirmed by decoding the returned JWT/principal)
-  - IDOR / broken object-level authorization
-  - Broken function-level authorization (BFLA) and privilege-parity (privileged data via an ungated sibling)
-  - Unauthenticated access to protected endpoints
+  - IDOR / broken object-level authorization, BFLA, and privilege-parity (privileged data via an ungated sibling)
+  - Unauthenticated access to protected endpoints and OAuth2 authorization-server flaws (redirect_uri/token leak)
+  - JWT weaknesses (`alg=none`, missing expiry, disclosed/weak signing key) and webhook signature fail-open
   - Sensitive-data exposure (cleartext secrets in responses, incl. secrets embedded in JWT payloads)
-  - Path traversal / LFI, open redirect, out-of-band (blind) XXE via Burp Collaborator
+- **Multi-step agentic flows** — an LLM planner chains requests (create→consume, auth→privileged action) and
+  replays values leaked by one probe into sibling endpoints the crawler never reached, to reach stateful vulns.
 - **WAF-evasion mode** (optional toggle) — probes also send obfuscated payload variants so a signature WAF that
-  blocks the naive payload lets the equivalent one through. It will automatically to deal with rate-limiting apps.
+  blocks the naive payload lets the equivalent one through. It automatically backs off rate-limiting apps.
 - **Findings as native Burp Audit Issues**, deduplicated, scope-gated, with multi-request evidence.
 - **Chat assistant** grounded in the current scope, scan log, and findings.
+
+## Benchmark: DAST vs DAST + SAST
+
+Findings per target, **black-box (DAST)** vs the same scan with **source-assisted mode (DAST + SAST)**. The extension reads the target's source repo to discover/probe, while the
+deterministic oracles still decide every finding, so hints only add coverage.
+
+Tested usiong **Qwen 3.6 35b** as the LLM backend. Findings = native audit issues + our own confirmed
+`VULNERABILITY` oracles (`VULNERABILITY:` / `HIGH` / `MED`).
+
+| Target | DAST | DAST + SAST | Δ |
+|---|---:|---:|---:|
+| webgoat | TBC | TBC | TBC |
+| xvna | TBC | TBC | TBC |
+| dvws | TBC | TBC | TBC |
+| juice | TBC | TBC | TBC |
+| snapstore | TBC | TBC | TBC |
+| sqli-labs | TBC | TBC | TBC |
+| dvwa | TBC | TBC | TBC |
+| vapi | TBC | TBC | TBC |
+| mutillidae | TBC | TBC | TBC |
+| dvna | TBC | TBC | TBC |
+| tiredful | TBC | TBC | TBC |
+| wackopicko | TBC | TBC | TBC |
+| vulnerableapp | TBC | TBC | TBC |
+| dvoauth | TBC | TBC | TBC |
+| reactvulna | TBC | TBC | TBC |
+| aiptlab | TBC | TBC | TBC |
+| **Total** | **TBC** | **TBC** | **TBC** |
+
+The largest gains are on apps whose vulnerable surface a black-box crawl can't reach on its own.
 
 ## Requirements
 

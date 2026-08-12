@@ -11,6 +11,7 @@ import com.ioactive.aiscanner.engine.EngineConfig;
 import com.ioactive.aiscanner.engine.LlmHttp;
 import com.ioactive.aiscanner.engine.MontoyaLlmHttp;
 import com.ioactive.aiscanner.engine.LocalAiEngine;
+import com.ioactive.aiscanner.engine.LogLevel;
 import com.ioactive.aiscanner.engine.MontoyaAiEngine;
 import com.ioactive.aiscanner.menu.AiContextMenuProvider;
 import com.ioactive.aiscanner.scan.AiScanner;
@@ -31,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 314;
+    public static final int BUILD = 477;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -40,7 +41,13 @@ public class AiScannerExtension implements BurpExtension {
     private final ScanConfig scanConfig = new ScanConfig();
     private final SessionStore session = new SessionStore();
     private final ScanScope scanScope = new ScanScope();
+    /** -Daiscanner.sourceRepo / AISCANNER_SOURCE_REPO — a LOCAL repo path applied to every autoscan target. */
+    private volatile String launchSourceRepo;
+    /** host → local source-repo path (from the context-menu popup / settings); persisted across sessions. */
+    private final java.util.Map<String, String> hostRepoMap = new java.util.concurrent.ConcurrentHashMap<>();
     private volatile EngineConfig engineConfig;
+    /** Persisted log level (INFO/DEBUG/TRACE) from settings; null until loaded. Applied at init after legacy flags. */
+    private volatile LogLevel logLevelSetting;
     private volatile AiEngine engine;
     private volatile boolean unloaded = false;
 
@@ -71,12 +78,35 @@ public class AiScannerExtension implements BurpExtension {
 
         loadSettings();
         applyLaunchOverrides();          // -Daiscanner.baseUrl/-Daiscanner.model/-Daiscanner.apiKey (or AISCANNER_* env)
-        scanLog.setVerbose(engineConfig.verbose);
+        // -Daiscanner.sourceRepo (or AISCANNER_SOURCE_REPO): a LOCAL repo path to drive SAST-assisted testing
+        // for every autoscan target (the launcher clones a URL and passes a path). null → black-box only.
+        launchSourceRepo = launchArg("aiscanner.sourceRepo", "AISCANNER_SOURCE_REPO");
+        if (launchSourceRepo != null) scanLog.log("[AI Scanner] source repo (launch): " + launchSourceRepo);
+        // Unified log level (INFO/DEBUG/TRACE) — the ONE knob for verbosity, selectable from Settings and the CLI
+        // (-Daiscanner.logLevel / AISCANNER_LOG_LEVEL). CLI wins over the persisted setting; nothing else feeds it.
+        String cli = launchArg("aiscanner.logLevel", "AISCANNER_LOG_LEVEL");
+        if (cli != null && !cli.isBlank()) LogLevel.set(LogLevel.parse(cli));
+        else if (logLevelSetting != null)  LogLevel.set(logLevelSetting);
+        scanLog.log("[AI Scanner] log level: " + LogLevel.current());
 
         api.extension().setName(EXT_NAME);
-        AiScanner scanner = new AiScanner(api, this::getEngine, scanConfig, scanLog, session, this::isUnloaded);
+        AiScanner scanner = new AiScanner(api, this::getEngine, scanConfig, scanLog, session, this::isUnloaded, this::repoForHost);
+        // Agent-tab Stop button. Root mechanism (no per-probe checkpoints): (1) scanLog.phase() throws once
+        // stopRequested, so the probe battery drains from a single point since every probe calls phase() first;
+        // (2) interrupting the named scan threads unblocks any in-flight crawl / discovery / SAST / native-audit
+        // wait. Wired before the headless guard so the stop-check is always live (the button lives in the UI).
+        scanLog.setStopCheck(scanner::stopRequested);
+        scanLog.setStopHandler(() -> {
+            scanLog.log("[AI Scanner] Stop requested by user — cancelling the current scan…");
+            scanner.requestStop();
+            for (Thread t : Thread.getAllStackTraces().keySet()) {
+                String n = t.getName();
+                if (n != null && (n.startsWith("ais-") || n.startsWith("aiscanner-"))) t.interrupt();
+            }
+        });
         api.scanner().registerAuditIssueHandler(new AiTriage(scanLog, scanScope));
-        AiContextMenuProvider menuProvider = new AiContextMenuProvider(api, scanLog, session, scanner, scanScope);
+        AiContextMenuProvider menuProvider = new AiContextMenuProvider(api, scanLog, session, scanner, scanScope,
+                this::repoForHost, this::setRepoForHost);
         api.userInterface().registerContextMenuItemsProvider(menuProvider);
         // Suite tab: nav bar (Log / Settings) switching a CardLayout. No Dashboard tab — Burp's own
         // Dashboard already shows the scan task/issues; ours was redundant.
@@ -108,8 +138,8 @@ public class AiScannerExtension implements BurpExtension {
         group.add(bLog); group.add(bSet);
         bLog.addActionListener(e -> cards.show(content, "log"));
         bSet.addActionListener(e -> { cards.show(content, "settings"); settingsTab.focusBaseUrl(); });
-        nav.add(bLog);
-        nav.add(bSet);
+        nav.add(bSet);   // Settings first
+        nav.add(bLog);   // Agent second
 
         JPanel tab = new JPanel(new BorderLayout());
         tab.add(nav, BorderLayout.NORTH);
@@ -126,6 +156,18 @@ public class AiScannerExtension implements BurpExtension {
             cards.show(content, "settings");
             settingsTab.focusBaseUrl();
         }
+        // When you open the AI Scanner suite tab WHILE a scan is running, snap to the Agent (log) view so you
+        // see live progress — even if the tab last defaulted to Settings.
+        Runnable focusAgentIfScanning = () -> {
+            if (tab.isShowing() && scanLog.isScanActive()) {
+                bLog.setSelected(true);
+                cards.show(content, "log");
+                scanLog.scrollToBottom();   // land at the live tail (re-enter autoscroll) when opening mid-scan
+            }
+        };
+        tab.addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & java.awt.event.HierarchyEvent.SHOWING_CHANGED) != 0) focusAgentIfScanning.run();
+        });
         api.userInterface().registerSuiteTab(EXT_NAME, tab);
         }  // end headless guard
 
@@ -138,7 +180,12 @@ public class AiScannerExtension implements BurpExtension {
                 String n = t.getName();
                 if (n != null && (n.startsWith("ais-") || n.startsWith("aiscanner-"))) t.interrupt();
             }
-            api.logging().logToOutput("[" + EXT_NAME + "] unloaded — background scans signalled to stop.");
+            // Filesystem hygiene: remove any source archives we downloaded+extracted to temp this session
+            // (never a user-supplied local checkout — those are used in place and not tracked for deletion).
+            int wiped = 0;
+            try { wiped = com.ioactive.aiscanner.scan.sast.RepoFetcher.cleanup(); } catch (Throwable ignore) { }
+            api.logging().logToOutput("[" + EXT_NAME + "] unloaded — background scans signalled to stop"
+                    + (wiped > 0 ? "; removed " + wiped + " fetched source checkout(s) from temp." : "."));
         });
 
         api.logging().logToOutput("[" + EXT_NAME + "] loaded (build " + BUILD + "). Configure your local model in the '"
@@ -190,6 +237,22 @@ public class AiScannerExtension implements BurpExtension {
         return h.replaceAll("[^A-Za-z0-9._-]", "_") + ".report.txt";
     }
 
+    /** Resolve the LOCAL source-repo path for a host: per-host mapping first, else the launch-wide repo, else null. */
+    public String repoForHost(String host) {
+        String h = host == null ? "" : host.toLowerCase().trim();
+        String r = hostRepoMap.get(h);
+        return (r != null && !r.isBlank()) ? r : launchSourceRepo;
+    }
+
+    /** Associate a local repo path with a host (from the context-menu popup); persisted. Blank/null clears it. */
+    public void setRepoForHost(String host, String repoPath) {
+        if (host == null || host.isBlank()) return;
+        String h = host.toLowerCase().trim();
+        if (repoPath == null || repoPath.isBlank()) hostRepoMap.remove(h);
+        else hostRepoMap.put(h, repoPath.trim());
+        persist();
+    }
+
     /** A launch parameter from a JVM system property, falling back to an env var. null if unset/blank. */
     private static String launchArg(String prop, String env) {
         String v = System.getProperty(prop);
@@ -203,10 +266,12 @@ public class AiScannerExtension implements BurpExtension {
     private void raiseAiIssue(String vulnClass, String url, String detail, HttpRequestResponse... evidence) {
         try {
             if (url == null || !scanScope.contains(url)) return;   // only hosts WE are scanning
-            // keep only the non-null req/resp pairs — a finding may attach several (e.g. BFLA's unauth /
-            // our-session / control probes) so Burp shows the full proof across multiple request tabs.
+            // keep evidence that carries a request OR a response — a finding may attach several (e.g. BFLA's
+            // unauth / our-session / control probes) so Burp shows the full proof across multiple request tabs.
+            // We keep a request with a null response too: for an out-of-band finding (OAST SSRF) the request
+            // that triggered the interaction IS the proof, so it must render even though no response came back.
             java.util.List<HttpRequestResponse> ev = new java.util.ArrayList<>();
-            if (evidence != null) for (HttpRequestResponse e : evidence) if (e != null && e.response() != null) ev.add(e);
+            if (evidence != null) for (HttpRequestResponse e : evidence) if (e != null && (e.request() != null || e.response() != null)) ev.add(e);
             String name = vulnClass == null ? "AI: finding" : (vulnClass.startsWith("AI:") ? vulnClass : "AI: " + vulnClass);
             String cls = vulnClass == null ? "finding" : vulnClass.replaceFirst("(?i)^AI:\\s*", "");
             // Full Burp-issue shape so these export cleanly alongside Burp's own issues: instance-specific
@@ -249,46 +314,69 @@ public class AiScannerExtension implements BurpExtension {
         String key = launchArg("aiscanner.apiKey", "AISCANNER_API_KEY");
         String think = launchArg("aiscanner.disableThinking", "AISCANNER_DISABLE_THINKING");
         String maxTok = launchArg("aiscanner.maxTokens", "AISCANNER_MAX_TOKENS");
-        String verbose = launchArg("aiscanner.verbose", "AISCANNER_VERBOSE");
-        if (provider == null && base == null && model == null && key == null && think == null && maxTok == null && verbose == null) return;
+        // -Daiscanner.temperature / AISCANNER_TEMPERATURE: sampling temperature for the LLM. Set to 0 for a
+        // DETERMINISTIC benchmark run — at temp>0 the discovery LLM returns different endpoint candidates each
+        // run, so the reachable surface (and thus the deterministic-oracle finding count) varies run-to-run.
+        // (Log verbosity is handled separately by LogLevel in initialize(), not here.)
+        String temp = launchArg("aiscanner.temperature", "AISCANNER_TEMPERATURE");
+        // -Daiscanner.noAi / AISCANNER_NO_AI is a hard deterministic-only switch. Reflect it in the provider enum
+        // so the Settings radio and the launch-override log SHOW "No AI" (otherwise the radio still reads the
+        // launcher's default LOCAL_LLM even though getEngine() returns null — honest at runtime, misleading in UI).
+        boolean forceNoAi = noAi();
+        if (!forceNoAi && provider == null && base == null && model == null && key == null && think == null && maxTok == null && temp == null) return;
         EngineConfig c = engineConfig;
         int mt = c.maxTokens;
         if (maxTok != null) try { mt = Integer.parseInt(maxTok.trim()); } catch (NumberFormatException ignore) { }
-        boolean vb = verbose != null ? Boolean.parseBoolean(verbose) : c.verbose;
+        double tp = c.temperature;
+        if (temp != null) try { tp = Double.parseDouble(temp.trim()); } catch (NumberFormatException ignore) { }
         // Use the 9-arg constructor so a launch override does NOT collapse the provider to LOCAL_LLM (the
         // 8-arg back-compat ctor hardcodes it). -Daiscanner.provider=BURP_AI selects Burp's built-in AI from
         // the CLI. When no provider is given but a baseUrl override IS (the local-LLM launcher / Docker flow),
         // INFER LOCAL_LLM — a baseUrl is meaningless for BURP_AI, and otherwise the fresh-install BURP_AI
         // default silently ignores the endpoint and degrades. Else keep the current/saved provider.
-        EngineConfig.Provider prov = provider != null ? parseProvider(provider.trim())
+        EngineConfig.Provider prov = forceNoAi ? EngineConfig.Provider.NO_AI
+                : provider != null ? parseProvider(provider.trim())
                 : (base != null && !base.isBlank() ? EngineConfig.Provider.LOCAL_LLM : c.provider);
         engineConfig = new EngineConfig(
                 prov,
                 base != null ? base : c.baseUrl,
                 model != null ? model : c.model,
                 key != null ? key : c.apiKey,
-                c.temperature, mt,
+                tp, mt,
                 think != null ? Boolean.parseBoolean(think) : c.disableThinking,
-                c.timeoutSeconds, vb);
-        scanLog.setVerbose(vb);   // -Daiscanner.verbose: show discovery/fetch traces without code edits
+                c.timeoutSeconds);
         this.engine = engineFor(engineConfig);
         scanLog.log("[AI Scanner] launch override → provider=" + engineConfig.provider
                 + (engineConfig.provider == EngineConfig.Provider.LOCAL_LLM ? ", baseUrl=" + engineConfig.baseUrl : "")
                 + (model != null ? ", model=" + model : "")
-                + (key != null ? ", apiKey=***" : ""));
+                + (key != null ? ", apiKey=***" : "")
+                + ", temperature=" + engineConfig.temperature);
     }
 
     // ---- accessors ----
     public MontoyaApi api() { return api; }
-    public AiEngine getEngine() { return engine; }
+    // NO-AI baseline: with -Daiscanner.noAi / AISCANNER_NO_AI the LLM is fully disabled — getEngine() returns
+    // null so EVERY LLM path (discovery synthesis, agentic unlock, fuzz payloads, flow-engine, SAST, triage of
+    // our own findings) is skipped by its existing `engine != null` guard, while the deterministic layer (auth,
+    // identity sweep, probes, exercise-writes, Burp's native audit) still runs. This measures the extension's
+    // NON-LLM capability, headless-safe (aiPreflight() returns true on a null engine, no endpoint required).
+    private static boolean noAi() {
+        String v = System.getProperty("aiscanner.noAi");
+        if (v == null || v.isBlank()) v = System.getenv("AISCANNER_NO_AI");
+        return v != null && (v.equalsIgnoreCase("true") || v.equals("1") || v.equalsIgnoreCase("yes"));
+    }
+    public AiEngine getEngine() {
+        // null → deterministic-only: the -Daiscanner.noAi/AISCANNER_NO_AI flag OR the NO_AI provider (Settings).
+        return (noAi() || engineConfig.provider == EngineConfig.Provider.NO_AI) ? null : engine;
+    }
     public EngineConfig engineConfig() { return engineConfig; }
     public ScanConfig scanConfig() { return scanConfig; }
+    public ScanLog scanLog() { return scanLog; }
 
     /** Rebuild the engine from a new config and persist everything. Called by the settings tab. */
     public void applyEngineConfig(EngineConfig cfg) {
         this.engineConfig = cfg;
         this.engine = engineFor(cfg);
-        scanLog.setVerbose(cfg.verbose);
         persist();
     }
 
@@ -315,9 +403,10 @@ public class AiScannerExtension implements BurpExtension {
          .put("baseUrl", c.baseUrl).put("model", c.model).put("apiKey", c.apiKey)
          .put("temperature", c.temperature).put("maxTokens", c.maxTokens)
          .put("disableThinking", c.disableThinking).put("timeoutSeconds", c.timeoutSeconds)
-         .put("verbose", c.verbose);
+         .put("logLevel", LogLevel.current().name());
         o.put("rounds", scanConfig.rounds).put("payloadsPerRound", scanConfig.payloadsPerRound)
          .put("delayMs", scanConfig.delayMs);
+        if (!hostRepoMap.isEmpty()) o.put("hostRepoMap", new JSONObject(hostRepoMap));
         api.persistence().extensionData().setString(PREF_KEY, o.toString());
     }
 
@@ -327,7 +416,7 @@ public class AiScannerExtension implements BurpExtension {
         // Fresh install defaults to Burp's built-in AI (App-Store preferred); the local base URL is pre-filled
         // so switching to the Local-LLM provider is one radio click away.
         EngineConfig def = new EngineConfig(EngineConfig.Provider.BURP_AI,
-                "http://127.0.0.1:8000/v1/", "", "", 0.3, 512, true, 120, false);
+                "http://127.0.0.1:8000/v1/", "", "", 0.3, 512, true, 120);
         String raw = api.persistence().extensionData().getString(PREF_KEY);
         if (raw == null || raw.isBlank()) {
             this.engineConfig = def;
@@ -346,11 +435,18 @@ public class AiScannerExtension implements BurpExtension {
                     o.optDouble("temperature", def.temperature),
                     o.optInt("maxTokens", def.maxTokens),
                     o.optBoolean("disableThinking", def.disableThinking),
-                    o.optInt("timeoutSeconds", def.timeoutSeconds),
-                    o.optBoolean("verbose", def.verbose));
+                    o.optInt("timeoutSeconds", def.timeoutSeconds));
+            String savedLvl = o.optString("logLevel", "");
+            if (!savedLvl.isBlank()) logLevelSetting = LogLevel.parse(savedLvl);
+            else if (o.optBoolean("verbose", false)) logLevelSetting = LogLevel.TRACE;   // migrate old verbose setting
             scanConfig.rounds = o.optInt("rounds", scanConfig.rounds);
             scanConfig.payloadsPerRound = o.optInt("payloadsPerRound", scanConfig.payloadsPerRound);
             scanConfig.delayMs = o.optInt("delayMs", scanConfig.delayMs);
+            JSONObject rm = o.optJSONObject("hostRepoMap");
+            if (rm != null) for (String k : rm.keySet()) {
+                String v = rm.optString(k, "");
+                if (!v.isBlank()) hostRepoMap.put(k.toLowerCase(), v);
+            }
         } catch (Exception e) {
             this.engineConfig = def;
         }

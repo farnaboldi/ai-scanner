@@ -113,11 +113,22 @@ public final class AuthSession {
             try {
                 if (!cookieHeader().isBlank()) req = req.withHeader("Cookie", cookieHeader());
                 req = browserize(req);   // browser-like headers so UA/behavior WAFs don't 403 our auth requests
-                rr = api.http().sendRequest(req, RequestOptions.requestOptions());
+                rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
             } catch (Throwable t) {
                 return rr;
             }
             if (rr == null || rr.response() == null) return rr;
+            // CORS-strict server rejected our synthetic Origin ("Invalid CORS request", Spring's DefaultCorsProcessor)
+            // — a non-browser request without an Origin is NOT CORS-checked, so retry once with Origin/Referer/
+            // Sec-Fetch stripped. Generic: only fires when we actually sent an Origin AND the body says CORS.
+            if (rr.response().statusCode() == 403 && req.hasHeader("Origin")
+                    && rr.response().bodyToString().toLowerCase().contains("invalid cors request")) {
+                HttpRequest noCors = req;
+                for (String h : new String[]{"Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"})
+                    if (noCors.hasHeader(h)) noCors = noCors.withRemovedHeader(h);
+                HttpRequestResponse rr2 = api.http().sendRequest(noCors, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                if (rr2 != null && rr2.response() != null) { rr = rr2; req = noCors; }
+            }
             mergeCookies(rr);
             int st = rr.response().statusCode();
             // Rate-limited: back off (honoring Retry-After) and retry the SAME request a few times, so a

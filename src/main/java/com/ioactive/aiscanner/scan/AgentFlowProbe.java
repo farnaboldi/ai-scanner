@@ -339,7 +339,7 @@ public final class AgentFlowProbe {
             if (jsonBody != null) req = req.withBody(jsonBody).withHeader("Content-Type", "application/json");
             req = req.withHeader("Accept", "application/json");
             req = withSession.apply(req);   // adds Cookie / Authorization: Bearer / X-Signature last
-            return api.http().sendRequest(req, RequestOptions.requestOptions());
+            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner]   agent-flow: send " + method + " " + url + " failed: " + t);
             return null;
@@ -351,7 +351,7 @@ public final class AgentFlowProbe {
         try {
             if (!req.hasHeader("Accept")) req = req.withHeader("Accept", "application/json");
             req = withSession.apply(req);   // sign LAST — covers final method/path/body
-            return api.http().sendRequest(req, RequestOptions.requestOptions());
+            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) {
             scanLog.debug("[AI Scanner]   agent-flow: sendReq failed: " + t);
             return null;

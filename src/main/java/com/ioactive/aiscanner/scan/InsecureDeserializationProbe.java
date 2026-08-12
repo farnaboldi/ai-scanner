@@ -168,7 +168,7 @@ public final class InsecureDeserializationProbe {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("GET")
                     .withHeader("Cookie", name + "=" + value);
-            return api.http().sendRequest(req, RequestOptions.requestOptions());
+            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) { return null; }
     }
 

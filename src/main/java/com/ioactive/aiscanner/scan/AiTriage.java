@@ -45,7 +45,10 @@ public final class AiTriage implements AuditIssueHandler {
                 scanLog.log("[AI Scanner]  ·  " + line);
                 return;
             }
-            if (!seen.add(issue.severity() + "|" + issue.name() + "|" + issue.baseUrl())) return;   // once per unique issue
+            // Cross-channel dedup: if OUR probes (or another native issue) already reported this flaw-family at
+            // this endpoint, don't double-count it under Burp's label (sqli-labs Less-11 was counted 3× — our
+            // error-based + the LLM tier + this native HIGH). Shared claim with ScanLog.found().
+            if (!scanLog.claimFinding(issue.name(), issue.baseUrl())) return;
             scanLog.log("[AI Scanner] >>> " + line);            // real vuln → prominent + counted + in report
             scanLog.incFinding();
         } catch (Throwable t) {

@@ -174,6 +174,15 @@ public final class AutonomousAuth {
         // never tried. Origin-aware + generic.
         loginCandidates = mergeCandidates(loginCandidates, siteMapLoginCandidates());
         if (loginCandidates == null || loginCandidates.isEmpty()) return false;
+        // Dedup by (method, path): the site map holds MANY copies of the same login/candidate request, so without
+        // this the whole register+login battery re-ran per copy — AND once per mailbox provider — hammering a
+        // single endpoint dozens of times (observed: /app/useredit ~11× × N providers). One attempt per endpoint.
+        {
+            java.util.LinkedHashMap<String, HttpRequest> uniq = new java.util.LinkedHashMap<>();
+            for (HttpRequest c : loginCandidates)
+                if (c != null) uniq.putIfAbsent(c.method() + " " + c.url().split("\\?")[0], c);
+            loginCandidates = new java.util.ArrayList<>(uniq.values());
+        }
         // Prefer a DISPOSABLE, readable mailbox so an email-verification / OTP step can be completed
         // autonomously; fall back to a throwaway @example.com for apps that don't verify email (or that
         // block disposable domains). Both are generic — only the mailbox address changes.
@@ -185,11 +194,101 @@ public final class AutonomousAuth {
             scanLog.log("[AI Scanner] API auth: trying disposable mailbox provider '" + box.providerName() + "' (" + box.address() + ")");
             if (attemptApiRegister(loginCandidates, box.address(), box)) return true;
             if (session.authenticated()) return true;   // captured mid-attempt (e.g. signup returned a token)
+            // One working provider is enough: the signup/login PATH permutation is mailbox-independent, so only
+            // fall through to the next provider when a signup was ACCEPTED but its verification email never
+            // arrived (throttled/blocked inbox). A path-permutation miss re-runs identically → don't hammer.
+            if (!needMailboxFallback) break;
         }
         if (attemptApiRegister(loginCandidates, null, null)) return true;   // no-verify apps: throwaway @example.com
         scanLog.debug("[AI Scanner] API auth: no JSON login endpoint returned a token.");
         return false;
     }
+
+    // OAuth2 password-grant harvesting patterns (generic).
+    private static final Pattern FORM_ACTION = Pattern.compile("(?is)<form\\b[^>]*\\baction\\s*=\\s*['\"]([^'\"]*)['\"]");
+    // "Username: batman  Password: Batman@123" (or user=/pass=) disclosed in a page — a common vuln-app pattern.
+    private static final Pattern CRED_PAIR = Pattern.compile(
+            "(?is)\\buser(?:name)?\\b\\s*[:=]\\s*([^\\s:<>\"']{2,63}).{0,80}?\\bpass(?:word)?\\b\\s*[:=]\\s*([^\\s:<>\"']{2,63})");
+
+    /**
+     * OAuth2 "password" grant, fully autonomous. Deliberately-vulnerable apps (Tiredful, many OAuth labs) — and
+     * plenty of real apps — hand everything needed straight in a crawled page: a form with a hidden
+     * grant_type=password + client_id + client_secret, plus demo credentials printed in the page text
+     * ("Username: batman  Password: Batman@123"). This harvests those from the site map, POSTs the token request
+     * to the OAuth token endpoint (the form's action, else the standard /oauth/token and /o/token paths), and
+     * adopts the returned access_token as the session bearer. Generic — no app-specific path, field, or value.
+     */
+    public boolean oauthPasswordGrant() {
+        String clientId = null, clientSecret = null;
+        LinkedHashSet<String> tokenUrls = new LinkedHashSet<>();
+        LinkedHashSet<String> credKeys = new LinkedHashSet<>();
+        java.util.List<String[]> creds = new java.util.ArrayList<>();
+        boolean sawPasswordGrant = false;
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            if (rr.request() == null || rr.response() == null || !sameHost(rr.request().url())) continue;
+            String body = bodyOf(rr);
+            if (body == null || body.isEmpty()) continue;
+            Matcher im = TAG.matcher(body);                       // hidden OAuth client fields (attr order-independent)
+            while (im.find()) {
+                String tag = im.group(), name = attr(tag, "name"), val = attr(tag, "value");
+                if (name == null || val == null) continue;
+                String n = name.toLowerCase();
+                if (n.equals("client_id") && clientId == null) clientId = val;
+                else if (n.equals("client_secret") && clientSecret == null) clientSecret = val;
+                else if (n.equals("grant_type") && "password".equalsIgnoreCase(val)) sawPasswordGrant = true;
+            }
+            Matcher fm = FORM_ACTION.matcher(body);               // token endpoint from a form action mentioning "token"
+            while (fm.find()) {
+                String act = fm.group(1);
+                // skip non-navigable actions ("javascript:getToken()" contains "token" but is NOT a URL).
+                if (act == null || !act.toLowerCase().contains("token") || act.regionMatches(true, 0, "javascript:", 0, 11)) continue;
+                try {
+                    String u = URI.create(rr.request().url()).resolve(act).toString();
+                    if (u.startsWith("http://") || u.startsWith("https://")) tokenUrls.add(u);
+                } catch (Exception ignore) {}
+            }
+            Matcher cm = CRED_PAIR.matcher(stripTags(body));      // demo/hardcoded creds disclosed in page TEXT
+            // (strip tags first: "Username:</td><td>batman" in raw HTML separates the pair with markup)
+            while (cm.find()) {
+                String u = cm.group(1).trim(), p = cm.group(2).trim();
+                if (!u.isEmpty() && !p.isEmpty() && credKeys.add(u + " " + p)) creds.add(new String[]{u, p});
+            }
+        }
+        if (clientId == null || clientSecret == null) return false;   // not an OAuth2 password-grant app we can drive
+        String base = seedUrl.replaceAll("/+$", "");
+        for (String p : new String[]{ "/oauth/token/", "/oauth/token", "/o/token/", "/o/token" }) tokenUrls.add(base + p);
+        String oe = arg("aiscanner.loginEmail", "AISCANNER_LOGIN_EMAIL"), op = arg("aiscanner.loginPassword", "AISCANNER_LOGIN_PASSWORD");
+        if (oe != null && op != null && credKeys.add(oe + " " + op)) creds.add(new String[]{oe, op});
+        for (String[] dc : com.ioactive.aiscanner.menu.AiContextMenuProvider.DEFAULT_CREDS) if (credKeys.add(dc[0] + " " + dc[1])) creds.add(dc);
+        if (creds.isEmpty()) return false;
+        if (sawPasswordGrant)
+            scanLog.log("[AI Scanner] OAuth2 password-grant form found (client_id + client_secret disclosed in page) — driving it autonomously.");
+
+        for (String turl : tokenUrls) {
+            if (!turl.startsWith("http://") && !turl.startsWith("https://")) continue;   // never httpRequestFromUrl a non-URL
+            for (String[] c : creds) {
+                String form = "grant_type=password&username=" + enc(c[0]) + "&password=" + enc(c[1])
+                        + "&client_id=" + enc(clientId) + "&client_secret=" + enc(clientSecret);
+                try {
+                    HttpRequest req = HttpRequest.httpRequestFromUrl(turl).withMethod("POST")
+                            .withAddedHeader("Content-Type", "application/x-www-form-urlencoded").withBody(form);
+                    HttpRequestResponse rr = com.ioactive.aiscanner.scan.AiScanner.decompress(
+                            api.http().sendRequest(req, burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                    String body = bodyOf(rr);
+                    if (body == null || !body.contains("access_token")) continue;
+                    String tok = new JSONObject(body).optString("access_token", "");
+                    if (!tok.isBlank()) {
+                        session.setBearer(tok);
+                        scanLog.log("[AI Scanner] OAuth2 password-grant SUCCESS @ " + turl + " (user '" + c[0]
+                                + "') → access_token adopted as bearer.");
+                        return true;
+                    }
+                } catch (Throwable ignore) { }
+            }
+        }
+        return false;
+    }
+
 
     /**
      * Log in with OPERATOR-SUPPLIED credentials (env {@code AISCANNER_LOGIN_EMAIL}/{@code AISCANNER_LOGIN_PASSWORD}
@@ -202,6 +301,12 @@ public final class AutonomousAuth {
         String email = arg("aiscanner.loginEmail", "AISCANNER_LOGIN_EMAIL");
         String pass  = arg("aiscanner.loginPassword", "AISCANNER_LOGIN_PASSWORD");
         if (email == null || pass == null) return false;
+        // FORM-ENCODED login FIRST: Spring formLogin / classic form logins have NO discoverable JSON endpoint and
+        // no HTML <form> on a SPA (the login POST is /login, form-encoded) — so loginWith()/JSON both miss them.
+        // POST the creds directly to well-known login paths with common field-name variants + a bad-creds baseline
+        // oracle. On success we hold the session cookie → seeded into Burp's cookie jar → Burp's browser crawl then
+        // renders the app AUTHENTICATED. Generic (no app-specific paths/fields).
+        if (formLoginProvidedCreds(email, pass)) return true;
         if (loginCandidates == null || loginCandidates.isEmpty()) {
             scanLog.log("[AI Scanner] API auth: operator credentials set but no login endpoint discovered.");
             return false;
@@ -226,10 +331,57 @@ public final class AutonomousAuth {
     /** Minimal JSON string escape for a single value built into a hand-assembled body. */
     private static String esc(String v) { return v == null ? "" : v.replace("\\", "\\\\").replace("\"", "\\\""); }
 
+    private static String enc(String v) { try { return java.net.URLEncoder.encode(v, "UTF-8"); } catch (Exception e) { return v == null ? "" : v; } }
+
+    /**
+     * Form-encoded login with operator-supplied creds at well-known login paths — for Spring formLogin and classic
+     * form logins that a SPA renders no HTML {@code <form>} for (the login is just a form-encoded POST to /login).
+     * Tries common field-name variants; a login-error bounce / 4xx / error body is rejected; success is confirmed
+     * by {@link #verifyAuthenticated}. On success the session cookie is published (→ Burp's cookie jar → Burp's
+     * browser crawl renders the app authenticated). Generic: no app-specific paths or field names.
+     */
+    private boolean formLoginProvidedCreds(String email, String pass) {
+        String origin;
+        try { java.net.URI u = java.net.URI.create(seedUrl); origin = u.getScheme() + "://" + u.getAuthority(); }
+        catch (Exception e) { return false; }
+        String[] paths = {"/login", "/rest/login", "/api/login", "/auth/login", "/signin",
+                          "/authenticate", "/perform_login", "/j_spring_security_check"};
+        String[][] fields = {{"username", "password"}, {"j_username", "j_password"},
+                             {"email", "password"}, {"name", "password"}, {"user", "pass"}};
+        for (String p : paths) {
+            boolean pathDead = false;
+            for (String[] f : fields) {
+                AuthSession s = new AuthSession(api, host);
+                HttpRequestResponse gr = s.postForm(origin + p, f[0] + "=" + enc(email) + "&" + f[1] + "=" + enc(pass));
+                if (gr == null || gr.response() == null) continue;
+                int st = gr.response().statusCode();
+                if (st == 404 || st == 405) { pathDead = true; break; }     // not a login handler → skip its variants
+                if (st >= 400) continue;
+                String gbody = safeBody(gr).toLowerCase();
+                String gloc = ("" + urlOf(gr, origin + p)).toLowerCase();
+                if (gbody.matches("(?s).*(bad credentials|invalid|denied|login\\s*failed|authentication failed).*")) continue;
+                if (gloc.matches("(?s).*(error|denied|invalid|/login|/signin).*")) continue;   // login-error bounce
+                if (verifyAuthenticated(s)) {
+                    s.publishTo(session, urlOf(gr, origin + p), origin + p, email, pass);
+                    scanLog.log("[AI Scanner] operator creds: FORM login OK at " + p + " (" + f[0] + "/" + f[1]
+                            + ") — session captured; Burp's crawl will render the app authenticated.");
+                    return true;
+                }
+            }
+            if (pathDead) continue;
+        }
+        return false;
+    }
+
     /** One register+login sweep with a given email (null → a throwaway @example.com). With a {@code box},
      *  an emailed verification code / magic-link is completed between register and login. Generic —
      *  endpoints are derived from the discovered login URL; field names are common conventions. */
+    /** Set true only when a signup was accepted but its verification email couldn't be read — the ONLY case where
+     *  trying the next mailbox provider is worthwhile (see the provider loop). Reset at the start of each sweep. */
+    private boolean needMailboxFallback;
+
     private boolean attemptApiRegister(List<HttpRequest> loginCandidates, String emailOverride, DisposableMailbox box) {
+        needMailboxFallback = false;
         long nonce = Math.abs(System.nanoTime());
         String tag = "aisc" + Long.toString(nonce, 36);
         String email = emailOverride != null ? emailOverride : tag + "@example.com";
@@ -249,6 +401,19 @@ public final class AutonomousAuth {
             String loginUrl = cand.url();
             if (loginUrl == null || !tried.add(loginUrl)) continue;
             for (String signupUrl : registrationTargets(loginUrl)) {
+                // A signup URL that already proved structurally dead (404/405/500/501 — endpoint absent, wrong
+                // method, or server error) is NEVER re-POSTed: many login candidates derive the SAME
+                // {register,register/,signup,…} siblings, and attemptApiRegister is called once per mailbox
+                // provider + once no-verify, so without this the same dead URL was POSTed a dozen+ times (the
+                // register-storm seen on Tiredful: register/ →405, register →500, repeated). Mirrors deadLoginUrls.
+                if (deadSignupUrls.contains(signupUrl)) continue;
+                // POST each distinct signup URL AT MOST ONCE per scan. deadSignupUrls only fences 4xx/5xx, but the
+                // worst storms come from endpoints that answer HTTP 200 with the app's HTML shell (SPA/MPA
+                // catch-all) to our JSON POST — never "dead", so every login-candidate × mailbox-provider ×
+                // auth-strategy re-POSTed them (observed: DVNA /register ×14, DVOAuth /users ×48, WebGoat
+                // /registration ×16). Re-POSTing the same URL with a fresh nonce never turns a non-handler into a
+                // handler, and on an ACCEPTED signup it just resends/duplicates the OTP — so once is correct.
+                if (!triedSignups.add(signupUrl)) continue;
                 try {
                     AuthSession s = new AuthSession(api, host);
                     HttpRequestResponse sr = registerSend(signupUrl, signup); // register (initial body; POST or PUT)
@@ -260,6 +425,10 @@ public final class AutonomousAuth {
                         scanLog.log("[AI Scanner] signup " + signupUrl + " → HTTP " + sc0 + " | "
                                 + (sb0 == null ? "" : sb0.substring(0, Math.min(160, sb0.length())).replaceAll("\\s+", " ")));
                     }
+                    // Structural failure → mark dead so no candidate/provider ever re-POSTs it. 405/501 = wrong
+                    // method/not implemented; 500 = the endpoint errors on our body (won't self-heal on retry);
+                    // 404 = absent. A 400/422 (validation) is NOT dead — the adaptive round loop below can fix it.
+                    if (sc0 == 404 || sc0 == 405 || sc0 == 500 || sc0 == 501) { deadSignupUrls.add(signupUrl); continue; }
                     // ADAPTIVE: the app's own 400/422 validation errors reveal its required fields — fill them
                     // (business name, license #, phone, region, …) and retry, so sign-up works on app-specific
                     // schemas. DETERMINISTIC field-name heuristics first (reliable), LLM only as a fallback, and
@@ -277,7 +446,12 @@ public final class AutonomousAuth {
                         signup = filled;
                         sr = registerSend(signupUrl, signup);
                     }
-                    boolean signupOk = sr != null && sr.response() != null && sr.response().statusCode() < 400;
+                    // A real API signup answers JSON/redirect — NOT the SPA/HTML app shell. A catch-all SPA returns
+                    // its index.html with HTTP 200 for ANY path (a "soft 404"), which was mis-read as "signup
+                    // accepted" and triggered an endless email-verify + mailbox-fallback loop (DVOAuth/Juice). Reject
+                    // HTML-shell 200s so signupOk means a genuine handler ran.
+                    boolean signupOk = sr != null && sr.response() != null
+                            && sr.response().statusCode() < 400 && !looksHtmlShell(sr);
                     if (captureLoginToken(s, loginUrl, login, signupUrl)) return true;   // maybe no verify needed
                     // Only wait for an emailed code if the signup endpoint actually ACCEPTED the request
                     // (2xx/3xx) — else a 404/405 sibling would make us block on the inbox for nothing.
@@ -287,6 +461,8 @@ public final class AutonomousAuth {
                         if (captureLoginToken(s, loginUrl, login, signupUrl)) return true;   // else a separate login
                         // Accepted but couldn't finalize: STOP. Re-POSTing signup on the next sibling "resends" a
                         // fresh code and invalidates the one we just used (a self-inflicted OTP race). One shot.
+                        // This is the mailbox-delivery-failure case → worth trying the NEXT provider.
+                        needMailboxFallback = true;
                         return false;
                     }
                 } catch (Throwable ignore) { }
@@ -298,11 +474,28 @@ public final class AutonomousAuth {
     /** Login URLs that already proved they are NOT a login handler (404/405/501) — never re-POSTed. This kills
      *  the dup storm where synthesized `<app>/accounts/{login,signin,authenticate}` candidates (all nginx 405)
      *  were POSTed once per signup-sibling × credential set. Populated in captureLoginToken. */
-    private final Set<String> deadLoginUrls = new LinkedHashSet<>();
+    // STATIC (scan-scoped, not instance-scoped): the orchestrator creates a FRESH AutonomousAuth per auth
+    // STRATEGY (manualImport, oauthPasswordGrant, apiRegisterThenLogin ×2, registerThenLogin, …), so an
+    // instance-field dedup resets between strategies and the SAME dead URL is re-POSTed once per strategy — the
+    // 2× register-storm still seen on Tiredful (each /books/{register,signup,…} sibling POSTed twice). Sharing
+    // these across instances makes a URL proven dead STAY dead for the whole scan. Safe across targets/cells:
+    // entries are full URLs (host:port qualified), and each matrix cell is its own Burp process (fresh statics).
+    private static final Set<String> deadLoginUrls = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static final Set<String> triedLogins = java.util.concurrent.ConcurrentHashMap.newKeySet();  // (endpoint, exact-credentials) already POSTed
+    /** Signup URLs proven structurally dead (404/405/500/501) — never re-POSTed for the rest of the scan. Kills
+     *  the register-storm where the same {register,signup,…} siblings, derived from many login candidates, were
+     *  POSTed once per candidate × per mailbox-provider call × per auth-strategy instance. */
+    private static final Set<String> deadSignupUrls = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Every signup URL already POSTed this scan — a hard POST-once cap (see attemptApiRegister). Catches the
+     *  HTML-shell-200 non-handlers that {@link #deadSignupUrls} (4xx/5xx only) misses. */
+    private static final Set<String> triedSignups = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** POST the login body; capture a JWT (or a 2xx + session cookie) as the authenticated session. */
     private boolean captureLoginToken(AuthSession s, String loginUrl, String login, String signupUrl) {
-        if (deadLoginUrls.contains(loginUrl)) return false;   // proven not a login handler — don't re-POST
+        if (deadLoginUrls.contains(loginUrl)) return false;   // proven not a login handler / blocked — don't re-POST
+        // Same (endpoint + exact credentials) already attempted → re-POSTing gets the SAME verdict and just hammers
+        // the server (the retry-storm that self-trips a WAF 403). Bad creds don't become good on a retry.
+        if (!triedLogins.add(loginUrl + " ## " + (login == null ? "" : login))) return false;
         HttpRequestResponse r = s.postJson(loginUrl, login);
         String body = bodyOf(r);
         Matcher jm = JWT.matcher(body == null ? "" : body);
@@ -333,11 +526,16 @@ public final class AutonomousAuth {
             }
         }
         int code = r != null && r.response() != null ? r.response().statusCode() : -1;
-        // Not a login handler (404/405/501, incl. nginx "Method Not Allowed") → remember it so we don't POST it
-        // again for every signup-sibling / credential set, and log once concisely instead of storming the log.
-        if (code == 404 || code == 405 || code == 501) {
+        // Not a login handler (404/405/501, incl. nginx "Method Not Allowed"), OR a dead/unreachable endpoint
+        // (HTTP 0/-1 = connection failed/timeout — DVOAuth's /users hung every ~36s and the retry loop burned the
+        // whole audit window) → remember it so we don't POST it again for every signup-sibling / credential set.
+        // Also stop on 403/429: a WAF/edge block or rate-limit. Retrying doesn't help and the hammering itself
+        // trips/worsens the block (observed on other hosts: ~6 rapid 401s → WAF 403 → 40+ more 403s). Mark it
+        // dead for this run so the auth chain stops re-POSTing it.
+        if (code == 404 || code == 405 || code == 501 || code <= 0 || code == 403 || code == 429) {
             deadLoginUrls.add(loginUrl);
-            scanLog.debug("[AI Scanner]   login " + loginUrl + " → HTTP " + code + " — not a login handler; skipping further attempts.");
+            String why = (code == 403 || code == 429) ? "blocked (WAF/rate-limit) — stopping to avoid hammering" : "not a login handler";
+            scanLog.debug("[AI Scanner]   login " + loginUrl + " → HTTP " + code + " — " + why + "; skipping further attempts.");
             return false;
         }
         // FORM-ENCODED login fallback: Spring Security formLogin and classic server apps take
@@ -896,11 +1094,22 @@ public final class AutonomousAuth {
                     if (forceSelect != null || RESET_BTN.matcher(value == null ? "" : value).find())
                         fields.put(name, value == null ? "" : value);
                     break;
-                default:  // text / email / tel / number / etc.
-                    if (user != null && USER_FIELD.matcher(name).matches() && !fields.containsValue(user))
-                        fields.put(name, user);
-                    else
-                        fields.put(name, value == null ? "" : value);
+                default:  // text / email / tel / number / url / etc.
+                    // Fill EVERY text-ish field with a valid value — never leave a required field empty. A
+                    // multi-field registration form (e.g. DVNA: name + username + email, all required) used to
+                    // get only the FIRST user-like field filled (the old `!fields.containsValue(user)` gate) and
+                    // the rest left blank → the server rejected the signup → auth failed. Fill by category so
+                    // each required field is plausible. Generic: categories, not app-specific field names.
+                    String nlow = name.toLowerCase();
+                    String v;
+                    if (value != null && !value.isBlank())                     v = value;                 // keep a server-prefilled value
+                    else if ("email".equals(type) || nlow.contains("mail"))    v = emailFor(user);        // email-shaped
+                    else if ("number".equals(type) || "tel".equals(type))      v = "1";
+                    else if ("url".equals(type))                               v = "https://example.com";
+                    else if (user != null && USER_FIELD.matcher(name).matches()) v = user;                // user/login/name/account
+                    else if (!forLogin)                                        v = user == null ? "aiscanner" : user; // other required signup field
+                    else                                                       v = "";                    // login: don't invent unrelated fields
+                    fields.put(name, v);
             }
         }
         StringBuilder sb = new StringBuilder();
@@ -917,6 +1126,13 @@ public final class AutonomousAuth {
         Matcher m = FORM.matcher(html);
         while (m.find()) out.add(m.group());
         return out;
+    }
+
+    /** An email-shaped value for an email field: reuse the identity if it's already email-shaped, else make one
+     *  from it so register and login stay consistent (the same handle flows to the login user/email field). */
+    private static String emailFor(String user) {
+        if (user == null || user.isBlank()) return "aiscanner@example.com";
+        return user.contains("@") ? user : user + "@example.com";
     }
 
     /** First form whose count of password inputs equals {@code pwCount} (1=login, 2=register). */
@@ -1041,8 +1257,16 @@ public final class AutonomousAuth {
         String tag = form.substring(0, form.indexOf('>') + 1);
         String action = attr(tag, "action");
         try {
-            if (action == null || action.isBlank() || action.equals("#")) return stripFragment(pageUrl);
-            return stripFragment(URI.create(pageUrl).resolve(action).toString());
+            // Pseudo-scheme actions (action="javascript:getToken()" on JS-driven forms, mailto:/tel:/data:) are NOT
+            // navigable URLs — resolving+POSTing them throws "Invalid data" and aborts the whole scan. The real
+            // submit target is JS-driven and unknowable black-box, so treat the form as posting to its own page.
+            if (action == null || action.isBlank() || action.equals("#")
+                    || action.regionMatches(true, 0, "javascript:", 0, 11)
+                    || action.regionMatches(true, 0, "mailto:", 0, 7)
+                    || action.regionMatches(true, 0, "tel:", 0, 4)
+                    || action.regionMatches(true, 0, "data:", 0, 5)) return stripFragment(pageUrl);
+            String abs = stripFragment(URI.create(pageUrl).resolve(action).toString());
+            return (abs.startsWith("http://") || abs.startsWith("https://")) ? abs : stripFragment(pageUrl);
         } catch (Exception e) {
             return stripFragment(pageUrl);
         }
@@ -1066,12 +1290,22 @@ public final class AutonomousAuth {
 
     private static String stripTags(String s) { return s == null ? "" : s.replaceAll("(?is)<[^>]*>", "").trim(); }
     private static String lower(String s) { return s == null ? null : s.toLowerCase(); }
-    private static String enc(String v) { return URLEncoder.encode(v == null ? "" : v, StandardCharsets.UTF_8); }
     private static String stripFragment(String u) { int i = u == null ? -1 : u.indexOf('#'); return i < 0 ? u : u.substring(0, i); }
     private boolean sameHost(String url) { try { return host.equalsIgnoreCase(URI.create(url).getHost()); } catch (Exception e) { return false; } }
 
     private static String bodyOf(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().bodyToString() : ""; } catch (Exception e) { return ""; }
+    }
+
+    /** True when a 2xx response is really the SPA/HTML app shell (a catch-all "soft 404"), not a real API handler. */
+    private static boolean looksHtmlShell(HttpRequestResponse rr) {
+        try {
+            if (rr == null || rr.response() == null) return false;
+            String ct = rr.response().headerValue("Content-Type");
+            if (ct != null && ct.toLowerCase().contains("text/html")) return true;
+            String t = bodyOf(rr).stripLeading().toLowerCase();
+            return t.startsWith("<!doctype") || t.startsWith("<html");
+        } catch (Exception e) { return false; }
     }
     private static String safeBody(HttpRequestResponse rr) { return bodyOf(rr); }
     private static String urlOf(HttpRequestResponse rr, String fallback) {
