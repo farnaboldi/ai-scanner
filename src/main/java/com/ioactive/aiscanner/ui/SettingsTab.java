@@ -84,10 +84,15 @@ public final class SettingsTab {
         {"lfi","Path-traversal / LFI"}, {"ssrf","SSRF"}, {"tamper","Restriction-bypass / tampering"},
         {"flow","Flow-engine (LLM, multi-step)"},
     };
-    // Prerequisite phases that ALWAYS run (before/after the attack probes) — shown checked + disabled.
-    private static final String[] PREREQ_MODULES = {
-        "Authentication (default-creds / register / SQLi-bypass)", "Native crawl", "Endpoint discovery (JS/OpenAPI mining)",
-        "Authenticated explore + form-exercise", "Native Burp active audit", "Benchmark tally",
+    // Prerequisite lifecycle phases that ALWAYS run (not skippable) — shown checked + disabled, in execution order.
+    // BEFORE the attack modules: build the request surface + session.
+    private static final String[] PREREQ_BEFORE = {
+        "Native crawl", "Endpoint discovery (JS/OpenAPI mining)",
+        "Authentication (default-creds / register / SQLi-bypass)", "Authenticated explore + form-exercise",
+    };
+    // AFTER the attack modules: Burp's async native audit completes, then scoring.
+    private static final String[] PREREQ_AFTER = {
+        "Native Burp active audit", "Benchmark tally",
     };
     private final java.util.Map<String, JCheckBox> moduleBoxes = new java.util.LinkedHashMap<>();
 
@@ -101,15 +106,9 @@ public final class SettingsTab {
         // JLabel hint = new JLabel("Uncheck to skip on the scan");
         // hint.setForeground(Color.GRAY); p.add(hint); p.add(Box.createVerticalStrut(6));
 
-        p.add(sectionLabel("Always run (before / after)"));
-        for (String pr : PREREQ_MODULES) {
-            JCheckBox cb = new JCheckBox(pr + "  (always on)", true);
-            cb.setEnabled(false);   // prerequisites are not skippable — the probes need them
-            // Bold so it's unmistakable these are mandatory lifecycle phases the module filter never skips —
-            // (the attack probes below depend on them, e.g. the crawl is what puts the surface in the site map).
-            cb.setFont(cb.getFont().deriveFont(Font.BOLD));
-            p.add(cb);
-        }
+        // Laid out top-to-bottom in the ORDER they execute: setup phases → attack modules → wrap-up phases.
+        p.add(sectionLabel("Runs before the attack modules"));
+        for (String pr : PREREQ_BEFORE) p.add(prereqBox(pr));
         p.add(Box.createVerticalStrut(8));
         p.add(sectionLabel("Attack modules"));
         java.util.Set<String> only = parseOnlyFilter();   // null → all run
@@ -120,6 +119,9 @@ public final class SettingsTab {
             cb.addActionListener(e -> applyModuleSelection());
             p.add(cb);
         }
+        p.add(Box.createVerticalStrut(8));
+        p.add(sectionLabel("Runs after the attack modules"));
+        for (String pr : PREREQ_AFTER) p.add(prereqBox(pr));
         JScrollPane sp = new JScrollPane(p);
         sp.getVerticalScrollBar().setUnitIncrement(16);
         return sp;
@@ -129,6 +131,14 @@ public final class SettingsTab {
         JLabel l = new JLabel(s);
         l.setFont(l.getFont().deriveFont(Font.BOLD));
         return l;
+    }
+
+    /** A mandatory lifecycle phase: bold + disabled + "(always on)" — not skippable by the module filter. */
+    private JCheckBox prereqBox(String label) {
+        JCheckBox cb = new JCheckBox(label + "  (always on)", true);
+        cb.setEnabled(false);
+        cb.setFont(cb.getFont().deriveFont(Font.BOLD));
+        return cb;
     }
 
     /** Current -Daiscanner.only / AISCANNER_ONLY as a set of terms, or null when unset (all modules run). */

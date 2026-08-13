@@ -23,9 +23,12 @@ import java.util.regex.Pattern;
  * <ol>
  *   <li><b>Passive</b> — scan every in-scope site-map response for the strong {@link StackTraceOracle} markers
  *       (no extra traffic; catches whatever already leaked during crawl/audit/other probes).</li>
- *   <li><b>Active</b> — POST a deliberately-malformed JSON body ({@code {}}) to discovered page-method /
- *       service-method endpoints ({@code …/x.aspx/Method}, {@code …/x.asmx/Method}, {@code …/x.ashx}) — the shape
- *       that reliably trips a framework error path — and confirm the same oracle, re-sent once.</li>
+ *   <li><b>Active</b> — POST a deliberately-malformed JSON body ({@code {}}, i.e. missing required fields) to
+ *       discovered page-method / service-method endpoints ({@code …/x.aspx/Method}, {@code …/x.asmx/Method},
+ *       {@code …/x.ashx}) AND rest/JSON Web-API routes ({@code /rest|/api|/odata/…} or any endpoint that spoke
+ *       {@code application/json}) — the shape that reliably trips a framework model-binding / validation error path
+ *       — and confirm the same oracle, re-sent once. Clearly state-changing verbs (delete/transfer/…) are skipped
+ *       so the fuzz stays non-destructive.</li>
  * </ol>
  * Fires ONCE per host (via {@link ScanLog#firstForHost}), listing every leaking endpoint in the evidence, so it never
  * near-dupes {@link SamlProbe}'s SAML-route finding. Non-destructive (a single malformed read per endpoint). Generic:
@@ -38,16 +41,25 @@ final class VerboseErrorProbe {
 
     /** ASP.NET page-method / service-handler shapes whose error path a malformed JSON body reliably trips. */
     private static final Pattern PAGE_METHOD = Pattern.compile("(?i)\\.(aspx|asmx|ashx)/[a-z][\\w]*$");
-    private static final int MAX_ACTIVE = 40;    // cap active malformed sends per host (a big site map is bounded)
+    /** REST / Web-API path shapes (ASP.NET Web API, WCF, etc.) — the JSON layer page-methods miss. */
+    private static final Pattern REST_API_PATH = Pattern.compile("(?i)(^|/)(rest|api|odata|services?)/");
+    /** State-changing verbs to NEVER fuzz (non-destructive engagement): a malformed body could still trigger an
+     *  irreversible action. Deliberately narrow — `{}` (missing required fields) fails validation before acting on
+     *  reset/send/save/create endpoints, so those stay testable; only clearly-irreversible verbs are skipped. */
+    private static final Pattern UNSAFE_PATH = Pattern.compile(
+            "(?i)(delete|remove|purge|destroy|\\bdrop\\b|wipe|deactivate|disable|revoke|transfer|withdraw|payment|logout|signout|signoff)");
+    private static final int MAX_ACTIVE = 60;    // cap active malformed sends per host (a big site map is bounded)
 
     VerboseErrorProbe(MontoyaApi api, ScanLog scanLog) { this.api = api; this.scanLog = scanLog; }
 
     /** Run once per host. Returns the finding count (0 or 1 — one systemic issue per host). */
     int probe(String host, UnaryOperator<HttpRequest> withSession) {
         Set<String> inScope = new LinkedHashSet<>();
+        Set<String> fuzzTargets = new LinkedHashSet<>();   // page-method + rest/JSON-API endpoints to malform-fuzz
         Map<String, HttpRequestResponse> leaks = new LinkedHashMap<>();   // endpoint → evidence rr
 
-        // (1) passive: existing site-map responses that already leak a stack trace.
+        // (1) passive: existing site-map responses that already leak a stack trace; also classify fuzz targets
+        //     (page-methods by URL shape, rest/JSON-API by /rest|/api path OR an application/json content-type).
         try {
             for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                 if (rr == null || rr.request() == null) continue;
@@ -56,15 +68,21 @@ final class VerboseErrorProbe {
                 String key = stripQuery(url);
                 inScope.add(key);
                 if (!leaks.containsKey(key) && StackTraceOracle.hasStackTrace(rr)) leaks.put(key, rr);
+                if (PAGE_METHOD.matcher(pathOf(key)).find() || isJsonApi(key, rr)) fuzzTargets.add(key);
             }
         } catch (Throwable t) { scanLog.debug("[AI Scanner]   verbose-error site-map scan error: " + t); }
 
-        // (2) active: malformed POST to page-method-shaped endpoints not already flagged.
+        // (2) active: POST a malformed body ({} → missing required fields) to page-method + rest/JSON-API endpoints
+        //     not already flagged, skipping clearly state-changing verbs (non-destructive). Fire on the strong
+        //     oracle, re-confirmed. `{}` trips the framework's model-binding / parameter-validation error path.
+        long restCount = fuzzTargets.stream().filter(u -> REST_API_PATH.matcher(pathOf(u)).find()).count();
+        scanLog.log("[AI Scanner] verbose-error probe: " + fuzzTargets.size() + " malformed-body target(s) ("
+                + restCount + " rest/API-path) + " + leaks.size() + " already-leaking from passive scan.");
         int sent = 0;
-        for (String url : inScope) {
+        for (String url : fuzzTargets) {
             if (sent >= MAX_ACTIVE) break;
             if (leaks.containsKey(url)) continue;
-            if (!PAGE_METHOD.matcher(pathOf(url)).find()) continue;
+            if (UNSAFE_PATH.matcher(pathOf(url)).find()) { scanLog.debug("[AI Scanner]   verbose-error: skip state-changing endpoint " + url); continue; }
             sent++;
             try {
                 HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
@@ -93,8 +111,9 @@ final class VerboseErrorProbe {
         }
         String detail = "The application returns a framework stack trace on malformed input, leaking exception types, "
                 + "class/method names, framework version and internal paths (CWE-209). This is a host-wide verbose-error "
-                + "misconfiguration (e.g. ASP.NET customErrors Off), reproducible across multiple endpoints — not a "
-                + "single page. Affected endpoint(s): " + preview(endpoints) + ". Re-confirmed.";
+                + "misconfiguration (e.g. ASP.NET customErrors Off), reproducible across multiple endpoints and layers "
+                + "(page-methods, ASMX, and rest/JSON Web-API routes) — not a single page. Affected endpoint(s): "
+                + preview(endpoints) + ". Re-confirmed.";
         scanLog.found("Stack trace disclosure", primary, detail, leaks.get(primary));
         scanLog.incFinding();
         scanLog.log("[AI Scanner] verbose-error probe: stack-trace disclosure @ " + endpoints.size() + " endpoint(s).");
@@ -112,6 +131,25 @@ final class VerboseErrorProbe {
     private boolean inScope(String host, String url) {
         try { if (!api.scope().isInScope(url)) return false; } catch (Throwable ignore) { }
         return host == null || host.equalsIgnoreCase(hostOf(url));
+    }
+
+    /** A rest/JSON-API endpoint: a /rest|/api|/odata|/services path segment, OR a request/response that
+     *  advertised an application/json content-type (so we only fuzz things that actually speak JSON). */
+    private static boolean isJsonApi(String url, HttpRequestResponse rr) {
+        if (REST_API_PATH.matcher(pathOf(url)).find()) return true;
+        try {
+            if (rr.request() != null && ctHasJson(rr.request().headers())) return true;
+            if (rr.response() != null && ctHasJson(rr.response().headers())) return true;
+        } catch (Throwable ignore) { }
+        return false;
+    }
+    private static boolean ctHasJson(java.util.List<burp.api.montoya.http.message.HttpHeader> headers) {
+        if (headers == null) return false;
+        for (burp.api.montoya.http.message.HttpHeader h : headers) {
+            if ("Content-Type".equalsIgnoreCase(h.name()) && h.value() != null
+                    && h.value().toLowerCase().contains("json")) return true;
+        }
+        return false;
     }
 
     private static String preview(List<String> endpoints) {
