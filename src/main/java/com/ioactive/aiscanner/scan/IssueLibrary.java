@@ -25,6 +25,77 @@ public final class IssueLibrary {
     public static Info describe(String vulnClass) {
         String v = vulnClass == null ? "" : vulnClass.toLowerCase();
 
+        // --- SAML SSO (matched before the generic branches; each class name starts with "SAML …") ---
+        if (v.contains("saml") && v.contains("authentication bypass"))
+            return new Info(HIGH,
+                "<p>The Service Provider's Assertion Consumer Service accepted an UNSIGNED, attacker-crafted SAML "
+                + "assertion as a valid login &mdash; it authenticated the request (non-login redirect + fresh "
+                + "session cookie) without verifying an IdP signature. An attacker can forge an assertion naming any "
+                + "user and impersonate them, fully bypassing authentication (CWE-347: improper verification of "
+                + "cryptographic signature).</p>",
+                "<p>Require and cryptographically verify the signature on every inbound SAML Response/Assertion "
+                + "against the IdP's trusted certificate before trusting any of its contents. Reject unsigned "
+                + "assertions, validate <code>Destination</code>/<code>Recipient</code>/<code>Audience</code> and the "
+                + "<code>NotBefore</code>/<code>NotOnOrAfter</code> conditions, and enforce single-use "
+                + "(anti-replay) on the assertion ID.</p>");
+
+        if (v.contains("saml") && v.contains("response signing enforced"))
+            return new Info(LOW,
+                "<p>The SP metadata does not require inbound assertions to be signed "
+                + "(<code>WantAssertionsSigned</code> is <code>false</code> or absent). However, the ACS was actively "
+                + "observed to reject a fully-unsigned SAML Response, so response-level signing is enforced and a "
+                + "forged/unsigned assertion is not accepted &mdash; this is a defense-in-depth hardening item, not an "
+                + "exploitable authentication bypass.</p>",
+                "<p>As defense-in-depth, also set <code>WantAssertionsSigned=\"true\"</code> so the assertion (subject "
+                + "and attribute statements) is individually signed, not only the response envelope. This narrows the "
+                + "attack surface for signature-wrapping (XSW) variants.</p>");
+
+        if (v.contains("saml") && v.contains("assertion signing"))
+            return new Info(MEDIUM,
+                "<p>The SP metadata does not require inbound SAML assertions to be signed "
+                + "(<code>WantAssertionsSigned</code> is <code>false</code> or absent). An SP that does not demand a "
+                + "signed assertion may accept a forged or tampered one, undermining the entire trust model of the "
+                + "federation.</p>",
+                "<p>Set <code>WantAssertionsSigned=\"true\"</code> and enforce it: reject any assertion that is not "
+                + "signed by the trusted IdP key. Prefer signing the assertion (not only the response envelope) so "
+                + "the subject and attribute statements are individually protected.</p>");
+
+        if (v.contains("saml") && v.contains("not encrypted"))
+            return new Info(LOW,
+                "<p>The SP metadata declares no encryption <code>KeyDescriptor</code>, so the IdP delivers SAML "
+                + "assertions unencrypted. The <code>NameID</code> and attribute statements (identity and PII) then "
+                + "transit through the user's browser and any intermediary in cleartext (CWE-311).</p>",
+                "<p>Publish an encryption <code>KeyDescriptor</code> in the SP metadata and require the IdP to send "
+                + "<code>EncryptedAssertion</code>s, so identity attributes are not exposed to the browser or to "
+                + "on-path observers.</p>");
+
+        if (v.contains("saml") && v.contains("artifact"))
+            return new Info(LOW,
+                "<p>The SP advertises an AssertionConsumerService using the HTTP-Artifact binding. The "
+                + "artifact-resolution back-channel is additional attack surface (server-side request forgery via "
+                + "<code>ArtifactResolve</code>, artifact reuse/guessing) that is often enabled without being "
+                + "needed.</p>",
+                "<p>Disable the HTTP-Artifact binding unless it is required. If it is needed, restrict "
+                + "artifact-resolution endpoints, enforce mutual TLS on the back-channel, and treat artifacts as "
+                + "single-use, short-lived, and unguessable.</p>");
+
+        if (v.contains("xml external entity") || v.contains("xxe"))
+            return new Info(HIGH,
+                "<p>An XML parser resolves attacker-controlled external entities: a crafted DOCTYPE made the server "
+                + "issue an out-of-band request to our Collaborator host. Server-side external-entity resolution "
+                + "enables internal file disclosure and SSRF (CWE-611).</p>",
+                "<p>Disable DOCTYPE/DTD processing and external-entity resolution in the XML parser "
+                + "(<code>disallow-doctype-decl</code>, disable external general/parameter entities). Prefer a "
+                + "hardened, schema-validated parser and reject documents containing a DOCTYPE.</p>");
+
+        if (v.contains("stack trace") || v.contains("stack-trace"))
+            return new Info(MEDIUM,
+                "<p>The endpoint returns a framework stack trace on malformed input, leaking exception types, "
+                + "class/method names, library versions, and internal file paths (CWE-209). This detail helps an "
+                + "attacker fingerprint the stack and craft further attacks.</p>",
+                "<p>Return a generic error page for unhandled exceptions and disable verbose/debug error output in "
+                + "production. Log the full detail server-side only.</p>");
+
         if (v.contains("nosql"))
             return new Info(HIGH,
                 "<p>The application builds a NoSQL (e.g. MongoDB) query from request data without separating "

@@ -702,6 +702,34 @@ public final class AiScanner {
             scanLog.debug("[AI Scanner] XXE probe skipped: " + t);
         }
 
+        // SAML SSO probe: reconstruct the SAML surface (SP metadata, ACS, SP-initiated endpoint) from the site
+        // map by PROTOCOL signals (metadata content-type / <EntityDescriptor>, SAMLRequest/SAMLResponse params, a
+        // `saml` path segment) — never by a vendor name or literal path — then run a zero-FP, non-destructive
+        // battery: metadata-hardening reads (unsigned/unencrypted assertions, HTTP-Artifact binding), an ACS
+        // stack-trace disclosure oracle (malformed SAMLResponse + strong markers, re-confirmed), OOB XXE at the
+        // ACS via Collaborator (same mechanism as the XXE/SSRF probes), unsigned/forged-assertion acceptance
+        // (fires only on a real authenticated signal — non-login 302 + fresh session cookie, re-confirmed), and a
+        // RelayState/ReturnUrl open redirect. Runs once per host (discovers its own surface). No-op if no SAML.
+        try {
+            scanLog.phase("SAML SSO probe");
+            int hits = new SamlProbe(api, scanLog).probe(host, this::withSession);
+            scanLog.log("[AI Scanner] SAML probe: " + hits + " SAML SSO finding(s).");
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] SAML probe skipped: " + t);
+        }
+
+        // Verbose-error / stack-trace disclosure probe: generic, host-wide. Passively scans the site map for strong
+        // stack-trace markers and actively POSTs a malformed body to discovered ASP.NET page-method / service-handler
+        // endpoints, firing ONCE per host (dedups with SamlProbe's SAML-route finding). Catches the systemic
+        // customErrors-Off class Burp misses (it never sends the malformed page-method call). Zero-FP, non-destructive.
+        try {
+            scanLog.phase("Verbose-error / stack-trace probe");
+            int hits = new VerboseErrorProbe(api, scanLog).probe(host, this::withSession);
+            scanLog.log("[AI Scanner] verbose-error probe: " + hits + " host-wide disclosure finding(s).");
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] verbose-error probe skipped: " + t);
+        }
+
         // NOTE: CORS misconfiguration is intentionally NOT a custom probe — Burp's native passive scanner
         // already reports it ("Cross-origin resource sharing: arbitrary origin trusted") with correct scope,
         // so a bespoke probe would only duplicate a built-in template.
