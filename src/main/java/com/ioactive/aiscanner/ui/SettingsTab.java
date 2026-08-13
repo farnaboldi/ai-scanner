@@ -80,6 +80,7 @@ public final class SettingsTab {
         {"idor","IDOR"}, {"bfla","BFLA"}, {"jwt","JWT analysis"}, {"unauth","Unauthenticated-access"},
         {"webhook","Webhook fail-open"}, {"privparity","Privilege-parity"}, {"secrets","Response secret-exposure"},
         {"graphql","GraphQL"}, {"deser","Insecure deserialization"}, {"xxe","Blind XXE (OOB)"},
+        {"saml","SAML SSO"}, {"verberr","Verbose-error / stack-trace"},
         {"lfi","Path-traversal / LFI"}, {"ssrf","SSRF"}, {"tamper","Restriction-bypass / tampering"},
         {"flow","Flow-engine (LLM, multi-step)"},
     };
@@ -102,8 +103,11 @@ public final class SettingsTab {
 
         p.add(sectionLabel("Always run (before / after)"));
         for (String pr : PREREQ_MODULES) {
-            JCheckBox cb = new JCheckBox(pr, true);
+            JCheckBox cb = new JCheckBox(pr + "  (always on)", true);
             cb.setEnabled(false);   // prerequisites are not skippable — the probes need them
+            // Bold so it's unmistakable these are mandatory lifecycle phases the module filter never skips —
+            // (the attack probes below depend on them, e.g. the crawl is what puts the surface in the site map).
+            cb.setFont(cb.getFont().deriveFont(Font.BOLD));
             p.add(cb);
         }
         p.add(Box.createVerticalStrut(8));

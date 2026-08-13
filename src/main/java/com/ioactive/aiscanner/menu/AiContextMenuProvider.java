@@ -634,10 +634,29 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     // /register twice…) — wasted requests + needless rate-limit pressure. Dedup by (method, path) so
                     // each distinct auth endpoint is attempted ONCE.
                     java.util.Set<String> triedAuth = new java.util.HashSet<>();
+                    // Blast-radius cap: an app may expose the SAME login at many alias paths (each a distinct
+                    // (method,path), so dedup treats them as separate endpoints and re-runs the whole default-cred +
+                    // SQLi-bypass battery per alias → hundreds of login POSTs). Count only endpoints we actually
+                    // batter (a login handler), and stop once we've hit the cap: if default creds fail on the first
+                    // few logins, the Nth alias of the same login won't authenticate either. Generic — no per-app paths.
+                    int cap = maxLoginEndpoints();
+                    int loginEndpointsTried = 0;
+                    boolean capLogged = false;
                     for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                         if (!host.equalsIgnoreCase(hostOf(rr.request().url()))) continue;
                         if (!triedAuth.add(rr.request().method() + " " + rr.request().url().split("\\?")[0])) continue;
+                        boolean isLoginShape = hasPasswordParam(rr.request()) || isJsonLogin(rr.request())
+                                || responseHasPasswordForm(rr);
+                        if (isLoginShape && loginEndpointsTried >= cap) {
+                            if (!capLogged) {
+                                scanLog.log("[AI Scanner] default-creds: reached " + cap + " login-endpoint cap — stopping"
+                                        + " (further aliases won't authenticate with default creds).");
+                                capLogged = true;
+                            }
+                            continue;
+                        }
                         if (hasPasswordParam(rr.request())) {
+                            loginEndpointsTried++;
                             scanLog.log("[AI Scanner] login candidate (request): " + rr.request().url());
                             defaultCredsLogin(rr);
                             // CSRF-protected forms (e.g. DVWA's per-request user_token) reject a replayed
@@ -645,9 +664,11 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                             if (!session.authenticated())
                                 loginViaForm(rr.request().url(), rr.request().httpService());
                         } else if (isJsonLogin(rr.request())) {
+                            loginEndpointsTried++;
                             scanLog.log("[AI Scanner] login candidate (JSON body): " + rr.request().url());
                             jsonCredsLogin(rr);
                         } else if (responseHasPasswordForm(rr)) {
+                            loginEndpointsTried++;
                             loginViaForm(rr.request().url(), rr.request().httpService());
                         }
                         if (session.authenticated()) break;
@@ -657,9 +678,19 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     // to authenticate (default creds + generic SQLi auth-bypass). No manual requests.
                     if (!session.authenticated()) {
                         scanLog.log("[AI Scanner] no login in site map — mining client code for an auth endpoint…");
+                        // Same blast-radius cap as the site-map loop: mined candidates can also be N aliases of one
+                        // login; batter at most `cap` of them so a multi-alias login can't balloon the credential battery.
                         for (HttpRequestResponse login : probeAuthCandidates(host)) {
-                            if (isJsonLogin(login.request())) jsonCredsLogin(login);
-                            else if (hasPasswordParam(login.request())) defaultCredsLogin(login);
+                            if (loginEndpointsTried >= cap) {
+                                if (!capLogged) {
+                                    scanLog.log("[AI Scanner] default-creds: reached " + cap + " login-endpoint cap — stopping"
+                                            + " (further aliases won't authenticate with default creds).");
+                                    capLogged = true;
+                                }
+                                break;
+                            }
+                            if (isJsonLogin(login.request())) { loginEndpointsTried++; jsonCredsLogin(login); }
+                            else if (hasPasswordParam(login.request())) { loginEndpointsTried++; defaultCredsLogin(login); }
                             if (session.authenticated()) break;
                         }
                     }
@@ -802,6 +833,21 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         String v = System.getProperty("aiscanner.nativeOnly");
         if (v == null || v.isBlank()) v = System.getenv("AISCANNER_NATIVE_ONLY");
         return v != null && (v.equalsIgnoreCase("true") || v.equals("1") || v.equalsIgnoreCase("yes"));
+    }
+
+    /** Max number of DISTINCT login endpoints subjected to the full default-cred + SQLi-bypass battery in the auth
+     *  phase. Blast-radius cap: some apps expose the SAME login handler at many alias paths (observed: one ASP.NET
+     *  login reachable at ~38 URLs). Dedup is by (method,path), so each alias looks distinct and the whole credential
+     *  battery re-runs per alias → hundreds of login POSTs (rate-limit/lockout/WAF risk, wasted budget). If the same
+     *  default creds fail on the first few login endpoints, an Nth alias of the same login won't succeed either, so we
+     *  stop after this many. Generic — no per-app paths. Override with -Daiscanner.maxLoginEndpoints / AISCANNER_MAX_LOGIN_ENDPOINTS. */
+    private static int maxLoginEndpoints() {
+        String v = System.getProperty("aiscanner.maxLoginEndpoints");
+        if (v == null || v.isBlank()) v = System.getenv("AISCANNER_MAX_LOGIN_ENDPOINTS");
+        if (v != null && !v.isBlank()) {
+            try { return Math.max(1, Integer.parseInt(v.trim())); } catch (NumberFormatException ignore) { }
+        }
+        return 4;   // small default: enough to cover genuinely-distinct logins, tight enough to kill alias multiplication
     }
 
     /** Cancel a scan task so it stops running in the background (its site-map entries are kept). */

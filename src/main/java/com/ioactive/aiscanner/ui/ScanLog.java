@@ -47,8 +47,18 @@ public final class ScanLog {
     /** Enable/disable the Stop button (scan start → true, scan end / clicked → false). EDT-safe. */
     public void setScanActive(boolean active) {
         this.scanActive = active;
-        if (active) scanStartMillis = System.currentTimeMillis();   // start the wall-clock at scan start
+        if (active) { scanStartMillis = System.currentTimeMillis(); hostClassClaimed.clear(); }   // start clock + reset host gate
         javax.swing.SwingUtilities.invokeLater(() -> { if (stopBtn != null) stopBtn.setEnabled(active); });
+    }
+
+    /** Host-wide one-shot gate for SYSTEMIC classes (e.g. stack-trace disclosure) that several probes may each
+     *  observe on different endpoints of the same host: returns true only the FIRST time this (vulnClass, host) is
+     *  seen this scan, so the systemic misconfig collapses to a single issue instead of one per endpoint. */
+    private final java.util.Set<String> hostClassClaimed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    public boolean firstForHost(String vulnClass, String url) {
+        String host = url;
+        try { java.net.URI u = new java.net.URI(url); if (u.getHost() != null) host = u.getHost(); } catch (Throwable ignore) { }
+        return hostClassClaimed.add(vulnClass + "@@" + host);
     }
     /** Elapsed wall-clock since the current scan started, formatted "Nm Ss" (or "Ss" under a minute). */
     public String scanElapsed() {
@@ -102,7 +112,9 @@ public final class ScanLog {
             java.util.Map.entry("tamper", "tampering"), java.util.Map.entry("fileserve", "file-serve"),
             java.util.Map.entry("bodymut", "body-mutation"), java.util.Map.entry("unauth", "unauthenticated"),
             java.util.Map.entry("pathtrav", "path travers"), java.util.Map.entry("privparity", "privilege-parity"),
-            java.util.Map.entry("agentflow", "agent-flow"), java.util.Map.entry("llmfuzz", "llm-fuzz"));
+            java.util.Map.entry("agentflow", "agent-flow"), java.util.Map.entry("llmfuzz", "llm-fuzz"),
+            java.util.Map.entry("saml", "saml"), java.util.Map.entry("verberr", "verbose-error"),
+            java.util.Map.entry("stacktrace", "verbose-error"));
     private volatile String currentPhase = "Idle";
     private volatile boolean filterAnnounced = false;   // -Daiscanner.only banner printed once per session
     public String currentPhase() { return currentPhase; }
