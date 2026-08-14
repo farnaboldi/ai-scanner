@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 503;
+    public static final int BUILD = 506;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -134,6 +134,7 @@ public class AiScannerExtension implements BurpExtension {
         // Chat with the local model, grounded in scope + the scan log. Replies interleave with the log.
         com.ioactive.aiscanner.ui.ChatAssistant chat =
                 new com.ioactive.aiscanner.ui.ChatAssistant(this::getEngine, api, scanScope, scanLog);
+        chat.setScanHandler(url -> menuProvider.startScan(url));
         scanLog.enableChat(msg -> {
             scanLog.log("[you] " + msg);
             new Thread(() -> scanLog.log("[ai] " + chat.reply(msg)), "ais-chat").start();
@@ -430,7 +431,7 @@ public class AiScannerExtension implements BurpExtension {
         // Fresh install defaults to Burp's built-in AI (App-Store preferred); the local base URL is pre-filled
         // so switching to the Local-LLM provider is one radio click away.
         EngineConfig def = new EngineConfig(EngineConfig.Provider.BURP_AI,
-                "http://127.0.0.1:8000/v1/", "", "", 0.3, 512, true, 120);
+                "http://127.0.0.1:8000/v1/", "", "", 0.3, 2048, true, 120);
         String raw = api.persistence().extensionData().getString(PREF_KEY);
         if (raw == null || raw.isBlank()) {
             this.engineConfig = def;
