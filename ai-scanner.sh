@@ -239,6 +239,9 @@ exec "$JAVA" \
   ${AISCANNER_DISCOVERY_ROUNDS:+-Daiscanner.discoveryRounds="${AISCANNER_DISCOVERY_ROUNDS}"} \
   "-Daiscanner.maxTokens=${AISCANNER_MAX_TOKENS:-2048}" \
   "-Daiscanner.synthEndpoints=${AISCANNER_SYNTH:-true}" \
+  ${AISCANNER_ONLY:+-Daiscanner.only="${AISCANNER_ONLY}"} \
+  ${AISCANNER_LOG_FILE:+-Daiscanner.logFile="${AISCANNER_LOG_FILE}"} \
+  ${AISCANNER_SQLI_SLEEP_SEC:+-Daiscanner.sqliSleepSec="${AISCANNER_SQLI_SLEEP_SEC}"} \
   "-Daiscanner.discoveryOnly=${AISCANNER_DISCOVERY_ONLY:-false}" \
   "-Daiscanner.nativeOnly=${AISCANNER_NATIVE_ONLY:-false}" \
   "-Daiscanner.noAi=${AISCANNER_NO_AI:-false}" \

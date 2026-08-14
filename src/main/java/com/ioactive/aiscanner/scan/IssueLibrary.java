@@ -26,6 +26,25 @@ public final class IssueLibrary {
         String v = vulnClass == null ? "" : vulnClass.toLowerCase();
 
         // --- SAML SSO (matched before the generic branches; each class name starts with "SAML …") ---
+        if (v.contains("saml") && v.contains("test certificate"))
+            return new Info(HIGH,
+                "<p>The SP metadata contains a self-signed certificate whose Subject CN indicates it is "
+                + "a library-shipped test or demo credential. Such certificates &mdash; and their private keys "
+                + "&mdash; are typically committed to the SAML library's public source repository or "
+                + "distributed with its test packages, making the private key effectively public. This removes "
+                + "all cryptographic assurance: (1) <b>SP impersonation</b> &mdash; anyone can sign "
+                + "<code>AuthnRequest</code>s as this SP, because IdP federation trust is based on the "
+                + "(now-public) certificate; (2) <b>assertion decryption</b> &mdash; if the same keypair "
+                + "covers the encryption slot, any <code>EncryptedAssertion</code> can be decrypted; "
+                + "(3) <b>XSW precondition</b> &mdash; a validly signed envelope over attacker-controlled "
+                + "content is trivially producible without cracking anything "
+                + "(CWE-321: Use of Hard-coded Cryptographic Key).</p>",
+                "<p>Generate a fresh, environment-specific RSA-2048 or ECDSA-P256 keypair. Update the SP "
+                + "configuration with the new certificate and private key, register the new public certificate "
+                + "with the IdP, and rotate in all environments where the test certificate appears. Do not "
+                + "reuse library-default or publicly-known key material outside of a local development "
+                + "sandbox.</p>");
+
         if (v.contains("saml") && v.contains("authentication bypass"))
             return new Info(HIGH,
                 "<p>The Service Provider's Assertion Consumer Service accepted an UNSIGNED, attacker-crafted SAML "
@@ -63,21 +82,34 @@ public final class IssueLibrary {
         if (v.contains("saml") && v.contains("not encrypted"))
             return new Info(LOW,
                 "<p>The SP metadata declares no encryption <code>KeyDescriptor</code>, so the IdP delivers SAML "
-                + "assertions unencrypted. The <code>NameID</code> and attribute statements (identity and PII) then "
-                + "transit through the user's browser and any intermediary in cleartext (CWE-311).</p>",
-                "<p>Publish an encryption <code>KeyDescriptor</code> in the SP metadata and require the IdP to send "
-                + "<code>EncryptedAssertion</code>s, so identity attributes are not exposed to the browser or to "
-                + "on-path observers.</p>");
+                + "assertions as plaintext <code>&lt;Assertion&gt;</code> elements rather than "
+                + "<code>&lt;EncryptedAssertion&gt;</code>. Wire-level confidentiality is already provided by TLS; "
+                + "the exposure here is at the SAML application layer: the <code>NameID</code> and attribute "
+                + "statements (identity/PII) are visible to the browser context &mdash; browser extensions, XSS "
+                + "payloads, browser history, referrer headers, and local disk cache &mdash; and assertion "
+                + "encryption is a defence-in-depth control that limits the blast radius of signature-validation "
+                + "or XML-parsing bugs in the SP (CWE-311).</p>",
+                "<p>Publish an encryption <code>KeyDescriptor</code> in the SP metadata and coordinate with the "
+                + "IdP to send <code>EncryptedAssertion</code>s. This is a two-party configuration change; test "
+                + "it in pre-production before promoting &mdash; binding/encryption interactions can break the "
+                + "login flow if either side is misconfigured. Ensure the encryption keypair is a freshly "
+                + "generated, environment-specific certificate and is not reused from any library test package.</p>");
 
         if (v.contains("saml") && v.contains("artifact"))
             return new Info(LOW,
-                "<p>The SP advertises an AssertionConsumerService using the HTTP-Artifact binding. The "
-                + "artifact-resolution back-channel is additional attack surface (server-side request forgery via "
-                + "<code>ArtifactResolve</code>, artifact reuse/guessing) that is often enabled without being "
-                + "needed.</p>",
-                "<p>Disable the HTTP-Artifact binding unless it is required. If it is needed, restrict "
-                + "artifact-resolution endpoints, enforce mutual TLS on the back-channel, and treat artifacts as "
-                + "single-use, short-lived, and unguessable.</p>");
+                "<p>The SP metadata advertises an AssertionConsumerService with the HTTP-Artifact binding "
+                + "(alongside or instead of the HTTP-POST binding). Artifact binding keeps the SAML assertion "
+                + "out of the browser entirely &mdash; only an opaque artifact token transits the user-agent, "
+                + "and the SP resolves it directly with the IdP over a back-channel. This is a stricter "
+                + "data-handling posture than HTTP-POST, but the back-channel itself adds surface: "
+                + "single-use and short-lived artifact enforcement is the IdP's responsibility, and the "
+                + "resolution endpoint should be accessible only to the SP. If the binding is not actively "
+                + "used in the deployment, advertising it widens the metadata surface unnecessarily.</p>",
+                "<p>If the IdP integration only uses HTTP-POST, remove the HTTP-Artifact "
+                + "<code>AssertionConsumerService</code> from the SP metadata to minimise the advertised "
+                + "surface. If artifact binding is intentionally used, confirm the IdP enforces single-use, "
+                + "short-lived, and unguessable artifacts, and restrict the artifact-resolution endpoint to "
+                + "SP-only access (network ACL or mutual TLS).</p>");
 
         if (v.contains("xml external entity") || v.contains("xxe"))
             return new Info(HIGH,

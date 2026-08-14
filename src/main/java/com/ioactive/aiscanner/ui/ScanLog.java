@@ -35,6 +35,18 @@ public final class ScanLog {
     public void setStopHandler(Runnable r) { this.stopHandler = r; }
     /** The Stop button — enabled only while a scan is active (disabled on click + when idle). */
     private JButton stopBtn;
+    /** The Rescan button — enabled only when a target was previously scanned AND no scan is running. */
+    private JButton rescanBtn;
+    /** Invoked by the Rescan button with the last scanned URL — extension wires this to startScan(). */
+    private volatile Consumer<String> rescanHandler;
+    public void setRescanHandler(Consumer<String> h) { this.rescanHandler = h; }
+    /** Last URL that was successfully started via startScan — used by the Rescan button. */
+    private volatile String lastTarget;
+    public void setLastTarget(String url) {
+        this.lastTarget = url;
+        // Enable Rescan whenever a target is registered and no scan is active.
+        javax.swing.SwingUtilities.invokeLater(() -> { if (rescanBtn != null) rescanBtn.setEnabled(!scanActive); });
+    }
     /** True while a scan runs; {@link #phase(String)} throws {@link ScanStopped} once this flips off via Stop. */
     private volatile java.util.function.BooleanSupplier stopCheck;
     public void setStopCheck(java.util.function.BooleanSupplier s) { this.stopCheck = s; }
@@ -44,11 +56,15 @@ public final class ScanLog {
     /** True while a scan is running — read by the Suite tab to auto-focus the Agent view when you open it mid-scan. */
     private volatile boolean scanActive = false;
     public boolean isScanActive() { return scanActive; }
-    /** Enable/disable the Stop button (scan start → true, scan end / clicked → false). EDT-safe. */
+    /** Enable/disable the Stop and Rescan buttons (scan start → true, scan end / clicked → false). EDT-safe. */
     public void setScanActive(boolean active) {
         this.scanActive = active;
         if (active) { scanStartMillis = System.currentTimeMillis(); hostClassClaimed.clear(); }   // start clock + reset host gate
-        javax.swing.SwingUtilities.invokeLater(() -> { if (stopBtn != null) stopBtn.setEnabled(active); });
+        javax.swing.SwingUtilities.invokeLater(() -> {
+            if (stopBtn != null) stopBtn.setEnabled(active);
+            // Rescan is available only when idle and a previous target exists.
+            if (rescanBtn != null) rescanBtn.setEnabled(!active && lastTarget != null);
+        });
     }
 
     /** Host-wide one-shot gate for SYSTEMIC classes (e.g. stack-trace disclosure) that several probes may each
@@ -80,6 +96,7 @@ public final class ScanLog {
      *  debugging). Caught by each phase's own try/catch(Throwable) → body skipped, next phase runs normally. */
     public static final class PhaseSkipped extends RuntimeException {
         public PhaseSkipped() { super("phase not selected by -Daiscanner.only"); }
+        @Override public String toString() { return "(module skipped)"; }
     }
     /** Comma-separated module filter (-Daiscanner.only / AISCANNER_ONLY): run ONLY the probe phases whose title
      *  contains one of these terms. Null/blank → run everything. Case-insensitive. e.g. only=reflected-xss,sqli. */
@@ -88,17 +105,21 @@ public final class ScanLog {
         if (v == null || v.isBlank()) v = System.getenv("AISCANNER_ONLY");
         return (v == null || v.isBlank()) ? null : v.toLowerCase();
     }
-    /** Lifecycle/prerequisite phases that -Daiscanner.only NEVER skips (auth, crawl, discovery, explore, re-auth,
-     *  audit submission, idle) — the attack surface + session they set up is required by whichever probe you select. */
+    /** Lifecycle/prerequisite phases that -Daiscanner.only NEVER skips — they set up the attack surface and
+     *  session that every selected probe depends on. Listing "auth" in only= is informational only (it always runs).
+     *  These appear in the log so the analyst can see what the scanner is doing even when using a narrow only= filter. */
     private static boolean isLifecyclePhase(String title) {
         String s = title.toLowerCase();
-        return s.contains("authenticating") || s.contains("source analysis") || s.startsWith("crawling")
-            || s.contains("exploring") || s.contains("submitting") || s.contains("idle")
+        return s.contains("authenticating") || s.contains("automatic user registration") || s.contains("source analysis")
+            || s.startsWith("crawling") || s.contains("exploring") || s.contains("submitting") || s.contains("idle")
             || s.contains("native baseline") || s.startsWith("auditing at") || s.contains("re-authenticat");
     }
     /** Short module names → a substring of the phase title, so `-Daiscanner.only=rxss,sqli,idor` is ergonomic.
-     *  An unlisted term is matched as a raw substring of the title, so any word from a phase title also works. */
+     *  Lifecycle phases (auth, crawl, discovery) appear here for visibility but are never skipped by the filter. */
     private static final java.util.Map<String,String> MODULE_ALIASES = java.util.Map.ofEntries(
+            // ---- lifecycle (always run, listed for visibility only — isLifecyclePhase prevents skipping) ----
+            java.util.Map.entry("auth", "automatic user registration"),
+            // ---- attack probes (filterable) ----
             java.util.Map.entry("rxss", "reflected-xss"), java.util.Map.entry("xss", "reflected-xss"),
             java.util.Map.entry("sqli", "blind sqli"), java.util.Map.entry("cmdi", "command inject"),
             java.util.Map.entry("idor", "idor"), java.util.Map.entry("ssrf", "ssrf"),
@@ -150,15 +171,27 @@ public final class ScanLog {
             stopBtn.setEnabled(false);                 // one-shot: disabled until the next scan starts
             Runnable h = stopHandler; if (h != null) h.run();
         });
+        rescanBtn = new JButton("Rescan");
+        rescanBtn.setToolTipText("Re-run the last scan target with current settings");
+        rescanBtn.setEnabled(false);   // enabled only after first scan completes
+        rescanBtn.addActionListener(e -> {
+            String url = lastTarget;
+            Consumer<String> h = rescanHandler;
+            if (url != null && h != null) {
+                rescanBtn.setEnabled(false);
+                new Thread(() -> h.accept(url), "aiscanner-rescan").start();
+            }
+        });
         JButton clear = new JButton("Clear");
         clear.addActionListener(e -> clear());
         JPanel labels = new JPanel(new GridLayout(2, 1));
         labels.add(phase);
         labels.add(status);
         top.add(labels, BorderLayout.CENTER);
-        // Stop sits to the LEFT of Clear.
+        // Stop | Rescan | Clear — left to right.
         JPanel btns = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 4, 0));
         btns.add(stopBtn);
+        btns.add(rescanBtn);
         btns.add(clear);
         top.add(btns, BorderLayout.EAST);
 

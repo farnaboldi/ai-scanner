@@ -30,6 +30,10 @@ import java.util.regex.Pattern;
  * by content-type / XML-root / SAML-parameter signals, then runs a battery of ZERO-FP, NON-DESTRUCTIVE checks:
  *
  * <ol>
+ *   <li><b>Self-signed test certificate</b> — if any cert in the SP metadata is self-signed and its Subject CN
+ *       matches a test-credential pattern (test, stub, sample, demo, localhost, …), the private key is likely
+ *       publicly distributed with the SAML library. HIGH: enables SP impersonation, assertion decryption, and
+ *       XSW without key-cracking. Generic: no library names or fingerprint lists hardcoded.</li>
  *   <li><b>Metadata hardening</b> — deterministic parse of the SP metadata XML: assertions not required signed
  *       ({@code WantAssertionsSigned="false"}/absent), assertions not encrypted (no encryption KeyDescriptor),
  *       and an HTTP-Artifact ACS binding present. Safe reads → always fine to run.</li>
@@ -67,6 +71,13 @@ public final class SamlProbe {
     private static final Pattern SAML_PATH_SEG = Pattern.compile("(?i)(^|[/._-])saml([0-9]{0,2})([/._-]|$)");
     // A redirect/return param the SP-initiated endpoint may echo into a Location — discovered generically.
     private static final Pattern RETURN_PARAM = Pattern.compile("(?i)^(RelayState|ReturnUrl|returnUrl|redirect|redirectUri|redirect_uri|returnTo|return_to|next|url)$");
+
+    // Generic signals that a cert is a library-shipped test credential — no fingerprint hardcoding.
+    // Self-signed (issuer == subject) is the necessary condition; the CN pattern adds specificity.
+    // "Tests", "Sample", "Demo", "Stub", "localhost", "example" are canonical test-cert CN patterns.
+    private static final Pattern TEST_CERT_CN = Pattern.compile(
+        "(?i)\\b(test|tests|stub|sample|demo|localhost|example\\.org|example\\.com|dummy|placeholder|selfsigned|dev[._-]?cert)\\b");
+
     private static long SEQ = 0L;
     private static synchronized long seq() { return ++SEQ; }
 
@@ -89,6 +100,9 @@ public final class SamlProbe {
                 + " entityID=" + (s.entityId != null ? s.entityId : "(unknown)"));
 
         int hits = 0;
+        // 0) Self-signed test/library certificate — root-cause HIGH finding; gates or contextualises the rest.
+        try { if (s.metadataRr != null && checkPublicTestCert(s)) hits++; }
+        catch (Throwable t) { scanLog.debug("[AI Scanner]   saml public-test-cert check error: " + t); }
         // 1) unsigned/forged assertion acceptance (auth bypass) — the AUTHORITATIVE test of whether the SP actually
         //    trusts an unsigned assertion. Run it FIRST so its verdict can gate the metadata WantAssertionsSigned
         //    claim below (avoid the classic FP: metadata says signing not required, but the SP still enforces
@@ -124,6 +138,7 @@ public final class SamlProbe {
         boolean encryptionKey;             // a KeyDescriptor use="encryption" present
         boolean artifactBinding;           // an ACS with HTTP-Artifact binding present
         boolean relayStateSeen;            // the app used a RelayState in an observed SSO request
+        boolean authnRequestsSigned;       // parsed from metadata: SP signs outbound AuthnRequests
         String logoutUrl;                  // Sustainsys SLO endpoint (derived) — checked for stack-trace disclosure
         boolean isEmpty() { return metadataRr == null && acsUrl == null && ssoUrl == null; }
         String metadataUrl() { return metadataRr != null && metadataRr.request() != null ? metadataRr.request().url() : (acsUrl != null ? acsUrl : ssoUrl); }
@@ -252,6 +267,9 @@ public final class SamlProbe {
         // WantAssertionsSigned (default is false when absent — so absence is the weak case too).
         Matcher w = Pattern.compile("(?i)\\bWantAssertionsSigned\\s*=\\s*\"([^\"]*)\"").matcher(xml);
         if (w.find()) { s.sawWantAssertionsSigned = true; s.wantAssertionsSigned = "true".equalsIgnoreCase(w.group(1).trim()); }
+        // AuthnRequestsSigned — true means the SP signs outbound AuthnRequests with its private key.
+        Matcher ars = Pattern.compile("(?i)\\bAuthnRequestsSigned\\s*=\\s*\"([^\"]*)\"").matcher(xml);
+        if (ars.find()) s.authnRequestsSigned = "true".equalsIgnoreCase(ars.group(1).trim());
         // encryption KeyDescriptor
         s.encryptionKey = Pattern.compile("(?i)<(?:[a-z0-9]+:)?KeyDescriptor\\b[^>]*\\buse\\s*=\\s*\"encryption\"").matcher(xml).find();
         // AssertionConsumerService Location + Binding — take the first non-artifact by default; note artifact.
@@ -355,8 +373,8 @@ public final class SamlProbe {
             scanLog.found("Stack trace disclosure", urls.get(i),
                     "A SAML endpoint returns a framework stack trace on malformed input (" + urls.get(i) + " with "
                     + how.get(i) + ") — leaking exception types, class/method names, framework version and internal "
-                    + "paths (CWE-209). The verbose-error misconfiguration is handler-wide across the Sustainsys.Saml2 "
-                    + "module (ACS / SignIn / Logout), aiding an attacker in mapping the stack. Re-confirmed.",
+                    + "paths (CWE-209). The verbose-error misconfiguration is handler-wide across the SAML module "
+                    + "(ACS / SignIn / Logout), aiding an attacker in mapping the application stack. Re-confirmed.",
                     rr);
             scanLog.incFinding();
             return true;
@@ -609,6 +627,68 @@ public final class SamlProbe {
     private static String safeBody(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().bodyToString() : null; } catch (Throwable t) { return null; }
     }
+    // ------------------------------------------------------------------ 0) Public / test certificate check
+
+    /** Fire HIGH when an SP metadata cert is self-signed AND its Subject CN matches a test-credential pattern.
+     *  Detection is purely generic: no fingerprint list, no library name — just observable cert properties.
+     *  A single finding per host (multiple certs with the same signal → one issue). */
+    private boolean checkPublicTestCert(Surface s) {
+        if (s.metadataXml == null || s.metadataRr == null) return false;
+        Matcher m = Pattern.compile("<(?:[A-Za-z0-9]+:)?X509Certificate[^>]*>([^<]+)</(?:[A-Za-z0-9]+:)?X509Certificate>")
+                .matcher(s.metadataXml);
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();   // dedup identical certs
+        while (m.find()) seen.add(m.group(1).replaceAll("\\s+", ""));
+        for (String b64Der : seen) {
+            String cn = certSubjectCn(b64Der);
+            if (cn == null || !isSelfSigned(b64Der)) continue;
+            if (!TEST_CERT_CN.matcher(cn).find()) continue;
+            String authRequestNote = s.authnRequestsSigned
+                    ? " The SP is configured to sign outbound authentication requests with this key "
+                      + "(AuthnRequestsSigned=\"true\"), meaning forged signed requests can be submitted "
+                      + "to the IdP claiming to be this service provider."
+                    : "";
+            scanLog.found("SAML signing key is a self-signed test certificate", s.metadataUrl(),
+                    "The SP metadata contains a self-signed certificate (CN=\"" + cn + "\") whose name "
+                    + "indicates it is a library-shipped test or demo credential. Such certificates and their "
+                    + "private keys are typically distributed publicly with the SAML library (source repository, "
+                    + "package registry), making the private key effectively public."
+                    + authRequestNote
+                    + " Consequences: (1) SP impersonation — signed authentication requests can be forged; "
+                    + "(2) assertion decryption if the same keypair covers the encryption slot; "
+                    + "(3) XML Signature Wrapping attacks without any key-cracking "
+                    + "(CWE-321: Use of Hard-coded Cryptographic Key). "
+                    + "Replace with a fresh, environment-specific keypair.",
+                    false, s.metadataRr);
+            scanLog.incFinding();
+            return true;
+        }
+        return false;
+    }
+
+    /** Subject CN of an X.509 certificate given as a base64-encoded DER blob, or null on error. */
+    private static String certSubjectCn(String b64Der) {
+        try {
+            byte[] der = Base64.getDecoder().decode(b64Der);
+            java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+            java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate)
+                    cf.generateCertificate(new java.io.ByteArrayInputStream(der));
+            String dn = cert.getSubjectX500Principal().getName();
+            Matcher m = Pattern.compile("(?i)CN=([^,]+)").matcher(dn);
+            return m.find() ? m.group(1).trim() : null;
+        } catch (Throwable t) { return null; }
+    }
+
+    /** True if the certificate is self-signed (Issuer DN == Subject DN). */
+    private static boolean isSelfSigned(String b64Der) {
+        try {
+            byte[] der = Base64.getDecoder().decode(b64Der);
+            java.security.cert.CertificateFactory cf = java.security.cert.CertificateFactory.getInstance("X.509");
+            java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate)
+                    cf.generateCertificate(new java.io.ByteArrayInputStream(der));
+            return cert.getSubjectX500Principal().equals(cert.getIssuerX500Principal());
+        } catch (Throwable t) { return false; }
+    }
+
     private static String xmlEsc(String s) {
         return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
