@@ -478,6 +478,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     /** Programmatic entry (CLI auto-scan): start the full crawl-and-scan on a seed URL. */
     public void startScan(String seedUrl) {
         if (seedUrl == null || seedUrl.isBlank()) return;
+        scanLog.setLastTarget(seedUrl);
         scanLog.log("[AI Scanner] auto-scan launching on " + seedUrl);
         crawlAndScan(seedUrl);
     }
@@ -616,6 +617,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // signup (self-sabotage observed on rate-limited APIs). Generic — runs only when an API auth
                 // endpoint is mined AND no cheap form login above already authenticated (so no needless mailbox).
                 if (!session.authenticated() && !session.hasBearer()) {
+                    scanLog.phase("Automatic User Registration");
                     List<HttpRequest> loginEps = scanner.discoverAuthRequests(host);
                     // Call even with ZERO discovered login endpoints: apiRegisterThenLogin self-sources login +
                     // registration targets from OBSERVED origins (crawl/LLM discovery is run-to-run variable and

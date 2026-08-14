@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 487;
+    public static final int BUILD = 503;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -70,7 +70,20 @@ public class AiScannerExtension implements BurpExtension {
         // Route ALL LLM traffic through Burp's own HTTP engine (visible in Logger, honors the user's network
         // config, avoids the java.net.http h2c body-drop). This is the only transport — BApp-compliant.
         this.http = new MontoyaLlmHttp(api);
-        this.scanLog = new ScanLog(s -> api.logging().logToOutput(s));
+        String logFileProp = System.getProperty("aiscanner.logFile");
+        java.util.function.Consumer<String> logMirror;
+        if (logFileProp != null && !logFileProp.isBlank()) {
+            try {
+                java.io.PrintWriter fw = new java.io.PrintWriter(new java.io.FileWriter(logFileProp, false), true);
+                logMirror = s -> { api.logging().logToOutput(s); fw.println(s); };
+            } catch (Exception e) {
+                api.logging().logToOutput("[AI Scanner] cannot open log file " + logFileProp + ": " + e);
+                logMirror = s -> api.logging().logToOutput(s);
+            }
+        } else {
+            logMirror = s -> api.logging().logToOutput(s);
+        }
+        this.scanLog = new ScanLog(logMirror);
         // Surface the AI Scanner's OWN findings (probes + flow-engine + auth) as Burp AuditIssues so they
         // appear on the dashboard / site-map issues, not only in our log. Scope-gated to hosts we scan.
         scanLog.setIssueSink(this::raiseAiIssue);
@@ -108,6 +121,7 @@ public class AiScannerExtension implements BurpExtension {
         AiContextMenuProvider menuProvider = new AiContextMenuProvider(api, scanLog, session, scanner, scanScope,
                 this::repoForHost, this::setRepoForHost);
         api.userInterface().registerContextMenuItemsProvider(menuProvider);
+        scanLog.setRescanHandler(url -> menuProvider.startScan(url));
         // Suite tab: nav bar (Log / Settings) switching a CardLayout. No Dashboard tab — Burp's own
         // Dashboard already shows the scan task/issues; ours was redundant.
         // HEADLESS GUARD: registering a Swing Suite tab throws HeadlessException with no display. In an

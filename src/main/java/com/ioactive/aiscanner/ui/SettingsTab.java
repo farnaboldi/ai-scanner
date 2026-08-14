@@ -133,9 +133,9 @@ public final class SettingsTab {
         return l;
     }
 
-    /** A mandatory lifecycle phase: bold + disabled + "(always on)" — not skippable by the module filter. */
+    /** A mandatory lifecycle phase: bold + disabled (checked + greyed already shows it can't be toggled off). */
     private JCheckBox prereqBox(String label) {
-        JCheckBox cb = new JCheckBox(label + "  (always on)", true);
+        JCheckBox cb = new JCheckBox(label, true);
         cb.setEnabled(false);
         cb.setFont(cb.getFont().deriveFont(Font.BOLD));
         return cb;

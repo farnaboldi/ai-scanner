@@ -85,6 +85,9 @@ public final class EndpointDiscovery {
     private static final int MAX_FETCH_SCRIPTS = 30;  // referenced JS chunks to ACTIVELY fetch for mining (SPAs)
     // Any .js referenced by a page (script src / preload link href) — the SPA bundles that hold the real API.
     private static final Pattern SCRIPT_REF = Pattern.compile("(?i)(?:src|href)\\s*=\\s*[\"']([^\"']+\\.js(?:\\?[^\"']*)?)[\"']");
+    // A quoted, path-like `.js` STRING LITERAL (inline module-loader lists: headJS head.load, RequireJS, System.import).
+    // Path chars only (no scheme/space) so it matches module refs, not arbitrary prose; same-host filter applied later.
+    private static final Pattern INLINE_JS_REF = Pattern.compile("[\"']([A-Za-z0-9_./~-]+\\.js(?:\\?[^\"']*)?)[\"']");
 
     public EndpointDiscovery(MontoyaApi api, Supplier<AiEngine> engine, SessionStore session, ScanLog scanLog) {
         this.api = api;
@@ -118,8 +121,11 @@ public final class EndpointDiscovery {
         if (!host.equalsIgnoreCase(hostOf(rr.request().url()))) return;
         if (isHtmlShell(rr)) return;
         int st = rr.response().statusCode();
+        // A real handler ran for this path. 405 = the path exists but our METHOD was wrong (GET a POST-only API);
+        // 500 = the handler ran and threw (e.g. a REST endpoint that errors on a malformed/GET request). Both mean a
+        // live endpoint worth bridging so the probes can exercise it with the right method — a GET-only 404 does not.
         boolean handlerRan = (st >= 200 && st < 300)
-                || st == 400 || st == 401 || st == 403 || st == 409 || st == 422;
+                || st == 400 || st == 401 || st == 403 || st == 405 || st == 409 || st == 422 || st == 500;
         // Bounded (defensive): this list is per-scan and drained into the site map, but cap it so a huge
         // discovered surface can never pin an unbounded set of HTTP messages in memory (BApp large-project rule).
         if (handlerRan && keptResponses.size() < 500) keptResponses.add(rr);
@@ -2036,7 +2042,9 @@ public final class EndpointDiscovery {
         return sb.append('}').toString();
     }
     // A REST/API path fragment as it appears in a bundle (even inside a `${base}/rest/...` template literal).
-    private static final Pattern REST_PATH = Pattern.compile("/(?:rest|api)/[A-Za-z0-9_./-]+");
+    // Match /rest|/api paths AND relative ones (headJS/ajax often reference "rest/UserAccess/…" with no leading
+    // slash), but the lookbehind stops it firing inside a word (e.g. "forest/…"). Normalized to a leading slash below.
+    private static final Pattern REST_PATH = Pattern.compile("(?<![A-Za-z0-9_])/?(?:rest|api)/[A-Za-z0-9_./-]+");
     // A base fragment an SPA appends an auth verb to at runtime (this.host = ".../rest/user"; post(host+"/login")).
     private static final Pattern AUTH_BASE = Pattern.compile("(?i).*/(users?|accounts?|auth|identity|session|customers?|members?)$");
     private static final Pattern AUTH_LEAF = Pattern.compile("(?i).*/(login|signin|sign-in|logon|authenticate|authentication|session|token)$");
@@ -2084,7 +2092,7 @@ public final class EndpointDiscovery {
             }
             for (String[] src : gatherSources(host)) {
                 Matcher m = REST_PATH.matcher(src[1]);
-                while (m.find()) paths.add(m.group());
+                while (m.find()) { String p = m.group(); paths.add(p.startsWith("/") ? p : "/" + p); }
             }
             Set<String> derived = new LinkedHashSet<>();
             // SIBLING DERIVATION (first, so it's probed within budget): /login|/signin are siblings of ANY /api/
@@ -2225,8 +2233,11 @@ public final class EndpointDiscovery {
     // app itself ships, so it never invents a route. A dynamic segment (${id}, :id, backtick) ends the match,
     // leaving the collection root. Every hit is LIVE-PROBED downstream and dropped if it 404s or returns the
     // SPA's HTML shell (isHtmlShell oracle) — so extracting broadly here cannot create a false positive.
+    // The /api|/rest branch also matches RELATIVE refs ("rest/UserAccess/RequestAccess" with no leading slash —
+    // how headJS/ajax bundles like ASP.NET page.*.js reference their own API), normalized to a leading slash in the
+    // loop below. The lookbehind stops it firing mid-word (e.g. "forest/…"). /vN and /graphql stay absolute-only.
     private static final Pattern API_PATH_LITERAL = Pattern.compile(
-            "/(?:api|rest)/[A-Za-z0-9_./-]*|/v[0-9]+/[A-Za-z0-9_./-]+|/graphql\\b");
+            "(?<![A-Za-z0-9_])/?(?:api|rest)/[A-Za-z0-9_./-]*|/v[0-9]+/[A-Za-z0-9_./-]+|/graphql\\b");
     // SPAs also declare their API surface in "endpoints objects" as QUOTED absolute-path VALUES that don't
     // carry an /api prefix (e.g. businessDetails:"/application/forms/submit/", create:"/transfers/"). Harvesting
     // only /api/… misses that whole business surface. So ALSO take quoted absolute paths that end in a slash
@@ -2250,6 +2261,7 @@ public final class EndpointDiscovery {
             Matcher m = API_PATH_LITERAL.matcher(body);
             while (m.find() && out.size() < 500) {
                 String p = m.group();
+                if (!p.startsWith("/")) p = "/" + p;   // relative "rest/…" ref (headJS/ajax bundle) → absolute
                 // Trim a trailing partial segment / stray separators; require a real path (a segment after root).
                 while (p.length() > 1 && (p.endsWith(".") || p.endsWith("-") || p.endsWith("_"))) p = p.substring(0, p.length() - 1);
                 if (p.length() < 6 || STATIC.matcher(p).matches()) continue;   // skip trivial / static-asset paths
@@ -2267,17 +2279,27 @@ public final class EndpointDiscovery {
         // Debug: the exact, deterministic API surface extracted from the app's own JS — check it against the
         // bundles to confirm nothing was left undiscovered. Runs every discovery pass (grows as more auth
         // scripts enter the site map).
+        // Name the harvested paths inline (bounded) so a run shows WHICH API surface was extracted — the /rest/…
+        // page-method endpoints (e.g. RequestAccess) are exactly what the downstream verbose-error/SQLi probes need.
+        StringBuilder fs = new StringBuilder();
+        for (String p : found) { if (fs.length() > 0) fs.append(", "); fs.append(p); if (fs.length() > 500) { fs.append("…"); break; } }
         scanLog.log("[AI Scanner] full-body API harvest: scanned " + scripts + " script(s), "
-                + n + " new distinct API path(s).");
+                + n + " new distinct API path(s)" + (found.isEmpty() ? "." : ": " + fs));
         for (String p : found) scanLog.debug("[AI Scanner]   harvested endpoint: " + p);
         return n;
     }
+
+    // A JSON `"key":"value"` STRING field — the injectable shape BlindSqliProbe/BodyMutator fuzz. A synthesized
+    // body carrying one is a usable SQLi/fuzz target even if the write itself keeps erroring.
+    private static final Pattern HAS_JSON_STR_FIELD = Pattern.compile("\"[^\"]+\"\\s*:\\s*\"[^\"]*\"");
 
     /**
      * Reconstruct a VALID POST body for a discovered endpoint that a bodyless probe can't reach, using the
      * server's own validation errors (the generic form of signup's fillRegistration). Bounded LLM-driven fill
      * loop; each attempt is live-probed. Returns the request that resolved to 2xx (and bridges it to the site
-     * map for the write-aware probes), or null. Gated: only API-ish paths, only non-destructive methods.
+     * map for the write-aware probes); failing a 2xx, returns the best-effort synthesized POST if it carries an
+     * injectable JSON field (so the SQLi/fuzz oracles can still reach a write that only ever errors); else null.
+     * Gated: only API-ish paths, only non-destructive methods.
      */
     private HttpRequest resolveWriteBody(String abs, String host, int getStatus) {
         try {
@@ -2294,6 +2316,7 @@ public final class EndpointDiscovery {
             // — no per-slash variants, and no duplicate writes. POST and branch on the ACTUAL response status.
             String path; try { path = URI.create(abs).getPath(); } catch (Exception e) { path = abs; }
             String body = "{}";
+            HttpRequest bestSynth = null;   // best-effort filled POST to hand the fuzzers even if the write never 2xx-es
             for (int i = 0; i < 4; i++) {
                 HttpRequest post = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
                         .withAddedHeader("Content-Type", "application/json").withBody(body));
@@ -2309,14 +2332,31 @@ public final class EndpointDiscovery {
                     return post;
                 }
                 // Fillable validation error → let the model complete the body from the server's own errors.
-                if (st == 400 || st == 422 || st == 409 || st == 415) {
-                    if (vb == null || !vb.contains("{")) break;                  // no structured errors to learn from
+                // Include 500: an ASP.NET Web-API write endpoint with customErrors Off returns its column/field
+                // errors as a 500 XML <Error> doc ("Cannot insert the value NULL into column 'email'"), NOT a
+                // 400/JSON — so learn from `<`-structured error bodies too, not just `{`. This is exactly the
+                // RequestAccess case: {} → 500 naming 'email', which the model turns into {"email":…}.
+                if (st == 400 || st == 422 || st == 409 || st == 415 || st == 500) {
+                    if (vb == null || (!vb.contains("{") && !vb.contains("<"))) break;   // no structured errors to learn from
                     String filled = eng.completeRequestBody("POST", path, body, vb);
                     if (filled == null || filled.isBlank() || filled.equals(body)) break;   // no progress
                     body = filled;
+                    // A body that now carries a JSON string field is an injectable SQLi/fuzz target even if the
+                    // write keeps erroring on a later column — a quote still reaches the SQL string sink. Remember it.
+                    if (HAS_JSON_STR_FIELD.matcher(body).find())
+                        bestSynth = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
+                                .withAddedHeader("Content-Type", "application/json").withBody(body));
                     continue;
                 }
-                break;   // 404 (missing/state)/405 (wrong method)/403 (authz) → not fillable; stop
+                break;   // 404/405 (wrong method)/403 (authz) → not fillable; stop
+            }
+            // No 2xx, but we synthesized a body with an injectable field: hand THAT to the targets-iterating probes
+            // (BlindSqli/BodyMutator/NoSql). A write that 500s on a NULL column still reaches the SQL string, so the
+            // error-based SQLi oracle can fire on it — the RequestAccess SQLi a bodyless probe can never reach.
+            if (bestSynth != null) {
+                scanLog.debug("[AI Scanner]   write-body: no 2xx for " + path
+                        + " — feeding best-effort synthesized POST (JSON field present) to the fuzzers.");
+                return bestSynth;
             }
         } catch (Throwable t) { scanLog.debug("[AI Scanner]   write-body resolve error: " + t); }
         return null;
@@ -2606,8 +2646,14 @@ public final class EndpointDiscovery {
             String url = rr.request().url();
             if (!host.equalsIgnoreCase(hostOf(url))) continue;
             String lower = url.toLowerCase();
-            boolean isJs = lower.contains(".js");
+            String ctype = "";
+            try { if (rr.response().hasHeader("Content-Type")) ctype = rr.response().headerValue("Content-Type").toLowerCase(); } catch (Throwable ignore) { }
+            boolean isJs = lower.contains(".js") || ctype.contains("javascript");
+            // Classify HTML by CONTENT-TYPE too, not just extension: server-rendered pages carry a real extension
+            // (.aspx/.php/.jsp/.do) so the extension heuristic skips them — yet they're exactly the pages whose inline
+            // module-loader lists (headJS/RequireJS) reference the SPA bundles holding the real API. text/html → mine.
             boolean isHtml = lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith("/")
+                    || ctype.contains("text/html")
                     || !lower.matches(".*\\.[a-z0-9]{1,5}($|\\?).*");
             if (!isJs && !isHtml) continue;
             if (isJs && LIBRARY_JS.matcher(lower).matches()) continue;   // skip libs
@@ -2659,7 +2705,18 @@ public final class EndpointDiscovery {
     /** Collect the same-host .js URLs a page references (script src / preload link href), resolved absolute. */
     private void collectScriptRefs(String rawHtml, String pageUrl, String host, Set<String> out) {
         if (rawHtml == null) return;
-        Matcher m = SCRIPT_REF.matcher(rawHtml);
+        // (a) <script src>/<link href> attributes — the classic case.
+        addJsRefs(SCRIPT_REF.matcher(rawHtml), pageUrl, host, out);
+        // (b) INLINE module-loader lists — headJS `head.load([{ "scripts/page.login.js": "…?_=v" }])`, RequireJS,
+        //     System.import, etc. reference their real bundles as quoted `.js` STRING LITERALS inside an inline
+        //     <script>, never as a src= attribute, so (a) misses them. On ASP.NET/SPA apps that's exactly where the
+        //     page's own module (holding the login.aspx/* page-methods + rest/* API) lives. Generic: any quoted
+        //     path-like `.js` literal, same-host, non-library. Bounded downstream by MAX_FETCH_SCRIPTS + dedup.
+        addJsRefs(INLINE_JS_REF.matcher(rawHtml), pageUrl, host, out);
+    }
+
+    /** Resolve each regex-captured `.js` reference against the page URL and keep same-host, non-library ones. */
+    private void addJsRefs(Matcher m, String pageUrl, String host, Set<String> out) {
         while (m.find()) {
             try {
                 String su = URI.create(pageUrl).resolve(m.group(1)).toString();

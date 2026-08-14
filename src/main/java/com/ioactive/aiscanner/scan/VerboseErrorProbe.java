@@ -49,6 +49,7 @@ final class VerboseErrorProbe {
     private static final Pattern UNSAFE_PATH = Pattern.compile(
             "(?i)(delete|remove|purge|destroy|\\bdrop\\b|wipe|deactivate|disable|revoke|transfer|withdraw|payment|logout|signout|signoff)");
     private static final int MAX_ACTIVE = 60;    // cap active malformed sends per host (a big site map is bounded)
+    private static final int MAX_EVIDENCE = 10;  // cap request/response tabs attached to the one host-wide issue
 
     VerboseErrorProbe(MontoyaApi api, ScanLog scanLog) { this.api = api; this.scanLog = scanLog; }
 
@@ -101,7 +102,12 @@ final class VerboseErrorProbe {
             scanLog.log("[AI Scanner] verbose-error probe: no stack-trace disclosure found.");
             return 0;
         }
+        // Rank leaking endpoints by disclosure severity (a DB-schema/SQL leak reveals far more than a bare framework
+        // trace), stable within a tier, so the MOST DAMAGING artifact anchors the finding and is the first evidence
+        // tab. Generic — the ranking is by response shape only, no app/vendor knowledge.
         List<String> endpoints = new ArrayList<>(leaks.keySet());
+        endpoints.sort((a, b) -> Integer.compare(
+                StackTraceOracle.disclosureSeverity(leaks.get(b)), StackTraceOracle.disclosureSeverity(leaks.get(a))));
         String primary = endpoints.get(0);
         // Systemic class — one issue per host. If SamlProbe already claimed it, just note the extra endpoints.
         if (!scanLog.firstForHost("Stack trace disclosure", primary)) {
@@ -109,14 +115,36 @@ final class VerboseErrorProbe {
                     + "also affected: " + preview(endpoints));
             return 0;
         }
+        // Aggregate the CONCRETE artifacts each error disclosed (DB objects, internal paths, code frames, versions)
+        // so the finding shows WHAT leaked, not just that something did — deduped + bounded across endpoints.
+        Set<String> artifacts = new LinkedHashSet<>();
+        boolean anyDb = false;
+        for (String ep : endpoints) {
+            artifacts.addAll(StackTraceOracle.leakedArtifacts(leaks.get(ep)));
+            anyDb |= StackTraceOracle.leaksDbSchema(leaks.get(ep));
+        }
         String detail = "The application returns a framework stack trace on malformed input, leaking exception types, "
                 + "class/method names, framework version and internal paths (CWE-209). This is a host-wide verbose-error "
                 + "misconfiguration (e.g. ASP.NET customErrors Off), reproducible across multiple endpoints and layers "
-                + "(page-methods, ASMX, and rest/JSON Web-API routes) — not a single page. Affected endpoint(s): "
-                + preview(endpoints) + ". Re-confirmed.";
-        scanLog.found("Stack trace disclosure", primary, detail, leaks.get(primary));
+                + "(page-methods, ASMX, and rest/JSON Web-API routes) — not a single page."
+                + (anyDb ? " At least one endpoint additionally leaks DATABASE SCHEMA / SQL error text (database, table "
+                        + "and/or column names, and the data-access stack), which materially aids SQL-injection targeting "
+                        + "and data-model reconnaissance." : "")
+                + " Affected endpoint(s): " + preview(endpoints) + "."
+                + (artifacts.isEmpty() ? "" : " Leaked artifacts observed: " + previewN(new ArrayList<>(artifacts), 14) + ".")
+                + " Re-confirmed.";
+        // Attach EVERY leaking request/response (most-severe first) so Burp shows one evidence tab per endpoint —
+        // the SQL/DB-schema disclosure leads, not whichever endpoint the crawl happened to hit first.
+        List<HttpRequestResponse> evidence = new ArrayList<>();
+        for (String ep : endpoints) {
+            if (evidence.size() >= MAX_EVIDENCE) break;
+            HttpRequestResponse rr = leaks.get(ep);
+            if (rr != null) evidence.add(rr);
+        }
+        scanLog.found("Stack trace disclosure", primary, detail, evidence.toArray(new HttpRequestResponse[0]));
         scanLog.incFinding();
-        scanLog.log("[AI Scanner] verbose-error probe: stack-trace disclosure @ " + endpoints.size() + " endpoint(s).");
+        scanLog.log("[AI Scanner] verbose-error probe: stack-trace disclosure @ " + endpoints.size() + " endpoint(s)"
+                + (anyDb ? " (incl. DB-schema leak)" : "") + "; " + evidence.size() + " evidence artifact(s) attached.");
         return 1;
     }
 
@@ -152,10 +180,11 @@ final class VerboseErrorProbe {
         return false;
     }
 
-    private static String preview(List<String> endpoints) {
-        int n = Math.min(endpoints.size(), 8);
-        String s = String.join(", ", endpoints.subList(0, n));
-        return endpoints.size() > n ? s + " (+" + (endpoints.size() - n) + " more)" : s;
+    private static String preview(List<String> endpoints) { return previewN(endpoints, 8); }
+    private static String previewN(List<String> items, int cap) {
+        int n = Math.min(items.size(), cap);
+        String s = String.join(", ", items.subList(0, n));
+        return items.size() > n ? s + " (+" + (items.size() - n) + " more)" : s;
     }
     private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return null; } }
     private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
