@@ -37,9 +37,9 @@ import java.util.regex.Pattern;
  *   <li><b>Metadata hardening</b> — deterministic parse of the SP metadata XML: assertions not required signed
  *       ({@code WantAssertionsSigned="false"}/absent), assertions not encrypted (no encryption KeyDescriptor),
  *       and an HTTP-Artifact ACS binding present. Safe reads → always fine to run.</li>
- *   <li><b>ACS verbose-error / stack-trace disclosure</b> — POST a malformed {@code SAMLResponse}; fire only on
- *       STRONG stack-trace markers (exception token + a real stack frame, or an ASP.NET/JSP error signature),
- *       re-confirmed. A bare 500 with a generic body does NOT fire.</li>
+ *   <li><b>ACS verbose-error exercise</b> — POST a malformed {@code SAMLResponse} and probe SignIn/Logout with
+ *       a bad ReturnUrl so those responses land in Burp's site map. {@link VerboseErrorProbe} runs after and is
+ *       the sole filer of "Stack trace disclosure" host-wide, backed by the richest available evidence.</li>
  *   <li><b>XXE at the ACS (out-of-band)</b> — reuse Burp Collaborator exactly as {@link SsrfProbe}/{@link XxeProbe}
  *       do: base64 a SAML-ish doc whose DOCTYPE references a fresh Collaborator host, POST it as
  *       {@code SAMLResponse}, poll for an interaction. Fire only on a CONFIRMED callback. No file exfiltration.</li>
@@ -113,8 +113,13 @@ public final class SamlProbe {
         // 2) metadata hardening — deterministic reads of the fetched metadata; the assertion-signing note is gated
         //    on the active verdict from (1) so we never overclaim forgeability the SP actually rejects.
         hits += metadataChecks(s, unsigned);
-        // 3) verbose-error / stack-trace disclosure across the Sustainsys command surface (ACS + SignIn/Logout).
-        try { if (samlStackTrace(s, withSession)) hits++; } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml stack-trace check error: " + t); }
+        // 3) verbose-error / stack-trace disclosure across the SAML command surface (ACS + SignIn/Logout).
+        // SamlProbe exercises these endpoints so the responses land in the site map; VerboseErrorProbe runs
+        // AFTER and is the sole filer of "Stack trace disclosure" host-wide (via passive scan of those hits).
+        // SamlProbe only logs the observation here — no independent filing — to avoid racing with VerboseErrorProbe
+        // for the firstForHost slot and producing a finding backed by the weaker SAML evidence instead of the
+        // richer REST evidence (DB schema / source paths) that VerboseErrorProbe surfaces.
+        try { samlStackTraceExercise(s, withSession); } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml stack-trace exercise error: " + t); }
         // 4) XXE at the ACS, out-of-band via Burp Collaborator (same mechanism as SsrfProbe/XxeProbe).
         try { if (s.acsUrl != null && acsXxeOob(s, withSession)) hits++; } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml xxe check error: " + t); }
         // 5) RelayState/ReturnUrl open redirect on the SP-initiated endpoint (reuses the "Open redirect" class).
@@ -339,47 +344,35 @@ public final class SamlProbe {
         return hits;
     }
 
-    // ------------------------------------------------------------------ 2) ACS verbose error / stack trace
+    // ------------------------------------------------------------------ 2) ACS verbose error / stack trace (exercise only)
 
-    /** Fire ONCE on the first SAML endpoint that leaks a framework stack trace, re-confirmed. Covers the whole
-     *  Sustainsys command surface — the ACS (malformed SAMLResponse) and the SignIn/Logout routes (malformed
-     *  ReturnUrl) — because the verbose-error misconfiguration is handler-wide, not ACS-specific. One issue per host,
-     *  endpoint named in the evidence (no near-dupes across the three routes). */
-    private boolean samlStackTrace(Surface s, UnaryOperator<HttpRequest> withSession) {
-        String evil = "https://aiscan-saml-oob.example.org/";   // an off-domain ReturnUrl → Sustainsys' validation error path
+    /** Exercises the SAML command surface with SAML-specific malformed inputs so that the error responses land in
+     *  Burp's site map. VerboseErrorProbe, which runs AFTER SamlProbe, picks them up via passive scan and is the
+     *  SOLE filer of "Stack trace disclosure" host-wide — that way the finding is always backed by the richest
+     *  available evidence (e.g. a REST endpoint leaking DB schema) rather than a SAML-only trace. */
+    private void samlStackTraceExercise(Surface s, UnaryOperator<HttpRequest> withSession) {
+        String evil = "https://aiscan-saml-oob.example.org/";
         java.util.List<String> urls = new java.util.ArrayList<>();
         java.util.List<HttpRequest> reqs = new java.util.ArrayList<>();
-        java.util.List<String> how = new java.util.ArrayList<>();
         if (s.acsUrl != null) {
-            urls.add(s.acsUrl); how.add("a malformed SAMLResponse");
+            urls.add(s.acsUrl);
             reqs.add(buildAcsPost(s.acsUrl, "notvalidbase64", s.relayStateSeen ? "aiscan" : null));
         }
         if (s.ssoUrl != null) {
-            urls.add(s.ssoUrl); how.add("a malformed ReturnUrl");
+            urls.add(s.ssoUrl);
             reqs.add(HttpRequest.httpRequestFromUrl(s.ssoUrl).withMethod("GET").withAddedParameters(HttpParameter.urlParameter("ReturnUrl", evil)));
         }
         if (s.logoutUrl != null) {
-            urls.add(s.logoutUrl); how.add("a malformed ReturnUrl");
+            urls.add(s.logoutUrl);
             reqs.add(HttpRequest.httpRequestFromUrl(s.logoutUrl).withMethod("GET").withAddedParameters(HttpParameter.urlParameter("ReturnUrl", evil)));
         }
         for (int i = 0; i < reqs.size(); i++) {
             HttpRequest req = reqs.get(i);
             HttpRequestResponse rr = send(withSession != null ? withSession.apply(req) : req);
-            if (!StackTraceOracle.hasStackTrace(rr)) continue;
-            HttpRequestResponse rr2 = send(withSession != null ? withSession.apply(req) : req);   // re-confirm (zero-FP)
-            if (!StackTraceOracle.hasStackTrace(rr2)) continue;
-            // Systemic class — collapse to one issue per host (the generic VerboseErrorProbe may see it elsewhere too).
-            if (!scanLog.firstForHost("Stack trace disclosure", urls.get(i))) return true;
-            scanLog.found("Stack trace disclosure", urls.get(i),
-                    "A SAML endpoint returns a framework stack trace on malformed input (" + urls.get(i) + " with "
-                    + how.get(i) + ") — leaking exception types, class/method names, framework version and internal "
-                    + "paths (CWE-209). The verbose-error misconfiguration is handler-wide across the SAML module "
-                    + "(ACS / SignIn / Logout), aiding an attacker in mapping the application stack. Re-confirmed.",
-                    rr);
-            scanLog.incFinding();
-            return true;
+            if (StackTraceOracle.hasStackTrace(rr))
+                scanLog.debug("[AI Scanner]   saml stack-trace observed @ " + urls.get(i)
+                        + " — VerboseErrorProbe will file the host-wide finding.");
         }
-        return false;
     }
 
     // ------------------------------------------------------------------ 3) XXE at the ACS (OOB / Collaborator)
