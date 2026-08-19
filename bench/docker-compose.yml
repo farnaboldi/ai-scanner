@@ -19,7 +19,7 @@ services:
   # bundled MySQL under active-scan load (non-deterministic 000/302/404, session drops). ghcr.io/digininja
   # /dvwa publishes linux/arm64 natively, and splitting the DB out keeps it from being CPU/IO-starved by the
   # web tier during a scan. Bonus: this image HAS the Open HTTP Redirect module the old one lacked.
-  # Needs a one-time DB create via setup.php — bench/run.sh dvwa_setup does it (login → create_db → login).
+  # Needs a one-time DB create via setup.php — the harness's setup_dvwa does it (login → create_db → login).
   dvwa:
     image: ghcr.io/digininja/dvwa:latest
     container_name: aiscanner-dvwa

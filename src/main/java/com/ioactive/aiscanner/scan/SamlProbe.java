@@ -175,7 +175,7 @@ public final class SamlProbe {
                     if ((loc != null && SAML_REQUEST_PARAM.matcher(loc).find())
                             || SAML_REQUEST_PARAM.matcher(url).find()) {
                         // The SP endpoint is the request URL that produced the SAMLRequest (that's what we can re-drive).
-                        s.ssoUrl = stripQuery(url);
+                        s.ssoUrl = Net.stripQuery(url);
                         String rp = findReturnParam(rr.request(), loc);
                         if (rp != null) s.ssoReturnParam = rp;
                     }
@@ -184,7 +184,7 @@ public final class SamlProbe {
                 // (c) ACS: a request/form carrying a SAMLResponse parameter → its action URL IS the ACS.
                 for (ParsedHttpParameter p : rr.request().parameters()) {
                     if ("SAMLResponse".equalsIgnoreCase(p.name())) {
-                        if (s.acsUrl == null) s.acsUrl = stripQuery(url);
+                        if (s.acsUrl == null) s.acsUrl = Net.stripQuery(url);
                     }
                     if ("RelayState".equalsIgnoreCase(p.name())) s.relayStateSeen = true;
                 }
@@ -196,7 +196,7 @@ public final class SamlProbe {
                 }
 
                 // (d) any in-scope URL whose PATH contains a `saml` segment → candidate endpoint; classify below.
-                if (SAML_PATH_SEG.matcher(pathOf(url)).find()) samlPaths.add(stripQuery(url));
+                if (SAML_PATH_SEG.matcher(pathOf(url)).find()) samlPaths.add(Net.stripQuery(url));
             }
         } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml discovery error: " + t); }
 
@@ -591,7 +591,7 @@ public final class SamlProbe {
             String form = fm.group();
             if (!form.toLowerCase().contains("samlresponse")) continue;
             String action = attr(form.substring(0, Math.min(form.length(), form.indexOf('>') + 1)), "action");
-            if (action == null || action.isBlank()) return stripQuery(pageUrl);   // self-post
+            if (action == null || action.isBlank()) return Net.stripQuery(pageUrl);   // self-post
             try { return URI.create(pageUrl).resolve(action).toString(); } catch (Exception e) { return action; }
         }
         return null;
@@ -687,8 +687,7 @@ public final class SamlProbe {
         return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
     private static String urlEnc(String s) { return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8); }
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
     private static String pathOf(String url) { try { String p = URI.create(url).getPath(); return p == null ? "" : p; } catch (Exception e) { return url; } }
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String url) { return Net.authority(url); }
     private static String yn(boolean b) { return b ? "yes" : "no"; }
 }

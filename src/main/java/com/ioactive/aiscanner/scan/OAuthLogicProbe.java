@@ -46,7 +46,7 @@ public final class OAuthLogicProbe {
     public int probe(String host, UnaryOperator<HttpRequest> sess) {
         int hits = 0;
         try {
-            for (String authzUrl : discoverAuthorizeRequests(host)) {
+            for (String authzUrl : discoverAuthorizeRequests(host, sess)) {
                 if (checkRedirectUriValidation(authzUrl, sess)) hits++;
             }
         } catch (Throwable t) { scanLog.debug("[AI Scanner] oauth-logic: " + t); }
@@ -54,14 +54,21 @@ public final class OAuthLogicProbe {
         return hits;
     }
 
-    private static final Pattern CLIENT_ID = Pattern.compile("(?i)client_?id[\"'=:\\s]{1,3}([A-Za-z0-9._-]{2,64})");
+    // client_id in a URL query (client_id=x) OR a JSON/JS blob ("clientID": "x") — bridge any quotes/space around =/:
+    private static final Pattern CLIENT_ID = Pattern.compile("(?i)client_?id[\"'\\s]*[=:][\"'\\s]*([A-Za-z0-9._-]{2,64})");
+    // A client secret rendered in a response body (e.g. an authenticated /clients registry page that leaks it).
+    private static final Pattern CLIENT_SECRET = Pattern.compile("(?i)client_?secret[\"'\\s]*[=:][\"'\\s]*([^\\s\"',}]{2,120})");
+    // Well-known OAuth client-registry paths a logged-in user might list (browser-like active harvest of client_id).
+    private static final String[] CLIENT_REGISTRY_PATHS = { "/clients", "/oauth/clients", "/oauth2/clients", "/api/clients" };
 
     /** Authorize-endpoint request URLs to drive. Primary: real OAuth authorize requests observed in the site map
-     *  (they carry the client's own client_id/scope). Fallback: if only a bare authorize ENDPOINT was seen (the
-     *  auth server was scanned without a client flow), SYNTHESIZE one using a client_id harvested from the site map
-     *  or supplied by the operator (-Daiscanner.oauthClientId / AISCANNER_OAUTH_CLIENT_ID) — the client_id is
-     *  public and usually known to the tester, same rationale as operator-supplied login creds. */
-    private Set<String> discoverAuthorizeRequests(String host) {
+     *  (they carry the client's own client_id/scope). Otherwise SYNTHESIZE one using a client_id we HARVEST like a
+     *  browser would — from the URL, request body AND response body of anything crawled (a client's authorize link,
+     *  an authenticated client-registry page such as /clients, an OpenID config blob), or, failing that, by actively
+     *  fetching the well-known client-registry paths WITH the session (a logged-in user can usually list the OAuth
+     *  clients). A client_id may also be supplied by the operator (-Daiscanner.oauthClientId / AISCANNER_OAUTH_CLIENT_ID)
+     *  — it is public and usually known to the tester, same rationale as operator-supplied login creds. */
+    private Set<String> discoverAuthorizeRequests(String host, UnaryOperator<HttpRequest> sess) {
         Set<String> out = new LinkedHashSet<>();
         Set<String> authzEndpoints = new LinkedHashSet<>();
         Set<String> clientIds = new LinkedHashSet<>();
@@ -73,11 +80,50 @@ public final class OAuthLogicProbe {
                 if (u.contains("client_id=") || u.contains("response_type=")) out.add(u);   // real flow → replay as-is
                 else authzEndpoints.add(u.split("[?#]")[0]);                                 // bare endpoint → maybe synth
             }
-            // harvest client_id tokens from any observed request/response (a client's authorize link, a config blob)
-            Matcher cm = CLIENT_ID.matcher(u); while (cm.find()) clientIds.add(cm.group(1));
+            // harvest client_id like a browser: from the URL, the request body, AND the response body — a client's
+            // authorize link, an authenticated client-registry page (/clients), or an OpenID config blob all carry it.
+            harvestClientIds(u, clientIds);
+            harvestClientIds(reqBody(rr), clientIds);
+            harvestClientIds(respBody(rr), clientIds);
         }
         String opCid = arg("aiscanner.oauthClientId", "AISCANNER_OAUTH_CLIENT_ID");
         if (opCid != null) clientIds.add(opCid);
+
+        // Browser-like ACTIVE harvest: if nothing crawled surfaced a client_id, fetch the well-known client-registry
+        // pages WITH the session. Many authorization servers let a logged-in user LIST the registered OAuth clients
+        // (the same page a human would open). Generic convention, not app-specific; no-ops when unauthenticated (302).
+        scanLog.debug("[AI Scanner] oauth-logic: passive client_id harvest = " + clientIds.size() + " from site map");
+        if (clientIds.isEmpty()) {
+            String origin = originOf(host);
+            if (origin != null) for (String p : CLIENT_REGISTRY_PATHS) {
+                // Force a SINGLE Accept: application/json (httpRequestFromUrl may already carry Accept: */*, and a
+                // second added header makes Express res.format serve the HTML page — where client_id isn't key:value).
+                HttpRequest req = HttpRequest.httpRequestFromUrl(origin + p).withMethod("GET")
+                        .withRemovedHeader("Accept").withAddedHeader("Accept", "application/json");
+                HttpRequestResponse rr = send(sess, req);
+                int sc = (rr != null && rr.response() != null) ? rr.response().statusCode() : -1;
+                String body = respBody(rr);
+                scanLog.debug("[AI Scanner] oauth-logic: registry GET " + origin + p + " → HTTP " + sc
+                        + " cookie=" + sess.apply(req).hasHeader("Cookie") + " body[" + (body == null ? 0 : body.length())
+                        + "]=" + (body == null ? "" : body.replaceAll("\\s+", " ").substring(0, Math.min(90, body.length()))));
+                if (sc != 200) continue;
+                int before = clientIds.size();
+                harvestClientIds(body, clientIds);
+                if (clientIds.size() > before) {
+                    scanLog.debug("[AI Scanner] oauth-logic: harvested " + (clientIds.size() - before)
+                            + " client_id(s) from authenticated " + p);
+                    // The registry is reachable by a logged-in (non-admin) user AND returns client secrets in
+                    // cleartext → OAuth client-credential disclosure + broken access control. Deterministic.
+                    if (body != null && CLIENT_SECRET.matcher(body).find()) {
+                        scanLog.found("OAuth client credentials exposed via client-registry endpoint", origin + p,
+                                "an authenticated user can GET " + p + " and read registered OAuth clients' "
+                                + "client_secret in cleartext (broken access control + secret disclosure)", rr);
+                        scanLog.incFinding();
+                    }
+                }
+            }
+        }
+
         // If we have a client_id but never crawled an authorize endpoint (the auth server doesn't self-link its
         // /authorize — only clients do), actively add the WELL-KNOWN authorize paths so we can still drive the flow.
         if (!clientIds.isEmpty()) {
@@ -87,8 +133,12 @@ public final class OAuthLogicProbe {
         }
         // synthesize an authorize request per (endpoint × client_id) when we have no real one to replay
         if (out.isEmpty() && !authzEndpoints.isEmpty() && !clientIds.isEmpty()) {
+            // A NON-EMPTY scope: an empty scope= makes some servers 500 while parsing/rendering the consent dialog
+            // (observed on dvoauth). "openid profile" is the universal OIDC default; servers that don't validate
+            // scope accept it and render the grant dialog we then drive.
             for (String ep : authzEndpoints) for (String cid : clientIds) {
-                out.add(ep + "?response_type=code&client_id=" + enc(cid) + "&scope=&state=aisc&redirect_uri=");
+                out.add(ep + "?response_type=code&client_id=" + enc(cid) + "&scope=" + enc("openid profile")
+                        + "&state=aisc&redirect_uri=");
                 if (out.size() >= 12) break;
             }
         }
@@ -97,18 +147,39 @@ public final class OAuthLogicProbe {
         return out;
     }
 
+    /** Harvest OAuth client_id values from any text blob (URL, request body, response body). Bounded: caps the set
+     *  and the bytes scanned so a huge JS bundle or site map can't blow up cost. Over-harvested junk is harmless —
+     *  a bogus client_id just yields no consent page and no finding. */
+    private static void harvestClientIds(String blob, Set<String> out) {
+        if (blob == null || blob.isEmpty() || out.size() >= 25) return;
+        String s = blob.length() > 524288 ? blob.substring(0, 524288) : blob;
+        Matcher m = CLIENT_ID.matcher(s);
+        while (m.find() && out.size() < 25) out.add(m.group(1));
+    }
+    private static String reqBody(HttpRequestResponse rr) {
+        try { return rr.request() != null ? rr.request().bodyToString() : null; } catch (Exception e) { return null; }
+    }
+    private static String respBody(HttpRequestResponse rr) {
+        try { return rr.response() != null ? rr.response().bodyToString() : null; } catch (Exception e) { return null; }
+    }
+
     /** scheme://authority (WITH port) for the target host, from any observed same-host request. Must keep the port —
      *  synthesizing "http://localhost/authorize" (dropping :3005) sends to :80 and the whole probe silently no-ops. */
     private String originOf(String host) {
         String bareHost = host.split(":")[0];
+        String portless = null;
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
             if (rr.request() == null) continue;
-            try { URI u = URI.create(rr.request().url());
-                if (u.getHost() != null && u.getHost().equalsIgnoreCase(bareHost) && u.getAuthority() != null)
-                    return u.getScheme() + "://" + u.getAuthority();
+            try {
+                URI u = URI.create(rr.request().url());
+                if (u.getHost() == null || !u.getHost().equalsIgnoreCase(bareHost) || u.getAuthority() == null) continue;
+                String o = u.getScheme() + "://" + u.getAuthority();
+                if (u.getAuthority().indexOf(':') >= 0) return o;   // authority carries an explicit port → definitive
+                if (portless == null) portless = o;                  // a :80/:443 request → keep only as last resort
             } catch (Exception ignore) {}
         }
-        return "http://" + host;   // last resort — keeps whatever (host:port) was passed in
+        if (host.indexOf(':') >= 0) return "http://" + host;         // the host we were given already carries the port
+        return portless != null ? portless : "http://" + host;       // last resort — keeps whatever we were given
     }
 
     private static String arg(String prop, String env) {
@@ -205,7 +276,7 @@ public final class OAuthLogicProbe {
     }
 
     private static boolean sameHost(String url, String host) {
-        try { return host.equalsIgnoreCase(URI.create(url).getHost()); } catch (Exception e) { return false; }
+        try { return host.equalsIgnoreCase(Net.authority(url)); } catch (Exception e) { return false; }
     }
     private static String safeBody(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().bodyToString() : null; } catch (Exception e) { return null; }

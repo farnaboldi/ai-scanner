@@ -6,7 +6,6 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -75,7 +74,5 @@ public final class FileServePathProbe {
         String b = body.toLowerCase();
         return b.contains("<!doctype html") || b.contains("<html") || b.contains("index of");
     }
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

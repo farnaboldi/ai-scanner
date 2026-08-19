@@ -274,6 +274,7 @@ exec "$JAVA" \
   ${SEED_LANDING:+-Daiscanner.landing="${SEED_LANDING}"} \
   ${REPORT_DIR:+-Daiscanner.reportDir="${REPORT_DIR}"} \
   ${SOURCE_REPO:+-Daiscanner.sourceRepo="${SOURCE_REPO}"} \
+  ${AISCANNER_AUTOSCAN_REPOS:+-Daiscanner.autoscanRepos="${AISCANNER_AUTOSCAN_REPOS}"} \
   "-Daiscanner.sastMode=${AISCANNER_SAST_MODE:-coarse}" \
   "-Daiscanner.deferToBurp=${AISCANNER_DEFER_TO_BURP:-true}" \
   "-Daiscanner.autoscan=${TARGET}" \

@@ -9,7 +9,6 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -52,8 +51,8 @@ public final class XxeProbe {
                 String body = req.bodyToString();
                 boolean xml = (ct != null && ct.toLowerCase().contains("xml"))
                         || (body != null && body.trim().startsWith("<"));
-                if (xml) { xmlEndpoints.putIfAbsent(m + " " + stripQuery(req.url()), req); continue; }
-                scanLog.debug("[AI Scanner]   xxe-scan skip " + m + " " + stripQuery(req.url()) + " ct=[" + ct + "]");
+                if (xml) { xmlEndpoints.putIfAbsent(m + " " + Net.stripQuery(req.url()), req); continue; }
+                scanLog.debug("[AI Scanner]   xxe-scan skip " + m + " " + Net.stripQuery(req.url()) + " ct=[" + ct + "]");
             }
         } catch (Throwable t) { scanLog.debug("[AI Scanner] XXE probe collect error: " + t); }
         scanLog.log("[AI Scanner] XXE probe: " + writeReqs + " write-request(s) in site map, "
@@ -123,6 +122,5 @@ public final class XxeProbe {
         return hits;
     }
 
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

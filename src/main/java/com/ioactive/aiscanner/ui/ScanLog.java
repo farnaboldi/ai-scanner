@@ -42,6 +42,20 @@ public final class ScanLog {
     /** Panel holding the progress bar + (later) the chat row — occupies BorderLayout.SOUTH. */
     private final JPanel southPanel = new JPanel(new BorderLayout());
     private final Consumer<String> mirror;
+    /** Per-scan target tag (e.g. "[localhost:3005] ") prepended to EVERY emitted line so a parallel two-target run is
+     *  atomic to review/grep — set once at the start of each per-target scan thread; InheritableThreadLocal so all the
+     *  worker threads that scan spawns (crawl, discovery, probes, the shared LLM engine's calling thread) inherit it.
+     *  Empty for a normal single-target run. */
+    public static final InheritableThreadLocal<String> TARGET_TAG = new InheritableThreadLocal<>();
+    /** In a PARALLEL run each per-target ScanLog is headless (its JLabels aren't in any panel). Point it at the MAIN
+     *  (UI-attached) ScanLog so its phase/progress/findings still drive the visible status bar — tagged — instead of
+     *  the bar sitting idle. null on the single-target UI ScanLog itself. */
+    private volatile ScanLog uiMirror;
+    public void setUiMirror(ScanLog m) { this.uiMirror = m; }
+    // Per-target progress for a LABELED parallel status bar: tag → {done,total} + tag → phase. Scales with N scans
+    // (1/2/3 → that many labeled segments), so the bar can never confuse whose progress is whose.
+    private final java.util.Map<String, int[]> parProgress = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Map<String, String> parPhase = new java.util.concurrent.ConcurrentHashMap<>();
     private final AtomicInteger scanned = new AtomicInteger();
     private final AtomicInteger findings = new AtomicInteger();
     /** Invoked by the Agent-tab "Stop" button — the extension wires this to cancel the running scan. */
@@ -286,8 +300,21 @@ public final class ScanLog {
 
     /** Always shown — reserve for phases, counts, and vulnerabilities. */
     public void log(String s) {
-        String line = LocalDateTime.now().format(TS) + " " + s;
+        String tag = TARGET_TAG.get();
+        String line = LocalDateTime.now().format(TS) + " " + (tag != null ? tag : "") + s;
         mirror.accept(line);
+        if (s.contains(">>>")) {
+            findingsLog.add(s.replaceAll(".*>>>\\s*", "").trim());   // capture findings for the harness report (per-target)
+            flushReport();   // persist immediately so a crash/OOM mid-scan doesn't lose findings already found
+        }
+        // Centralize the VISIBLE log into the ONE Agent tab: a parallel per-target ScanLog renders into the MAIN
+        // (UI-attached) ScanLog's buffer + area, so the tab shows both targets interleaved (tagged) instead of split.
+        // (The mirror above already sent this line to Burp's Output + the cell-log file on THIS per-target log.)
+        (uiMirror != null ? uiMirror : this).render(line);
+    }
+
+    /** Buffer a formatted line and append it to THIS log's visible tab area (search-filtered, tail-following). */
+    private void render(String line) {
         lines.add(line);
         if (lines.size() > MAX_BUFFER_LINES + 512) {           // bulk-trim the buffer (amortized, front removal is O(n))
             synchronized (lines) {
@@ -295,33 +322,24 @@ public final class ScanLog {
                 if (drop > 0) lines.subList(0, Math.min(drop, lines.size())).clear();
             }
         }
-        if (s.contains(">>>")) {
-            findingsLog.add(s.replaceAll(".*>>>\\s*", "").trim());   // capture findings for the harness report
-            flushReport();   // persist immediately so a crash/OOM mid-scan doesn't lose findings already found
-        }
-        if (matches(line)) {
-            SwingUtilities.invokeLater(() -> {
-                // Follow the tail ONLY when the user is already at (or near) the bottom. If they scrolled up to
-                // read, appending must NOT yank the view back down — measured BEFORE the append. With the caret on
-                // NEVER_UPDATE, append() no longer scrolls on its own, so when the user is scrolled up we do
-                // nothing (and we also SKIP trimView, whose top-removal would shift their content and jump them).
-                boolean atBottom = true;
-                try {
+        if (!matches(line)) return;
+        SwingUtilities.invokeLater(() -> {
+            // Follow the tail ONLY when the user is already at (or near) the bottom. If they scrolled up to read,
+            // appending must NOT yank the view back down — measured BEFORE the append.
+            boolean atBottom = true;
+            try {
+                JScrollBar vb = scroll != null ? scroll.getVerticalScrollBar() : null;
+                if (vb != null) atBottom = (vb.getValue() + vb.getVisibleAmount()) >= (vb.getMaximum() - 24);
+            } catch (Throwable ignore) { }
+            area.append(line + "\n");
+            if (atBottom) {
+                trimView();                                 // keep the visible document bounded → EDT stays responsive
+                SwingUtilities.invokeLater(() -> {
                     JScrollBar vb = scroll != null ? scroll.getVerticalScrollBar() : null;
-                    if (vb != null) atBottom = (vb.getValue() + vb.getVisibleAmount()) >= (vb.getMaximum() - 24);
-                } catch (Throwable ignore) { }
-                area.append(line + "\n");
-                if (atBottom) {
-                    trimView();                                 // keep the visible document bounded → EDT stays responsive
-                    // Pin to the bottom explicitly. Nested invokeLater so the append + relayout is done and the
-                    // scrollbar maximum reflects the new content before we jump to it.
-                    SwingUtilities.invokeLater(() -> {
-                        JScrollBar vb = scroll != null ? scroll.getVerticalScrollBar() : null;
-                        if (vb != null) vb.setValue(vb.getMaximum());
-                    });
-                }
-            });
-        }
+                    if (vb != null) vb.setValue(vb.getMaximum());
+                });
+            }
+        });
     }
 
     /** Drop the oldest lines from the VISIBLE document once it exceeds the cap (the full log stays in the buffer /
@@ -359,6 +377,8 @@ public final class ScanLog {
     public void incFinding() {
         findings.incrementAndGet();
         updateStatus();
+        ScanLog um = uiMirror;
+        if (um != null) um.externalFinding();   // parallel: reflect in the shared UI aggregate
     }
 
     /** Confirmed real vulnerabilities counted this session (used when audit.issues() is unavailable). */
@@ -575,7 +595,36 @@ public final class ScanLog {
             probeProgress.setString(barLabel);
             probeProgress.setVisible(true);
         });
+        ScanLog um = uiMirror;   // parallel: drive the ONE status bar with a LABELED per-target segment
+        if (um != null) um.externalProgress(TARGET_TAG.get(), done, total, cp != null ? cp.label : currentPhase);
     }
+
+    /** Driven by a parallel per-target ScanLog to keep the shared UI status bar live (tagged activity + progress). */
+    public void externalProgress(String tag, int done, int total, String phaseLabel) {
+        String t = (tag == null || tag.trim().isEmpty()) ? "scan" : tag.trim();
+        parProgress.put(t, new int[]{done, total});
+        parPhase.put(t, phaseLabel == null ? "" : phaseLabel);
+        StringBuilder sb = new StringBuilder();
+        int sumPct = 0, n = 0;
+        for (java.util.Map.Entry<String, int[]> e : parProgress.entrySet()) {
+            int d = e.getValue()[0], tot = e.getValue()[1];
+            int p = tot > 0 ? Math.min(100, d * 100 / tot) : 0;
+            sumPct += p; n++;
+            if (sb.length() > 0) sb.append("   ·   ");
+            sb.append(e.getKey()).append(' ').append(d).append('/').append(tot)
+              .append(' ').append(parPhase.getOrDefault(e.getKey(), ""));
+        }
+        final int avg = n > 0 ? sumPct / n : 0;
+        final String status = sb.toString();
+        SwingUtilities.invokeLater(() -> {
+            probeProgress.setValue(avg);
+            probeProgress.setString(status);   // e.g. "[localhost:3005] 12/44 SQLi   ·   [localhost:4000] 9/44 XSS"
+            probeProgress.setVisible(true);
+            phase.setText("Current activity: " + status);
+        });
+    }
+    /** Bump the shared UI findings counter for a parallel per-target finding (aggregate across targets). */
+    public void externalFinding() { findings.incrementAndGet(); updateStatus(); }
 
     public void clear() {
         scanned.set(0);

@@ -93,7 +93,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         // --- Step 1: map entry points + dispatch targets ---
         List<Entry> entries;
         try {
-            entries = parseEntries(engine.chat(SkillLibrary.augment(MAP_SYS, skills), mapUser(host, entrySnips)));
+            entries = parseEntries(engine.chat(SkillLibrary.augment(MAP_SYS, skills), mapUser(host, entrySnips), "sast: map"));
         } catch (Exception e) { return coarseFallback(host, repoPath, "step 1 error (" + e.getClass().getSimpleName() + ")"); }
         if (entries.isEmpty()) return coarseFallback(host, repoPath, "step 1 mapped no entry points (flat/non-routed app)");
 
@@ -113,7 +113,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         // --- Step 2: pin the real sink inside each child (or inline) ---
         List<StaticHint> hints;
         try {
-            hints = StaticHint.parseArray(engine.chat(SkillLibrary.augment(SINK_SYS, skills), sinkUser(entries, childSrc)));
+            hints = StaticHint.parseArray(engine.chat(SkillLibrary.augment(SINK_SYS, skills), sinkUser(entries, childSrc), "sast: sink"));
         } catch (Exception e) { return coarseFallback(host, repoPath, "step 2 error (" + e.getClass().getSimpleName() + ")"); }
         if (hints.isEmpty()) return coarseFallback(host, repoPath, "step 2 produced no hints");
         // FLAT-APP MERGE: the two-step boundary-follow fits framework-routed / process-boundary apps, but a flat

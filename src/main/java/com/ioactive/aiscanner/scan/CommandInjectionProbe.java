@@ -11,7 +11,6 @@ import com.ioactive.aiscanner.scan.sast.SourceFindings;
 import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;

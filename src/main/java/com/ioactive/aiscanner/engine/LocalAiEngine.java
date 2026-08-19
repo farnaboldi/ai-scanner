@@ -71,7 +71,10 @@ public final class LocalAiEngine extends PromptAiEngine {
     }
 
     @Override
-    public String chat(String systemPrompt, String userPrompt) {
+    public String chat(String systemPrompt, String userPrompt) { return chat(systemPrompt, userPrompt, ""); }
+
+    @Override
+    public String chat(String systemPrompt, String userPrompt, String label) {
         setLastError("");
         if (cfg.baseUrl.isBlank()) { setLastError("Engine not configured (base URL missing)."); return ""; }
         try {
@@ -128,7 +131,8 @@ public final class LocalAiEngine extends PromptAiEngine {
             // Targeted per-call DEBUG (metadata only — NOT the request/response bodies, which are noise): seed +
             // sizes, so an empty/degenerate reply (the "round 2 parsed 0" mystery) is visible as resp=0 (transport
             // returned nothing) vs resp=NNN content=0 (a real reply we failed to parse). On with -Daiscanner.debug.
-            if (LogLevel.debug()) logger.accept("[AI Scanner] llm-call seed=" + seed
+            if (LogLevel.debug()) logger.accept("[AI Scanner] llm-call "
+                    + (label == null || label.isBlank() ? "" : "<" + label + "> ") + "seed=" + seed
                     + " req=" + (userPrompt == null ? 0 : userPrompt.length()) + "ch"
                     + " -> resp=" + (raw == null ? 0 : raw.length()) + "ch content=" + content.length() + "ch"
                     + (raw == null || raw.isEmpty() ? "  [EMPTY TRANSPORT REPLY]" : ""));

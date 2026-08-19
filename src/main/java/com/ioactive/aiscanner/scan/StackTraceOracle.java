@@ -19,6 +19,15 @@ final class StackTraceOracle {
     static final Pattern EXCEPTION_TOKEN = Pattern.compile("(?i)\\b([A-Za-z0-9_.]*Exception|Traceback \\(most recent call last\\))\\b");
     /** Framework error-page signatures that are themselves conclusive (ASP.NET yellow-screen, etc.). */
     static final Pattern FRAMEWORK_ERR = Pattern.compile("(?i)Server Error in |ASP\\.NET Version:|Stack Trace:");
+    /** V8 / Node.js stack frame: `at <fn> (<file>:line:col)` or bare `at <file>:line:col`. The trailing
+     *  {@code :line:col} preceded by a JS source file, a {@code node:} core module, or an absolute {@code /path}
+     *  is the distinctive V8 shape — a bare "at 12:30:00" time-of-day has no such prefix and cannot match, which
+     *  keeps this zero-FP. Node frames use a space before `(` (or no `(` at all), so {@link #STACK_FRAME} misses them. */
+    static final Pattern V8_FRAME = Pattern.compile(
+            "(?i)\\bat\\s+[^\\r\\n<]*?(?:\\.[cm]?[jt]sx?|node:[\\w./]+|/[\\w.$@+-]+):\\d+:\\d+");
+    /** JavaScript / Node built-in error types — none end in {@code Exception}, so {@link #EXCEPTION_TOKEN} misses them. */
+    static final Pattern JS_EXCEPTION = Pattern.compile(
+            "\\b(?:Type|Reference|Syntax|Range|Eval|URI|Aggregate|Assertion|Internal)Error\\b");
     /** Generic RDBMS error text that discloses schema (db/table/column names) or SQL — engine-agnostic, not
      *  app-specific. A verbose error carrying this leaks far more than a bare framework trace, so it ranks higher
      *  as evidence. Covers SQL Server, Oracle, MySQL/PDO, PostgreSQL, SQLite and the .NET/ODBC/OLE-DB data layer. */
@@ -33,12 +42,24 @@ final class StackTraceOracle {
             + "ODBC[^<]*Driver|OLE DB|System\\.Data\\.(SqlClient|OleDb|Odbc)|JDBC"                         // .NET / generic
             + ")");
 
-    /** True on (a real stack frame AND an exception token) OR a framework error-page signature. */
+    /** True on (a real .NET/Java frame AND an exception token), OR a V8/Node stack trace, OR a framework error page. */
     static boolean hasStackTrace(HttpRequestResponse rr) {
         String body = body(rr);
         if (body == null) return false;
-        boolean frame = STACK_FRAME.matcher(body).find() && EXCEPTION_TOKEN.matcher(body).find();
-        return frame || FRAMEWORK_ERR.matcher(body).find();
+        // .NET / Java / Python: a real stack frame paired with an exception token.
+        if (STACK_FRAME.matcher(body).find() && EXCEPTION_TOKEN.matcher(body).find()) return true;
+        // Node.js / V8: ≥2 frames, or one frame + a JS error type — the distinctive frame shape keeps this zero-FP.
+        if (hasV8StackTrace(body)) return true;
+        // Conclusive framework error-page signatures (ASP.NET yellow-screen, etc.).
+        return FRAMEWORK_ERR.matcher(body).find();
+    }
+
+    /** ≥2 V8 stack frames, OR one V8 frame paired with a JS error type — either is conclusive of a real trace. */
+    private static boolean hasV8StackTrace(String body) {
+        java.util.regex.Matcher m = V8_FRAME.matcher(body);
+        int frames = 0;
+        while (m.find() && frames < 2) frames++;
+        return frames >= 2 || (frames == 1 && JS_EXCEPTION.matcher(body).find());
     }
 
     /** True if the response's verbose error also leaks database schema / SQL (see {@link #DB_ERROR}). */
@@ -70,8 +91,9 @@ final class StackTraceOracle {
     /** A leaked internal code path — the fully-qualified type.method of a stack frame (Namespace.Class.Method).
      *  This IS a form of path disclosure even when no filesystem path is present (e.g. a .NET/Java trace). */
     private static final Pattern CODE_FRAME = Pattern.compile("\\bat\\s+([A-Za-z_][\\w.]+\\.[A-Za-z0-9_<>]+)\\s*\\(");
-    /** The exception type token (`*Exception`), captured to name what failed. */
-    private static final Pattern EXC_TYPE = Pattern.compile("\\b([A-Za-z_][\\w.]*Exception)\\b");
+    /** The exception type token (`*Exception`, or a JS/Node `*Error` builtin), captured to name what failed. */
+    private static final Pattern EXC_TYPE = Pattern.compile(
+            "\\b([A-Za-z_][\\w.]*Exception|(?:Type|Reference|Syntax|Range|Eval|URI|Aggregate|Assertion|Internal)Error)\\b");
 
     /** Extract the concrete sensitive artifacts a verbose error disclosed — internal file paths, DB schema objects
      *  (table/column/database names), and framework/version banners — so a finding can show WHAT leaked. Generic

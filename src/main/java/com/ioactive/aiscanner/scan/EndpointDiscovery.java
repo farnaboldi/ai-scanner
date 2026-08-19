@@ -286,7 +286,7 @@ public final class EndpointDiscovery {
                     String abs;
                     try { abs = URI.create(baseUrl).resolve(base + leaf).toString(); } catch (Exception e) { continue; }
                     if (!host.equalsIgnoreCase(hostOf(abs))) continue;
-                    if (!seen.add("GET " + stripQuery(abs))) continue;
+                    if (!seen.add("GET " + Net.stripQuery(abs))) continue;
                     HttpRequestResponse rr = probe(authedGet(abs));
                     probed++;
                     int st = statusOf(rr);
@@ -295,7 +295,7 @@ public final class EndpointDiscovery {
                         baseReal = true; found++;
                         HttpRequest keep = authedGet(abs);
                         live.add(keep);
-                        scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + stripQuery(abs) + " (assembled)");
+                        scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + Net.stripQuery(abs) + " (assembled)");
                     }
                 }
             }
@@ -448,7 +448,7 @@ public final class EndpointDiscovery {
                 int st = rr.response().statusCode();
                 if (st < 200 || st >= 300 || isHtmlShell(rr)) continue;
                 if (!respIsStructured(rr)) continue;                       // JSON or XML collection, not the HTML shell
-                candidates.add(stripQuery(req.url()));
+                candidates.add(Net.stripQuery(req.url()));
             }
             for (String abs : candidates) {
                 // Re-probe forcing JSON (Spring/JAXB apps content-negotiate to XML under a browser Accept, so the
@@ -581,7 +581,7 @@ public final class EndpointDiscovery {
                     + "Never return an endpoint with an empty params list. Output ONLY a JSON array, no markdown:\n"
                     + "[{\"method\":\"POST\",\"leaf\":\"api/foo/bar\",\"params\":[\"field1\",\"field2\"]}]\n"
                     + "Skip auth (login/signup/token) and static assets. [] if none.";
-            String raw = eng.chat(system, "Client code fragments:\n" + ctx + "\n\nReturn the JSON array now.");
+            String raw = eng.chat(system, "Client code fragments:\n" + ctx + "\n\nReturn the JSON array now.", "discovery: mine-endpoints");
             if (raw == null) return;
             List<JSONObject> objs = lenientObjects(raw);   // salvage complete objects even if the array is truncated
             if (objs.isEmpty()) { scanLog.log("[AI Scanner] synth: LLM returned 0 parseable endpoint(s)."); return; }
@@ -619,7 +619,7 @@ public final class EndpointDiscovery {
                     try { abs = URI.create(baseUrl).resolve(b + leaf).toString(); } catch (Exception ex) { continue; }
                     if (!host.equalsIgnoreCase(hostOf(abs))) continue;
                     if (AuthenticatedExplorer.SESSION_RESET.matcher(abs).matches()) continue;
-                    if (!seen.add(method + " " + stripQuery(abs) + " synth")) { trail.add((b.isEmpty()?"/":b)+"dup"); continue; }
+                    if (!seen.add(method + " " + Net.stripQuery(abs) + " synth")) { trail.add((b.isEmpty()?"/":b)+"dup"); continue; }
                     HttpRequest req; HttpRequestResponse rr; int st;
                     if (method.equals("GET")) {
                         req = authedGet(abs);
@@ -645,6 +645,10 @@ public final class EndpointDiscovery {
                         req = null; rr = null; st = -1; int bestRank = -1;
                         for (List<String> fs : variants) {
                             if (probed >= BUDGET) break;
+                            if (session != null && session.mutatesOwnAccount(method, abs)) {
+                                scanLog.debug("[AI Scanner]   discovery: skip self-account mutation " + method + " " + Net.stripQuery(abs));
+                                break;   // req stays null → this candidate is skipped below (protects our own login)
+                            }
                             HttpRequest r = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod(method)
                                     .withAddedHeader("Content-Type", "application/json").withBody(jsonBody(fs)));
                             if (session != null && session.hasBearer())
@@ -676,7 +680,7 @@ public final class EndpointDiscovery {
                     if (handlerRan) {
                         live.add(req); kept++;
                         keep(rr, host);   // bridge to site map for IdorGet/Bfla/ChainReplay
-                        scanLog.log("[AI Scanner]   -> LIVE " + st + "  " + method + " " + stripQuery(abs)
+                        scanLog.log("[AI Scanner]   -> LIVE " + st + "  " + method + " " + Net.stripQuery(abs)
                                 + (fields.isEmpty() ? "" : " {" + String.join(",", fields) + "}") + " (llm-synth)");
                         keptThis = true;
                         break;   // found this leaf's real base — stop trying other bases
@@ -758,7 +762,7 @@ public final class EndpointDiscovery {
                 method = (method == null ? "GET" : method).toUpperCase();
                 if (!"GET".equals(method) && !"POST".equals(method)) method = "GET";
                 String abs;
-                try { abs = (action == null || action.isBlank()) ? stripQuery(pageUrl) : URI.create(pageUrl).resolve(action).toString(); }
+                try { abs = (action == null || action.isBlank()) ? Net.stripQuery(pageUrl) : URI.create(pageUrl).resolve(action).toString(); }
                 catch (Exception e) { continue; }
                 if (!host.equalsIgnoreCase(hostOf(abs))) continue;
                 if (AuthenticatedExplorer.SESSION_RESET.matcher(abs).matches()) continue;   // never re-submit login/logout
@@ -782,8 +786,12 @@ public final class EndpointDiscovery {
                     fields.put(name, val);
                 }
                 if (fields.isEmpty()) continue;
-                String key = method + " " + stripQuery(abs) + " " + fields.keySet();
+                String key = method + " " + Net.stripQuery(abs) + " " + fields.keySet();
                 if (!seen.add(key)) continue;
+                if (session != null && session.mutatesOwnAccount(method, abs)) {
+                    scanLog.debug("[AI Scanner]   html-form: skip self-account mutation " + method + " " + Net.stripQuery(abs));
+                    continue;
+                }
                 StringBuilder enc = new StringBuilder();
                 for (Map.Entry<String, String> e : fields.entrySet()) {
                     if (enc.length() > 0) enc.append('&');
@@ -791,14 +799,14 @@ public final class EndpointDiscovery {
                 }
                 HttpRequest req;
                 if ("POST".equals(method)) {
-                    req = withSessionCookie(HttpRequest.httpRequestFromUrl(stripQuery(abs)).withMethod("POST"))
+                    req = withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs)).withMethod("POST"))
                             .withAddedHeader("Content-Type", "application/x-www-form-urlencoded")
                             .withBody(enc.toString());
                 } else {
-                    req = withSessionCookie(HttpRequest.httpRequestFromUrl(stripQuery(abs) + "?" + enc).withMethod("GET"));
+                    req = withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs) + "?" + enc).withMethod("GET"));
                 }
                 live.add(req); added++;
-                scanLog.log("[AI Scanner]   -> FORM " + method + " " + stripQuery(abs) + " {" + String.join(",", fields.keySet()) + "}");
+                scanLog.log("[AI Scanner]   -> FORM " + method + " " + Net.stripQuery(abs) + " {" + String.join(",", fields.keySet()) + "}");
             }
         }
         if (added > 0) scanLog.log("[AI Scanner] html-form synthesis: " + added + " parameterized form request(s) for the active audit.");
@@ -837,7 +845,7 @@ public final class EndpointDiscovery {
                 if (!host.equalsIgnoreCase(hostOf(sample.url()))) continue;   // stay in scope
                 if (STATIC.matcher(sample.url()).matches() || sample.url().toLowerCase().contains(".js")) continue;
                 if (AuthenticatedExplorer.SESSION_RESET.matcher(sample.url()).matches()) continue; // never probe login/logout
-                String key = sample.method() + " " + stripQuery(sample.url());
+                String key = sample.method() + " " + Net.stripQuery(sample.url());
                 if (!seen.add(key)) continue;
 
                 HttpRequest best = null; int bestSt = -1; HttpRequestResponse bestRr = null;
@@ -853,7 +861,7 @@ public final class EndpointDiscovery {
                     live.add(best);
                     keep(bestRr, host);   // bridge to site map for IdorGet/Bfla/ChainReplay
                     scanLog.log("[AI Scanner]   -> LIVE " + bestSt + "  " + best.method() + " "
-                            + stripQuery(best.url()) + paramSuffix(best));
+                            + Net.stripQuery(best.url()) + paramSuffix(best));
                 } else {
                     String leafPath; try { leafPath = URI.create(sample.url()).getPath(); } catch (Exception e) { leafPath = ""; }
                     boolean bareLeaf = leafPath != null && !leafPath.startsWith("/api/") && !leafPath.startsWith("/rest/");
@@ -1297,14 +1305,14 @@ public final class EndpointDiscovery {
                     HttpRequest req = buildFromOperation(path, method.toUpperCase(), op, root);
                     if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
                     if (AuthenticatedExplorer.SESSION_RESET.matcher(req.url()).matches()) continue;
-                    if (!seen.add(method.toUpperCase() + " " + stripQuery(req.url()))) continue;
+                    if (!seen.add(method.toUpperCase() + " " + Net.stripQuery(req.url()))) continue;
                     HttpRequestResponse rr = probe(req);
                     int st = statusOf(rr);
                     if (st <= 0 || st == 404 || st == 405) continue;   // route absent → not real
                     live.add(req);
                     keep(rr, host);                                    // bridge to site map
                     scanLog.log("[AI Scanner]   -> SPEC " + st + "  " + method.toUpperCase()
-                            + " " + stripQuery(req.url()) + paramSuffix(req));
+                            + " " + Net.stripQuery(req.url()) + paramSuffix(req));
                 } catch (Exception ignore) { }
             }
         }
@@ -1565,7 +1573,7 @@ public final class EndpointDiscovery {
             String sys = "Convert this OpenAPI/Swagger YAML to COMPACT JSON. Output ONLY the JSON object with a "
                     + "top-level \"paths\" key mirroring the spec (each path -> method -> {parameters, requestBody}). "
                     + "Preserve parameter name/in and any example values and requestBody content-types/examples. No markdown.";
-            String raw = eng.chat(sys, y);
+            String raw = eng.chat(sys, y, "discovery: openapi-yaml");
             if (raw == null) return null;
             int s = raw.indexOf('{'), e = raw.lastIndexOf('}');
             if (s < 0 || e <= s) return null;
@@ -1689,7 +1697,7 @@ public final class EndpointDiscovery {
             if (!host.equalsIgnoreCase(hostOf(abs))) return null;
             if (STATIC.matcher(abs).matches() || abs.toLowerCase().contains(".js")) return null;
             if (AuthenticatedExplorer.SESSION_RESET.matcher(abs).matches()) return null;   // never login/logout
-            if (!seen.add("GET " + stripQuery(abs))) return null;
+            if (!seen.add("GET " + Net.stripQuery(abs))) return null;
             return resolveConfirm(host, abs, 2);
         } catch (Exception e) { return null; }
     }
@@ -1713,7 +1721,7 @@ public final class EndpointDiscovery {
             try {
                 String loc = java.net.URI.create(url).resolve(rr.response().headerValue("Location")).toString();
                 if (host.equalsIgnoreCase(hostOf(loc)) && !AuthenticatedExplorer.SESSION_RESET.matcher(loc).matches()
-                        && !stripQuery(loc).equalsIgnoreCase(stripQuery(url)))
+                        && !Net.stripQuery(loc).equalsIgnoreCase(Net.stripQuery(url)))
                     return resolveConfirm(host, loc, hops - 1);
             } catch (Exception ignore) { }
         }
@@ -1734,7 +1742,7 @@ public final class EndpointDiscovery {
                 String abs;
                 try { abs = java.net.URI.create(base).resolve(v).toString(); } catch (Exception e) { continue; }
                 if (!host.equalsIgnoreCase(hostOf(abs))) continue;
-                if (seen.contains("GET " + stripQuery(abs))) continue;
+                if (seen.contains("GET " + Net.stripQuery(abs))) continue;
                 queue.add(new String[]{abs, String.valueOf(depth)});
             }
         } catch (Exception ignore) { }
@@ -1865,7 +1873,7 @@ public final class EndpointDiscovery {
                 if (rr.response() == null) continue;
                 HttpRequest req = rr.request();
                 if (!"GET".equals(req.method()) || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
-                String path = stripQuery(req.url());
+                String path = Net.stripQuery(req.url());
                 if (!path.matches("(?i).*/(api|rest)/[A-Za-z].*")) continue;
                 List<String> keys = sampleKeys(rr.response().bodyToString());
                 if (keys.isEmpty()) continue;
@@ -1917,7 +1925,7 @@ public final class EndpointDiscovery {
                 if (rr.response() == null) continue;
                 HttpRequest req = rr.request();
                 if (!"GET".equals(req.method()) || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
-                String path = stripQuery(req.url());
+                String path = Net.stripQuery(req.url());
                 if (!path.matches("(?i).*/(api|rest)/[A-Za-z].*")) continue;
                 int st = rr.response().statusCode();
                 if (st >= 200 && st < 300) colls.putIfAbsent(path, rr.response().bodyToString());
@@ -1961,7 +1969,7 @@ public final class EndpointDiscovery {
                 // and emit spurious 500s. (e.g. Juice "Empty User Registration")
                 if (hasEmail && done.add("empty:" + coll)) {
                     if (!WriteGuard.allowsRegistration(coll, keys)) {
-                        scanLog.debug("[AI Scanner]   write-gate: skip empty-cred POST to non-registration sink " + stripQuery(coll));
+                        scanLog.debug("[AI Scanner]   write-gate: skip empty-cred POST to non-registration sink " + Net.stripQuery(coll));
                         continue;
                     }
                     JSONObject b = new JSONObject();
@@ -2048,7 +2056,7 @@ public final class EndpointDiscovery {
             HttpRequest w = withSessionCookie(HttpRequest.httpRequestFromUrl(coll).withMethod("POST")
                     .withAddedHeader("Content-Type", "application/json").withBody(body.toString()));
             int st = statusOf(probe(w));
-            scanLog.log("[AI Scanner]   exercise write [WRITE-tier] [" + what + "] POST " + stripQuery(coll) + " -> HTTP " + st);
+            scanLog.log("[AI Scanner]   exercise write [WRITE-tier] [" + what + "] POST " + Net.stripQuery(coll) + " -> HTTP " + st);
         } catch (Exception ignore) { }
     }
 
@@ -2194,7 +2202,7 @@ public final class EndpointDiscovery {
                             : URI.create(baseUrl).resolve(c.startsWith("/") ? c.substring(1) : c).toString();
                 } catch (Exception e) { continue; }
                 if (!host.equalsIgnoreCase(hostOf(abs))) continue;
-                if (!seen.add("POST " + stripQuery(abs) + " json")) continue;
+                if (!seen.add("POST " + Net.stripQuery(abs) + " json")) continue;
                 HttpRequest req = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
                         .withAddedHeader("Content-Type", "application/json")
                         .withBody("{\"email\":\"1\",\"password\":\"1\"}"));
@@ -2204,12 +2212,12 @@ public final class EndpointDiscovery {
                         || st == 400 || st == 401 || st == 403 || st == 422;
                 if (exists) {
                     out.add(req);
-                    scanLog.log("[AI Scanner] derived auth endpoint: POST " + stripQuery(abs) + " → HTTP " + st);
+                    scanLog.log("[AI Scanner] derived auth endpoint: POST " + Net.stripQuery(abs) + " → HTTP " + st);
                 }
             }
             StringBuilder us = new StringBuilder();
             java.util.LinkedHashSet<String> uu = new java.util.LinkedHashSet<>();
-            for (HttpRequest r : out) uu.add(stripQuery(r.url()));
+            for (HttpRequest r : out) uu.add(Net.stripQuery(r.url()));
             for (String u : uu) { if (us.length() > 0) us.append(", "); us.append(u); if (us.length() > 400) { us.append("…"); break; } }
             scanLog.log("[AI Scanner] auth discovery: " + out.size() + " candidate login request(s)"
                     + (uu.isEmpty() ? "." : ": " + us));
@@ -2235,7 +2243,7 @@ public final class EndpointDiscovery {
         if (path != null && POST_AUTH_PATH.matcher(path).matches() && !AUTH_VERB_PATH.matcher(path).matches()) return;
         String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
         String kind = ct != null && ct.toLowerCase().contains("json") ? "json" : "form";
-        if (seen.add(req.method() + " " + stripQuery(req.url()) + " " + kind)) out.add(req);
+        if (seen.add(req.method() + " " + Net.stripQuery(req.url()) + " " + kind)) out.add(req);
     }
 
     private static boolean hasPasswordLike(String params) {
@@ -2375,7 +2383,7 @@ public final class EndpointDiscovery {
                         + "  " + trunc(vb == null ? "" : vb.replaceAll("\\s+", " "), 140));
                 if (st >= 200 && st < 300) {
                     keep(rr, host);   // bridge for IdorGet/Bfla/ChainReplay/BodyMutator
-                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  POST " + stripQuery(abs)
+                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  POST " + Net.stripQuery(abs)
                             + "  [body reconstructed from server validation in " + i + " step(s)]");
                     return post;
                 }
@@ -2429,7 +2437,7 @@ public final class EndpointDiscovery {
                 int st = statusOf(rr);
                 if (st >= 200 && st < 300 && !isHtmlShell(rr)) {
                     keep(rr, host);
-                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + stripQuery(candidate) + "  [resolved under API base " + base + "]");
+                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + Net.stripQuery(candidate) + "  [resolved under API base " + base + "]");
                     return get;
                 }
                 if (st == 405 || st == 400 || st == 422) {   // real route, needs POST/body → reconstruct
@@ -2705,7 +2713,7 @@ public final class EndpointDiscovery {
                     || !lower.matches(".*\\.[a-z0-9]{1,5}($|\\?).*");
             if (!isJs && !isHtml) continue;
             if (isJs && LIBRARY_JS.matcher(lower).matches()) continue;   // skip libs
-            if (!seen.add(stripQuery(url))) continue;
+            if (!seen.add(Net.stripQuery(url))) continue;
             // A/B: legacy head-truncation when -Daiscanner.legacyMining=true, else the regex-anchored excerpt.
             byte[] rb = rr.response().body().getBytes();
             String magic = rb.length >= 2 ? String.format("%02x%02x", rb[0] & 0xFF, rb[1] & 0xFF) : "";
@@ -2769,7 +2777,7 @@ public final class EndpointDiscovery {
             try {
                 String su = URI.create(pageUrl).resolve(m.group(1)).toString();
                 if (host.equalsIgnoreCase(hostOf(su)) && !LIBRARY_JS.matcher(su.toLowerCase()).matches())
-                    out.add(stripQuery(su));
+                    out.add(Net.stripQuery(su));
             } catch (Exception ignore) { }
         }
     }
@@ -2819,12 +2827,7 @@ public final class EndpointDiscovery {
         });
         return sb.length() == 0 ? "" : "  [" + sb + "]";
     }
-    private static String stripQuery(String url) {
-        int i = url.indexOf('?'); return i < 0 ? url : url.substring(0, i);
-    }
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
     private static int statusOf(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().statusCode() : -1; }
         catch (Throwable t) { return -1; }

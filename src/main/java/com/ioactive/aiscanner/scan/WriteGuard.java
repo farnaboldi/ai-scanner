@@ -44,7 +44,7 @@ public final class WriteGuard {
      * than a missed one.
      */
     public static boolean allowsRegistration(String url, List<String> schemaKeys) {
-        return url != null && REGISTRATION_PATH.matcher(stripQuery(url)).matches();
+        return url != null && REGISTRATION_PATH.matcher(Net.stripQuery(url)).matches();
     }
 
     /** True when a state-changing exercise of this method is allowed to be sent unattended (never DESTRUCTIVE). */
@@ -52,8 +52,4 @@ public final class WriteGuard {
         return tier(method) != Tier.DESTRUCTIVE;
     }
 
-    private static String stripQuery(String u) {
-        int q = u.indexOf('?');
-        return q < 0 ? u : u.substring(0, q);
-    }
 }

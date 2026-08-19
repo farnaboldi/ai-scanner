@@ -7,7 +7,6 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
 import org.json.JSONObject;
 
-import java.net.URI;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -82,7 +81,7 @@ public final class UnauthAccessProbe {
                 // the public. Field NAMES and plain emails are NOT enough (public reviews/feedback/catalog carry
                 // those) — that heuristic caused a false-positive flood; requiring a secret VALUE is zero-FP.
                 if (!carriesSecretValue(bt)) continue;
-                if (!tried.add(method + " " + stripQuery(url))) continue;
+                if (!tried.add(method + " " + Net.stripQuery(url))) continue;
 
                 // re-send the SAME request WITHOUT any credential
                 HttpRequest anon = HttpRequest.httpRequestFromUrl(url).withMethod(method);
@@ -193,12 +192,6 @@ public final class UnauthAccessProbe {
         return st + ":body:" + String.join(" ", toks);
     }
 
-    private static String stripQuery(String url) {
-        int q = url.indexOf('?');
-        return q < 0 ? url : url.substring(0, q);
-    }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

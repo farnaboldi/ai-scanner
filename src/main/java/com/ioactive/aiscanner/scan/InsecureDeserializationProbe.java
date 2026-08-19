@@ -27,7 +27,6 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -109,7 +108,7 @@ public final class InsecureDeserializationProbe {
                         scanLog.found("Insecure deserialization — RCE-class, OOB-confirmed via cookie '" + name + "' (Java)",
                                 originOf(url),
                                 "PROOF (out-of-band, no container access): a URLDNS serialized object placed in cookie '"
-                                + name + "' and sent to " + stripQuery(url) + " made the SERVER resolve our unique domain "
+                                + name + "' and sent to " + Net.stripQuery(url) + " made the SERVER resolve our unique domain "
                                 + oob.domain + " (" + oob.type + " interaction on Burp Collaborator) DURING deserialization. "
                                 + "The server calls readObject() on attacker-controlled data AND performs network I/O from the "
                                 + "deserialized object graph — remote-code-execution-class (CWE-502); with a classpath gadget "
@@ -119,7 +118,7 @@ public final class InsecureDeserializationProbe {
                     } else {
                         scanLog.found("Insecure deserialization — server deserializes cookie '" + name + "' (" + fmt + ")",
                                 originOf(url),
-                                "PROOF (black-box, no container access): a request to " + stripQuery(url) + " returns HTTP "
+                                "PROOF (black-box, no container access): a request to " + Net.stripQuery(url) + " returns HTTP "
                                 + okSt + " with the app's own serialized " + fmt + " cookie '" + name + "', but HTTP " + badSt
                                 + " when ONLY that cookie's serialized object bytes are corrupted (same length/format). The "
                                 + "server therefore calls ObjectInputStream.readObject() (or the " + fmt + " equivalent) on "
@@ -151,14 +150,14 @@ public final class InsecureDeserializationProbe {
         if (candidates != null) for (HttpRequest r : candidates) {
             if (r == null || !"GET".equalsIgnoreCase(r.method())) continue;
             String u = r.url();
-            if (u != null && host.equalsIgnoreCase(hostOf(u)) && !SKIP.matcher(u).matches()) urls.add(stripQuery(u));
+            if (u != null && host.equalsIgnoreCase(hostOf(u)) && !SKIP.matcher(u).matches()) urls.add(Net.stripQuery(u));
         }
         try {
             for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                 if (urls.size() >= 25) break;
                 String u = rr.request() != null ? rr.request().url() : null;
                 if (u == null || !host.equalsIgnoreCase(hostOf(u)) || SKIP.matcher(u).matches()) continue;
-                if (rr.request().method() != null && rr.request().method().equalsIgnoreCase("GET")) urls.add(stripQuery(u));
+                if (rr.request().method() != null && rr.request().method().equalsIgnoreCase("GET")) urls.add(Net.stripQuery(u));
             }
         } catch (Throwable ignore) { }
         return new ArrayList<>(urls);
@@ -278,8 +277,7 @@ public final class InsecureDeserializationProbe {
         try { return Base64.getDecoder().decode(b); } catch (Throwable t) { return null; }
     }
 
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
+    private static String hostOf(String url) { return Net.authority(url); }
     private static String originOf(String url) {
         try { URI u = URI.create(url); return u.getScheme() + "://" + u.getAuthority() + "/"; } catch (Exception e) { return url; }
     }

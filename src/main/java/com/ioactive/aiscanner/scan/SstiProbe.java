@@ -11,7 +11,6 @@ import com.ioactive.aiscanner.scan.sast.SourceFindings;
 import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.util.function.UnaryOperator;
 
 /**
  * Deterministic Server-Side Template Injection (SSTI, CWE-1336) — the gap left by {@link CommandInjectionProbe},

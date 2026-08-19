@@ -76,6 +76,11 @@ public interface AiEngine {
     /** Raw one-shot call. Returns "" on failure. */
     String chat(String systemPrompt, String userPrompt);
 
+    /** As {@link #chat(String,String)} but with a short PURPOSE label (e.g. "discovery: mine-endpoints", "spa-nav",
+     *  "sast: sink", "auth: llm-login") logged alongside the call, so verbose/parallel logs say WHAT each llm-call is
+     *  for. Default engines ignore the label. */
+    default String chat(String systemPrompt, String userPrompt, String label) { return chat(systemPrompt, userPrompt); }
+
     /** The last transport/parse error, for surfacing in the UI. "" if the last call succeeded. */
     String lastError();
 

@@ -10,7 +10,6 @@ import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -123,7 +122,7 @@ public final class CsrfProbe {
         if (req == null || !"POST".equalsIgnoreCase(req.method())) return false;
         String url = req.url();
         if (!host.equalsIgnoreCase(hostOf(url)) || SKIP.matcher(url).matches() || AUTHY.matcher(url).find()) return false;
-        String key = stripQuery(url);
+        String key = Net.stripQuery(url);
         if (fired.contains(key)) return false;
 
         // cookie-authenticated, NOT header/bearer-authenticated (bearer auth is not CSRF-able)
@@ -228,6 +227,5 @@ public final class CsrfProbe {
     private static String headerValue(HttpRequest r, String n) { try { return r.hasHeader(n) ? r.headerValue(n) : null; } catch (Throwable t) { return null; } }
     private static String ctLower(HttpRequest r) { String c = headerValue(r, "Content-Type"); return c == null ? "" : c.toLowerCase(); }
     private static int status(HttpRequestResponse rr) { return rr != null && rr.response() != null ? rr.response().statusCode() : -1; }
-    private static String stripQuery(String u) { int q = u.indexOf('?'); return q < 0 ? u : u.substring(0, q); }
-    private static String hostOf(String u) { try { return URI.create(u).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String u) { return Net.authority(u); }
 }

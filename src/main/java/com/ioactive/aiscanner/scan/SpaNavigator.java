@@ -75,7 +75,7 @@ public final class SpaNavigator {
         int reached = 0;
         for (int round = 0; round < MAX_ROUNDS && reached < MAX_TOTAL; round++) {
             String out;
-            try { out = engine.chat(SYSTEM, buildUser(origin, appJs, vocab, observed, saturatedOps(opCount))); }
+            try { out = engine.chat(SYSTEM, buildUser(origin, appJs, vocab, observed, saturatedOps(opCount)), "spa-nav: plan"); }
             catch (Throwable t) { scanLog.debug("[AI Scanner] SPA-nav chat error: " + t); break; }
             List<Req> reqs = parseReqs(out);
             if (reqs.isEmpty()) break;
@@ -273,7 +273,7 @@ public final class SpaNavigator {
                     + "Enumerate the concrete .js module URLs it would request — resolve computed pieces to literal paths "
                     + "wherever the fragments are visible. Output ONLY a JSON array of url strings (absolute or "
                     + "root-relative), no prose.";
-            String resp = engine.chat(sys, "BASE: " + origin + "\n\nMODULE-LOADER JS:\n" + loaderJs);
+            String resp = engine.chat(sys, "BASE: " + origin + "\n\nMODULE-LOADER JS:\n" + loaderJs, "spa-nav: module-loader");
             if (resp == null) return out;
             Matcher m = Pattern.compile("[\"']([^\"']+?\\.js)(?:\\?[^\"']*)?[\"']").matcher(resp);
             LinkedHashSet<String> s = new LinkedHashSet<>();
@@ -304,7 +304,7 @@ public final class SpaNavigator {
         return h.startsWith("<!doctype") || h.startsWith("<html") || h.startsWith("<?xml") || h.contains("<head");
     }
     private static String canon(String url) {
-        try { URI u = URI.create(url); String p = u.getPath(); return (u.getHost() == null ? "" : u.getHost().toLowerCase()) + (p == null ? "" : p); }
+        try { URI u = URI.create(url); String p = u.getPath(); return Net.authority(url).toLowerCase() + (p == null ? "" : p); }
         catch (Throwable t) { return url; }
     }
 
@@ -533,13 +533,13 @@ public final class SpaNavigator {
         return origin == null ? null : origin + "/" + url.replaceAll("^/", "");
     }
     private boolean sameHost(String url, String host) {
-        try { return host.equalsIgnoreCase(URI.create(url).getHost()); } catch (Throwable t) { return false; }
+        try { return host.equalsIgnoreCase(Net.authority(url)); } catch (Throwable t) { return false; }
     }
     private static String originOf(String url) {
         try { URI u = URI.create(url); return u.getScheme() + "://" + u.getHost() + (u.getPort() > 0 ? ":" + u.getPort() : ""); }
         catch (Throwable t) { return null; }
     }
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Throwable t) { return null; } }
+    private static String hostOf(String url) { return Net.authority(url); }
     private String safeUrl(HttpRequest r) { try { return r == null ? null : r.url(); } catch (Throwable t) { return null; } }
     private static String clip(String s, int n) { return s == null ? "" : (s.length() <= n ? s : s.substring(0, n) + "…"); }
 

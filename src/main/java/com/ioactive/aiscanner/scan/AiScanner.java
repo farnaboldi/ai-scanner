@@ -58,6 +58,35 @@ public final class AiScanner {
     private final java.util.function.BooleanSupplier cancelled;  // true once the extension is unloaded
     /** host → local source-repo path (or null) — drives the optional SAST pass. null resolver = never. */
     private final java.util.function.Function<String, String> repoResolver;
+    // Per-scan report path. Set for PARALLEL scans so two concurrent AiScanner instances each write their own report
+    // instead of racing on the single global -Daiscanner.report property. null → fall back to the global property/env.
+    private volatile String reportPathOverride;
+    public void setReportPath(String p) { this.reportPathOverride = (p == null || p.isBlank()) ? null : p; }
+
+    // Per-instance self-shutdown gate. In a CONCURRENT run, exitOnComplete() (which falls back to the
+    // AISCANNER_EXIT_ON_COMPLETE env var, so clearing the system property alone does NOT disable it) would let the
+    // FIRST target to finish shut Burp down mid-scan and KILL the slower target's report (observed: WebGoat.NET
+    // finished, shut Burp down, VulnLab's report was never written). launchParallel disables self-exit on every
+    // parallel unit and shuts down CENTRALLY after ALL join. Default true → single-target/batch runs unchanged.
+    private volatile boolean selfExitAllowed = true;
+    public void setSelfExitAllowed(boolean b) { this.selfExitAllowed = b; }
+
+    // Concurrent CO-SCAN target authorities (host[:port]) to EXCLUDE from THIS scan. In a parallel two-target run
+    // (two AiScanner instances, one Burp), Burp's scope is ADDITIVE — api.scope().isInScope(url) is true for BOTH
+    // targets — so a site-map loop gated ONLY on isInScope() pulls the OTHER target's requests into THIS scan
+    // (observed: a localhost:9500 scan raising a SQLi finding on localhost:1337). We exclude ONLY the KNOWN
+    // co-target authorities (not "anything off-seed") so legit same-registrable-domain siblings a single scan SHOULD
+    // reach — e.g. api.example.com for a scan of example.com, added by discovery's sameSite scope — are NOT blocked.
+    // Empty in a single-target run → inScanHost() is always true (zero behaviour change). Port-aware via Net.authority.
+    private final java.util.Set<String> siblingTargets = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    public void addSiblingTarget(String url) { String a = Net.authority(url); if (a != null && !a.isEmpty()) siblingTargets.add(a); }
+    private boolean inScanHost(String url) { return !siblingTargets.contains(Net.authority(url)); }
+    private String reportPathBase() {
+        if (reportPathOverride != null) return reportPathOverride;
+        String path = System.getProperty("aiscanner.report");
+        if (path == null || path.isBlank()) path = System.getenv("AISCANNER_REPORT");
+        return path;
+    }
 
     /** User-requested stop (the Agent-tab Stop button). Volatile: set from the UI thread, polled by the scan
      *  thread via {@link #cancelled()}. Reset at the start of each scan so a prior Stop never kills a new run. */
@@ -367,7 +396,7 @@ public final class AiScanner {
             String body = t.bodyToString();
             String shape = (body != null && !body.isBlank() && body.length() < 200) ? " body=" + body
                     : " " + paramSummary(t);
-            scanLog.log("[AI Scanner]   • " + t.method() + " " + stripQuery(t.url()) + shape);
+            scanLog.log("[AI Scanner]   • " + t.method() + " " + Net.stripQuery(t.url()) + shape);
         }
 
         // DISCOVERY-ONLY: dump the reachable attack surface and STOP before the (slow) probes + Burp audit.
@@ -433,6 +462,9 @@ public final class AiScanner {
         attackActions.put("oauth", () -> {
             // OAuth authorization-server logic (redirect_uri validation → auth-code/token leak). Drives the
             // observed authorize flow with an off-origin sentinel redirect_uri; a leaked code/token to it = flaw.
+            // Re-auth first: Burp's crawl may have followed a /logout link and dropped the server-side session, which
+            // would bounce /authorize + the client registry to /login and silently zero this probe.
+            refreshSessionIfPossible("OAuth-logic");
             new OAuthLogicProbe(api, scanLog).probe(host, this::withSession);
         });
 
@@ -455,6 +487,7 @@ public final class AiScanner {
                 HttpRequest r = rr.request();
                 if (!"GET".equalsIgnoreCase(r.method()) || r.url().contains("?")) continue;
                 if (STATIC.matcher(pathOf(r)).matches()) continue;
+                if (!inScanHost(r.url())) continue;   // parallel isolation: don't mine the OTHER concurrent target's pages (scope is additive)
                 try { if (!api.scope().isInScope(r.url())) continue; } catch (Throwable ignore) { }
                 int st = rr.response().statusCode(); if (st < 200 || st >= 400) continue;
                 String ct = rr.response().headerValue("Content-Type");
@@ -462,7 +495,7 @@ public final class AiScanner {
                 // Normalize an extensionless path to a trailing slash: the crawler records the link "Less-1"
                 // without the slash, but appending ?id= to /Less-1 makes Apache 301-redirect to /Less-1/ and DROP
                 // the query — so the injected param never reaches the handler. /Less-1/ keeps it.
-                String u = stripQuery(r.url());
+                String u = Net.stripQuery(r.url());
                 String lastSeg = u.substring(u.lastIndexOf('/') + 1);
                 if (!u.endsWith("/") && !lastSeg.contains(".")) u = u + "/";
                 if (!minedPaths.add(u)) continue;
@@ -871,9 +904,9 @@ public final class AiScanner {
             for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                 HttpRequest req = rr.request();
                 if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
-                if (!AUTH_PAGE.matcher(stripQuery(req.url())).find()) continue;
+                if (!AUTH_PAGE.matcher(Net.stripQuery(req.url())).find()) continue;
                 if (!hasFuzzable(req)) continue;
-                if (!bseen.add(req.method() + " " + stripQuery(req.url()))) continue;
+                if (!bseen.add(req.method() + " " + Net.stripQuery(req.url()))) continue;
                 bsp.probe(req);
             }
             bsp.emitCollapsed();   // flush collected auth-page SQLi (else they'd be recorded but never emitted)
@@ -881,14 +914,37 @@ public final class AiScanner {
             scanLog.debug("[AI Scanner] auth-page blind-SQLi pass skipped: " + t);
         }
 
+        // Auth-page NoSQL AUTH-BYPASS ($ne/$gt Mongo operator injection in the JSON login body) — the HEADLINE
+        // vuln on Node/Mongo login endpoints (goof POST /login, secDevLabs/mongection POST /login). The login
+        // page is excluded from the main probe surface (SESSION_RESET, to avoid self-logout) and the BlindSqli
+        // pass above + Burp's native audit are SQL-only, so this NoSQL class had no home. NoSqlProbe.authBypassJson
+        // sends the login as JSON with a Mongo operator and confirms via the auth differential. Generic — any
+        // login-style POST; runs load-free at the end when the session no longer matters.
+        try {
+            NoSqlProbe nsp = new NoSqlProbe(api, scanLog);
+            if (session != null) nsp.setKnownUser(session.loginUser());
+            Set<String> nseen = new HashSet<>();
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                HttpRequest req = rr.request();
+                if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
+                if (!"POST".equalsIgnoreCase(req.method())) continue;
+                if (!AUTH_PAGE.matcher(Net.stripQuery(req.url())).find()) continue;
+                if (!nseen.add(Net.stripQuery(req.url()))) continue;
+                scanLog.log("[AI Scanner]   auth-page NoSQL: testing " + req.method() + " " + Net.stripQuery(req.url()));
+                try { nsp.probe(req); } catch (Throwable ignore) { }
+            }
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] auth-page NoSQL pass skipped: " + t);
+        }
+
         Set<String> seen = new HashSet<>();
         List<HttpRequest> auth = new ArrayList<>();
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
             HttpRequest req = rr.request();
             if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
-            if (!AuthenticatedExplorer.SESSION_RESET.matcher(stripQuery(req.url())).matches()) continue;
+            if (!AuthenticatedExplorer.SESSION_RESET.matcher(Net.stripQuery(req.url())).matches()) continue;
             if (!hasFuzzable(req)) continue;
-            StringBuilder key = new StringBuilder(req.method()).append(' ').append(stripQuery(req.url()));
+            StringBuilder key = new StringBuilder(req.method()).append(' ').append(Net.stripQuery(req.url()));
             for (ParsedHttpParameter p : fuzzableParams(req)) key.append('|').append(p.name());
             if (!seen.add(key.toString())) continue;
             auth.add(req);
@@ -906,7 +962,7 @@ public final class AiScanner {
                 audit.addRequest(r, ranges);
                 added++;
                 scanLog.log("[AI Scanner]   audit (auth page, separate) @ " + r.method() + " "
-                        + stripQuery(r.url()) + " → " + paramSummary(r));
+                        + Net.stripQuery(r.url()) + " → " + paramSummary(r));
             }
             if (added == 0) { audit.delete(); return null; }
             scanLog.log("[AI Scanner] submitted " + added + " login/signin request(s) to a SEPARATE audit "
@@ -942,7 +998,7 @@ public final class AiScanner {
             HttpRequest req = rr.request();
             if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
             if (STATIC.matcher(pathOf(req)).matches()) continue;
-            StringBuilder key = new StringBuilder(req.method()).append(' ').append(stripQuery(req.url()));
+            StringBuilder key = new StringBuilder(req.method()).append(' ').append(Net.stripQuery(req.url()));
             for (ParsedHttpParameter p : fuzzableParams(req)) key.append('|').append(p.name());
             if (!seen.add(key.toString())) continue;
             List<Range> ranges = fuzzableRanges(req);
@@ -1119,6 +1175,7 @@ public final class AiScanner {
      * log and let the caller/CI time out.
      */
     public void exitIfRequested() {
+        if (!selfExitAllowed) return;    // parallel unit: launchParallel owns the central shutdown after ALL join
         if (!exitOnComplete()) return;   // default: never triggers — normal GUI use is unaffected
         scanLog.log("[AI Scanner] exitOnComplete set — requesting a clean Burp shutdown so the CLI run can return.");
         try { Thread.sleep(1500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }  // let the final log/report flush
@@ -1253,8 +1310,7 @@ public final class AiScanner {
 
             for (String line : out) scanLog.log("[AI Scanner] " + line);
 
-            String path = System.getProperty("aiscanner.report");
-            if (path == null || path.isBlank()) path = System.getenv("AISCANNER_REPORT");
+            String path = reportPathBase();
             if (path != null && !path.isBlank()) {
                 String mp = path.replaceAll("\\.report\\.txt$", "").replaceAll("\\.txt$", "") + ".manual.txt";
                 try { java.nio.file.Files.write(java.nio.file.Path.of(mp), out); } catch (Throwable ignore) { }
@@ -1400,8 +1456,7 @@ public final class AiScanner {
     }
 
     private void writeReport() {
-        String path = System.getProperty("aiscanner.report");
-        if (path == null || path.isBlank()) path = System.getenv("AISCANNER_REPORT");
+        String path = reportPathBase();
         if (path == null || path.isBlank()) return;
         try {
             // Self-recording summary header so the report is self-contained for the benchmark harness: elapsed
@@ -1439,8 +1494,7 @@ public final class AiScanner {
     /** Write a report marking the cell as SKIPPED (no scan run), so the benchmark harness records the cell as a
      *  deliberate 0 with a machine-readable reason rather than a missing/errored file. */
     public void writeSkipReport(String reason) {
-        String path = System.getProperty("aiscanner.report");
-        if (path == null || path.isBlank()) path = System.getenv("AISCANNER_REPORT");
+        String path = reportPathBase();
         if (path == null || path.isBlank()) return;
         try {
             java.util.List<String> out = new java.util.ArrayList<>();
@@ -1478,20 +1532,39 @@ public final class AiScanner {
      * offsets of the app's own URL/body parameters (so it doesn't waste payloads on
      * headers/cookies/path). Applies the captured session cookie first.
      */
+    /** True when a STATE-CHANGING request targets the AUTHENTICATED user's OWN account (its own identity appears as a
+     *  path segment, e.g. POST /users/{ownIdentity}). Skipped so the audit can't change/reset/delete the very
+     *  credentials we logged in with — self-mutation (password/email/delete) bounces every later authenticated probe
+     *  to /login and silently zeroes the rest of the battery (observed on dvoauth: a fuzzed POST /users/koen set
+     *  password=test → the re-auth then failed). The SAME verbs against OTHER identities are NOT skipped — those are
+     *  the legitimate cross-user IDOR/BOLA writes (handled by the write-BOLA probe with a second identity). Generic:
+     *  keyed on the captured own identity, no app-specific path. */
+    private boolean mutatesOwnAccount(HttpRequest req) {
+        try {
+            if (session != null && session.mutatesOwnAccount(req.method(), pathOf(req))) {
+                scanLog.debug("[AI Scanner]   skip (would mutate our OWN account — keeps the session alive): "
+                        + req.method() + " " + pathOf(req));
+                return true;
+            }
+        } catch (Throwable t) { }
+        return false;
+    }
+
     private boolean addToAudit(Audit audit, HttpRequest req) {
         if (audit == null) return false;   // Community edition — no native audit
         if (STATIC.matcher(pathOf(req)).matches()) return false;
         if (NOISE.matcher(req.url()).matches()) {
-            scanLog.debug("[AI Scanner]   skip audit (transport/handshake noise): " + stripQuery(req.url()));
+            scanLog.debug("[AI Scanner]   skip audit (transport/handshake noise): " + Net.stripQuery(req.url()));
             return false;
         }
         // Never audit login/signin/logout: Burp firing payloads at them = login attempts that
         // invalidate our authenticated session mid-audit, making every /bank/* request bounce to
         // login. Those pages add no injection value (creds/cleartext already covered separately).
-        if (AuthenticatedExplorer.SESSION_RESET.matcher(stripQuery(req.url())).matches()) {
-            scanLog.debug("[AI Scanner]   skip audit (auth page, would drop session): " + stripQuery(req.url()));
+        if (AuthenticatedExplorer.SESSION_RESET.matcher(Net.stripQuery(req.url())).matches()) {
+            scanLog.debug("[AI Scanner]   skip audit (auth page, would drop session): " + Net.stripQuery(req.url()));
             return false;
         }
+        if (mutatesOwnAccount(req)) return false;
         HttpRequest base = withSession(req);
         boolean any = submitToAudit(audit, base, true);
         // Empty-valued params give Burp a zero-length insertion point whose appended
@@ -1514,7 +1587,7 @@ public final class AiScanner {
         if (ranges.isEmpty()) return false;
         audit.addRequest(finalReq, ranges);
         scanLog.addInsertionPoints(paramCount + extra);
-        scanLog.log("[AI Scanner]   audit @ " + finalReq.method() + " " + stripQuery(finalReq.url())
+        scanLog.log("[AI Scanner]   audit @ " + finalReq.method() + " " + Net.stripQuery(finalReq.url())
                 + " → " + paramSummary(finalReq)
                 + (extra > 0 ? " [+" + extra + " AI insertion point(s)]" : "")
                 + " (" + (paramCount + extra) + " point(s))");
@@ -1616,17 +1689,21 @@ public final class AiScanner {
         // it as a target would send attack payloads to a third party (scope violation + guaranteed false positive:
         // an external service's response varies by its own params, which fools differential oracles). Skip anything
         // Burp says is out of scope. Generic — respects whatever scope the operator/launcher set.
-        try { if (!api.scope().isInScope(req.url())) { scanLog.debug("[AI Scanner]   skip out-of-scope: " + stripQuery(req.url())); return false; } }
+        try { if (!api.scope().isInScope(req.url())) { scanLog.debug("[AI Scanner]   skip out-of-scope: " + Net.stripQuery(req.url())); return false; } }
         catch (Throwable ignore) { }
+        // Parallel isolation: Burp scope is ADDITIVE across concurrent scans, so isInScope() alone lets the OTHER
+        // target's requests in. Keep every audit target on THIS scan's own authority (no-op in single-target runs).
+        if (!inScanHost(req.url())) { scanLog.debug("[AI Scanner]   skip other-target host: " + Net.stripQuery(req.url())); return false; }
         // NEVER put login/logout/signin in the probe surface: a probe fuzzing them submits credentials / hits the
         // logout, which INVALIDATES our authenticated session mid-battery — every authenticated endpoint tested
         // afterwards then bounces to login (302) and its sink is missed (observed: reflected-XSS on Zero Bank's
         // /bank/* went from 5→0 in a full run because a prior probe fuzzed /signin.html and logged us out). Login
         // SQLi / weak-creds are covered separately by the auth phase + auditAuthPages() (run in isolation, after).
-        if (AuthenticatedExplorer.SESSION_RESET.matcher(stripQuery(req.url())).matches()) {
-            scanLog.debug("[AI Scanner]   skip auth page (would drop session if fuzzed): " + stripQuery(req.url()));
+        if (AuthenticatedExplorer.SESSION_RESET.matcher(Net.stripQuery(req.url())).matches()) {
+            scanLog.debug("[AI Scanner]   skip auth page (would drop session if fuzzed): " + Net.stripQuery(req.url()));
             return false;
         }
+        if (mutatesOwnAccount(req)) return false;
         if (STATIC.matcher(pathOf(req)).matches()) return false;
         if (!hasFuzzable(req)) return false;
         StringBuilder key = new StringBuilder(req.method()).append(' ').append(hostOf(req.url())).append(pathTemplate(req));
@@ -1647,7 +1724,7 @@ public final class AiScanner {
         if (seen.add(key.toString())) {
             targets.add(req);
             scanLog.scanned(req.url(), paramSummary(req));
-            scanLog.log("[AI Scanner]   found params @ " + req.method() + " " + stripQuery(req.url())
+            scanLog.log("[AI Scanner]   found params @ " + req.method() + " " + Net.stripQuery(req.url())
                     + " → " + paramSummary(req));
             return true;
         }
@@ -1740,18 +1817,6 @@ public final class AiScanner {
         // request signature" and every authenticated probe is wasted. No-op when no signing key was captured.
         if (session != null && session.hasSigningKey())
             r = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey()).sign(r);
-        return r;
-    }
-
-    /** As {@link #withSession} but authenticates as the SECOND identity B (for true cross-user access-control
-     *  differentials). Falls back to the request unchanged when no second identity was minted. */
-    private HttpRequest withSessionB(HttpRequest req) {
-        HttpRequest r = req;
-        if (session == null || !session.hasSecondIdentity()) return r;
-        if (!session.cookieHeaderB().isBlank()) r = r.withHeader("Cookie", session.cookieHeaderB());
-        if (session.hasBearerB()) r = r.withHeader("Authorization", "Bearer " + session.bearerB());
-        if (session.hasSigningKeyB())
-            r = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKeyB()).sign(r);
         return r;
     }
 
@@ -1866,7 +1931,7 @@ public final class AiScanner {
             String[] segs = req.pathWithoutQuery().split("/");
             for (int k = 0; k < segs.length; k++) if (ID_SEG.matcher(segs[k]).matches()) segs[k] = "{id}";
             return String.join("/", segs);
-        } catch (Throwable t) { return stripQuery(req.url()); }
+        } catch (Throwable t) { return Net.stripQuery(req.url()); }
     }
 
     /** Empty JSON string values ("k":"") give Burp a zero-length point; seed them to "1" (see seedEmptyParams). */
@@ -1984,9 +2049,6 @@ public final class AiScanner {
     private static String pathOf(HttpRequest req) {
         try { return req.pathWithoutQuery(); } catch (Exception e) { return req.url(); }
     }
-    private static String stripQuery(String url) {
-        int i = url.indexOf('?'); return i < 0 ? url : url.substring(0, i);
-    }
     /** scheme://authority (host[:port]) for {@code url}, or "" — the request's origin, used to key catch-all shells. */
     private static String originOf(String url) {
         try { URI u = URI.create(url); return u.getScheme() + "://" + u.getAuthority(); } catch (Exception e) { return ""; }
@@ -2016,9 +2078,7 @@ public final class AiScanner {
         return p[p.length - 2] + "." + p[p.length - 1];
     }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
     /** Full origin (scheme://authority incl. port) for {@code host} from the site map — lets a header-only OAST
      *  probe (Log4Shell) hit the root even when discovery surfaced no auditable parameter (targets list empty). */
     private String siteMapOrigin(String host) {
