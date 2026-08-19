@@ -26,6 +26,7 @@ public final class SettingsTab {
     private final JTextField urlField = new JTextField(34);
     private final JTextField modelField = new JTextField(34);
     private final JPasswordField keyField = new JPasswordField(34);
+    private final JToggleButton eyeBtn = new JToggleButton("👁");  // 👁
     private final JTextField tempField = new JTextField(6);
     private final JTextField maxTokField = new JTextField(6);
     private final JTextField timeoutField = new JTextField(6);
@@ -69,59 +70,50 @@ public final class SettingsTab {
     }
 
     // ---- Modules panel (right half): which scan modules run, reflecting -Daiscanner.only ----
-    // Filterable ATTACK probes, listed in their ACTUAL execution order in the probe battery (AiScanner.scanDiscovered).
-    // Keys match ScanLog.MODULE_ALIASES; only phases whose title contains "probe" are skippable, so these are exactly
-    // those. Unchecking one adds it to the skip set for the NEXT scan. (LLM) ones only run when an LLM engine is set.
-    private static final String[][] PROBE_MODULES = {
-        {"agentflow","Agent-flow (LLM)"}, {"llmfuzz","LLM-fuzz (LLM)"}, {"csrf","CSRF"}, {"redirect","Open-redirect"},
-        {"oauth","OAuth-logic"}, {"sqli","Blind SQLi"}, {"rxss","Reflected-XSS (context-aware breakout)"},
-        {"pathtrav","Path-reflection"}, {"nosql","NoSQL injection"}, {"cmdi","Command injection"},
-        {"chain","Create->consume chain (leak replay)"}, {"bodymut","Body-mutation"}, {"fileserve","File-serve bypass"},
-        {"idor","IDOR"}, {"bfla","BFLA"}, {"jwt","JWT analysis"}, {"unauth","Unauthenticated-access"},
-        {"webhook","Webhook fail-open"}, {"privparity","Privilege-parity"}, {"secrets","Response secret-exposure"},
-        {"graphql","GraphQL"}, {"deser","Insecure deserialization"}, {"xxe","Blind XXE (OOB)"},
-        {"saml","SAML SSO"}, {"verberr","Verbose-error / stack-trace"},
-        {"lfi","Path-traversal / LFI"}, {"ssrf","SSRF"}, {"tamper","Restriction-bypass / tampering"},
-        {"flow","Flow-engine (LLM, multi-step)"},
-    };
-    // Prerequisite lifecycle phases that ALWAYS run (not skippable) — shown checked + disabled, in execution order.
-    // BEFORE the attack modules: build the request surface + session.
-    private static final String[] PREREQ_BEFORE = {
-        "Native crawl", "Endpoint discovery (JS/OpenAPI mining)",
-        "Authentication (default-creds / register / SQLi-bypass)", "Authenticated explore + form-exercise",
-    };
-    // AFTER the attack modules: Burp's async native audit completes, then scoring.
-    private static final String[] PREREQ_AFTER = {
-        "Native Burp active audit", "Benchmark tally",
-    };
+    // The phase/module list lives in ONE place — com.ioactive.aiscanner.scan.ScanPhases — which this panel AND the
+    // status-bar step counter (ScanLog) both read, so there is no second list to drift out of sync (that drift is
+    // exactly what left "Source analysis (SAST)" showing as a step with no Modules entry). These counts derive from it.
+    /** Attack modules a full scan runs (the filterable probe battery). */
+    public static int attackModuleCount()  { return com.ioactive.aiscanner.scan.ScanPhases.attackCount(); }
+    /** Always-run lifecycle phases (pre-attack + post-attack). */
+    public static int lifecyclePhaseCount() { return com.ioactive.aiscanner.scan.ScanPhases.lifecycleCount(); }
+    /** Total phases a full run performs = pre-attack + attack + post-attack. */
+    public static int fullRunPhaseCount()  { return com.ioactive.aiscanner.scan.ScanPhases.totalPhases(); }
+
     private final java.util.Map<String, JCheckBox> moduleBoxes = new java.util.LinkedHashMap<>();
 
     private JComponent modulesPanel() {
         JPanel p = new JPanel();
         p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
-        JLabel title = new JLabel("Modules");
-        title.setFont(title.getFont().deriveFont(Font.BOLD, title.getFont().getSize() + 2f));
-        p.add(title);
+        // JLabel title = new JLabel("Modules");
+        // title.setFont(title.getFont().deriveFont(Font.BOLD, title.getFont().getSize() + 2f));
+        // p.add(title);
         // JLabel hint = new JLabel("Uncheck to skip on the scan");
         // hint.setForeground(Color.GRAY); p.add(hint); p.add(Box.createVerticalStrut(6));
 
-        // Laid out top-to-bottom in the ORDER they execute: setup phases → attack modules → wrap-up phases.
-        p.add(sectionLabel("Runs before the attack modules"));
-        for (String pr : PREREQ_BEFORE) p.add(prereqBox(pr));
+        // Laid out top-to-bottom in the ORDER they execute — ALL derived from the ONE registry (ScanPhases), so
+        // this panel, the progress total, and the status-bar step names can never drift apart.
+        java.util.Set<String> only = parseOnlyFilter();   // null → all run
+        p.add(sectionLabel("Pre-attack modules"));
+        for (com.ioactive.aiscanner.scan.ScanPhases.Phase ph : com.ioactive.aiscanner.scan.ScanPhases.ALL) {
+            if (ph.section == com.ioactive.aiscanner.scan.ScanPhases.Section.BEFORE) p.add(prereqBox(ph.label));
+        }
         p.add(Box.createVerticalStrut(8));
         p.add(sectionLabel("Attack modules"));
-        java.util.Set<String> only = parseOnlyFilter();   // null → all run
-        for (String[] m : PROBE_MODULES) {
-            boolean checked = only == null || only.contains(m[0]);
-            JCheckBox cb = new JCheckBox(m[1], checked);
-            moduleBoxes.put(m[0], cb);
+        for (com.ioactive.aiscanner.scan.ScanPhases.Phase ph : com.ioactive.aiscanner.scan.ScanPhases.ALL) {
+            if (!ph.isAttack()) continue;
+            boolean checked = only == null || only.contains(ph.key);
+            JCheckBox cb = new JCheckBox(ph.label, checked);
+            moduleBoxes.put(ph.key, cb);
             cb.addActionListener(e -> applyModuleSelection());
             p.add(cb);
         }
         p.add(Box.createVerticalStrut(8));
-        p.add(sectionLabel("Runs after the attack modules"));
-        for (String pr : PREREQ_AFTER) p.add(prereqBox(pr));
+        p.add(sectionLabel("Post-attack modules"));
+        for (com.ioactive.aiscanner.scan.ScanPhases.Phase ph : com.ioactive.aiscanner.scan.ScanPhases.ALL) {
+            if (ph.section == com.ioactive.aiscanner.scan.ScanPhases.Section.AFTER) p.add(prereqBox(ph.label));
+        }
         JScrollPane sp = new JScrollPane(p);
         sp.getVerticalScrollBar().setUnitIncrement(16);
         return sp;
@@ -224,7 +216,16 @@ public final class SettingsTab {
         header(g, y++, "Local LLM (OpenAI-compatible: vLLM / llama.cpp / Ollama / LM Studio)");
         row(g, y++, urlLabel, urlField);
         row(g, y++, modelLabel, modelField);
-        row(g, y++, keyLabel, keyField);
+        // API key field with eye-toggle button — panel keeps full column width via BorderLayout.
+        eyeBtn.setMargin(new Insets(0, 4, 0, 4));
+        eyeBtn.setToolTipText("Show / hide API key");
+        char defaultEcho = keyField.getEchoChar();
+        eyeBtn.addActionListener(e -> keyField.setEchoChar(eyeBtn.isSelected() ? (char) 0 : defaultEcho));
+        JPanel keyRow = new JPanel(new BorderLayout(2, 0));
+        keyRow.setOpaque(false);
+        keyRow.add(keyField, BorderLayout.CENTER);
+        keyRow.add(eyeBtn,   BorderLayout.EAST);
+        row(g, y++, keyLabel, keyRow);
         row(g, y++, new JLabel("Temperature:"), tempField);   // temperature applies to both providers
         row(g, y++, maxTokLabel, maxTokField);
         row(g, y++, timeoutLabel, timeoutField);
@@ -256,12 +257,14 @@ public final class SettingsTab {
                 System.setProperty("aiscanner.sastMode", String.valueOf(sastModeCombo.getSelectedItem())));
         row(g, y++, new JLabel("Source analysis mode:"), sastModeCombo);
 
-        JButton save = new JButton("Save");
-        save.addActionListener(e -> onSave());
+        // Auto-save: settings persist as soon as you change them — no Save button. Text fields commit on Enter or
+        // when focus leaves them (so a partial half-typed value isn't saved mid-keystroke); toggles/combos/radios
+        // commit immediately. onSave() persists to Burp's extension prefs (survives restart) + re-applies the engine.
+        wireAutoSave();
+
         JButton test = new JButton("Test connection");
         test.addActionListener(e -> onTest());
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        buttons.add(save);
         buttons.add(test);
         g.gridx = 1; g.gridy = y++; panel.add(buttons, g);
 
@@ -283,7 +286,7 @@ public final class SettingsTab {
     }
 
     private void setLocalEnabled(boolean en) {
-        for (JComponent cpt : new JComponent[]{urlField, modelField, keyField, tempField, maxTokField, timeoutField,
+        for (JComponent cpt : new JComponent[]{urlField, modelField, keyField, eyeBtn, tempField, maxTokField, timeoutField,
                 thinkBox, urlLabel, modelLabel, keyLabel, maxTokLabel, timeoutLabel}) {
             cpt.setEnabled(en);
         }
@@ -297,7 +300,8 @@ public final class SettingsTab {
             burpAiStatus.setForeground(new Color(0, 128, 0));
             String bal = null;
             try { bal = com.ioactive.aiscanner.engine.MontoyaAiEngine.readCreditBalance(); } catch (Throwable ignore) { }
-            burpAiStatus.setText("Burp AI: enabled ✓" + (bal == null || bal.isBlank() ? "" : "   (credits available: " + bal + ")"));
+            burpAiStatus.setText("Burp AI: enabled ✓" + (bal == null || bal.isBlank() ? "" : "   (credits available: "
+                    + com.ioactive.aiscanner.engine.MontoyaAiEngine.displayBalance(bal) + ")"));
         } else {
             burpAiStatus.setForeground(new Color(176, 96, 0));
             burpAiStatus.setText("Burp AI not enabled for this extension. Reload this extension (Extensions → right click on AI Scanner → Reload) and approve the usage of Burp AI");
@@ -317,6 +321,27 @@ public final class SettingsTab {
                 parseI(maxTokField.getText(), 512),
                 thinkBox.isSelected(),
                 parseI(timeoutField.getText(), 120));
+    }
+
+    /** Wire every setting to auto-persist on change so no Save button is needed. Text fields commit on Enter and on
+     *  focus-loss (NOT per keystroke — a half-typed URL/model shouldn't be applied mid-edit); checkboxes, combos and
+     *  the provider radios commit immediately. Each path calls {@link #onSave()} (persist to prefs + re-apply engine). */
+    private void wireAutoSave() {
+        java.awt.event.FocusAdapter onBlur = new java.awt.event.FocusAdapter() {
+            @Override public void focusLost(java.awt.event.FocusEvent e) { onSave(); }
+        };
+        for (JTextField f : new JTextField[]{urlField, modelField, keyField, tempField, maxTokField, timeoutField,
+                roundsField, payloadsField, delayField, concurrencyField}) {
+            f.addActionListener(e -> onSave());   // Enter commits
+            f.addFocusListener(onBlur);           // leaving the field commits
+        }
+        thinkBox.addActionListener(e -> onSave());
+        wafEvasionBox.addActionListener(e -> onSave());
+        logLevelCombo.addActionListener(e -> onSave());
+        sastModeCombo.addActionListener(e -> onSave());
+        burpAiRadio.addActionListener(e -> onSave());
+        localRadio.addActionListener(e -> onSave());
+        noAiRadio.addActionListener(e -> onSave());
     }
 
     private void onSave() {
@@ -361,7 +386,7 @@ public final class SettingsTab {
         try {
             String bal = com.ioactive.aiscanner.engine.MontoyaAiEngine.readCreditBalance();
             return (bal == null || bal.isBlank()) ? "   |   Burp AI credits: unknown (Burp hasn't synced a balance yet)"
-                    : "   |   Burp AI credits available: " + bal;
+                    : "   |   Burp AI credits available: " + com.ioactive.aiscanner.engine.MontoyaAiEngine.displayBalance(bal);
         } catch (Throwable t) { return ""; }
     }
 

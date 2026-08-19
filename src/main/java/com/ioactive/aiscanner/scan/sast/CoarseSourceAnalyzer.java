@@ -103,9 +103,11 @@ public final class CoarseSourceAnalyzer implements SourceAnalyzer {
         scanLog.log("[AI Scanner] SAST: scanned " + files[0] + " file(s), " + snips.size()
                 + " route/sink signal(s) → querying the model…");
 
+        String skills = SkillLibrary.promptExcerpt(root, 3500);
+        if (!skills.isBlank()) scanLog.debug("[AI Scanner] SAST: injected stack skill guidance (" + skills.length() + " chars).");
         String reply;
         try {
-            reply = engine.chat(systemPrompt(), userPrompt(host, snips));
+            reply = engine.chat(SkillLibrary.augment(systemPrompt(), skills), userPrompt(host, snips));
         } catch (Exception e) {
             scanLog.debug("[AI Scanner] SAST: model call failed: " + e);
             return SourceFindings.empty();

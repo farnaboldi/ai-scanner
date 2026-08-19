@@ -1074,8 +1074,56 @@ public final class EndpointDiscovery {
                     }
                 }
             }
+            // (4) TWO-STEP register -> login. APIs like VAmPI/crAPI create the account on a register endpoint that
+            //     returns NO token, then issue the token only on a SEPARATE login endpoint — the single-step loop
+            //     above can't bridge that. Pair a register-ish path with a login-ish one, register a fresh account,
+            //     then log in with the SAME registered handle (username=tag, NOT the email — VAmPI answers "Username
+            //     does not exist" for the email). Generic: unique nonce creds, spec password field, no app specifics.
+            Pattern REGISTERISH = Pattern.compile("(?i).*(register|signup|sign-?up|create).*");
+            String regPath = loginPaths.stream().filter(p -> REGISTERISH.matcher(p).find()).findFirst().orElse(null);
+            String logPath = loginPaths.stream().filter(p -> !REGISTERISH.matcher(p).find()).findFirst().orElse(null);
+            if (regPath != null && logPath != null && !regPath.equals(logPath)) {
+                long n = Math.abs(System.nanoTime());
+                String tag = "aisc" + Long.toString(n, 36), pass = "Aisc!" + (n % 100000) + "Zx", email = tag + "@example.com";
+                String[] rcf = credentialFieldNames(loginOps.get(regPath)), lcf = credentialFieldNames(loginOps.get(logPath));
+                String rpf = (rcf != null && rcf.length > 1 && rcf[1] != null) ? rcf[1] : "password";
+                String lpf = (lcf != null && lcf.length > 1 && lcf[1] != null) ? lcf[1] : "password";
+                String regUrl = root + (regPath.startsWith("/") ? regPath : "/" + regPath);
+                String logUrl = root + (logPath.startsWith("/") ? logPath : "/" + logPath);
+                try {
+                    probe(withSessionCookie(HttpRequest.httpRequestFromUrl(regUrl).withMethod("POST"))
+                            .withHeader("Content-Type", "application/json").withBody(superCreds(tag, email, pass, rpf)));
+                    HttpRequestResponse rr = probe(withSessionCookie(HttpRequest.httpRequestFromUrl(logUrl).withMethod("POST"))
+                            .withHeader("Content-Type", "application/json").withBody(superCreds(tag, email, pass, lpf)));
+                    if (rr != null && rr.response() != null && statusOf(rr) >= 200 && statusOf(rr) < 300) {
+                        String resp = rr.response().bodyToString();
+                        String tok = (resp != null && resp.trim().startsWith("{")) ? extractToken(new JSONObject(resp)) : null;
+                        if (tok == null) tok = bearerFromResponseHeaders(rr.response());
+                        if (tok != null) {
+                            apiAuthToken = tok; if (session != null) session.setBearer(tok);
+                            scanLog.log("[AI Scanner]   -> API AUTH: registered '" + tag + "' on " + regPath
+                                    + " -> logged in via " + logPath + " -> token adopted (register-then-login).");
+                            if (resp != null && resp.trim().startsWith("{")) checkWeakToken(new JSONObject(resp), tok, logUrl, rr);
+                            return;
+                        }
+                    }
+                } catch (Throwable t) { scanLog.debug("[AI Scanner]   -> API AUTH: two-step register-then-login error: " + t); }
+            }
             scanLog.log("[AI Scanner]   -> API AUTH: login candidate(s) tried but no token extracted (" + tries + " attempt(s)).");
         } catch (Throwable t) { scanLog.log("[AI Scanner] spec auth bootstrap error: " + t); }
+    }
+
+    /** Superset JSON credential body: the registered handle (tag) in every common identity field + email + the
+     *  spec's password field, so a lenient JSON register/login endpoint finds what it needs regardless of naming.
+     *  Log in with tag (username-keyed APIs reject the email); email is present for email-keyed apps. */
+    private static String superCreds(String tag, String email, String pass, String pf) {
+        StringBuilder b = new StringBuilder("{\"username\":\"").append(tag).append("\",\"user\":\"").append(tag)
+                .append("\",\"login\":\"").append(tag).append("\",\"name\":\"").append(tag)
+                .append("\",\"email\":\"").append(email).append("\",\"password\":\"").append(pass)
+                .append("\",\"passwordConfirm\":\"").append(pass).append("\",\"repeatPassword\":\"").append(pass).append("\"");
+        if (pf != null && !pf.isBlank() && !pf.equalsIgnoreCase("password"))
+            b.append(",\"").append(pf).append("\":\"").append(pass).append("\"");
+        return b.append("}").toString();
     }
 
     /** Resolve a schema object, following a {@code $ref} ({@code #/definitions/X} in Swagger 2.0 or

@@ -70,6 +70,11 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         }
         if (!Files.isDirectory(root)) return SourceFindings.empty();
 
+        // Stack-specific steering — detected-framework skills (when recognized) plus generic vuln attack-surface
+        // cues — injected into BOTH the map and sink prompts. Steering only; the deterministic oracle still decides.
+        String skills = SkillLibrary.promptExcerpt(root, 3500);
+        if (!skills.isBlank()) scanLog.debug("[AI Scanner] SAST(agentic): injected stack skill guidance (" + skills.length() + " chars).");
+
         // Index every code file by basename (for child resolution) and gather entry/dispatch snippets.
         Map<String, Path> byName = new LinkedHashMap<>();
         List<String> entrySnips = new ArrayList<>();
@@ -88,7 +93,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         // --- Step 1: map entry points + dispatch targets ---
         List<Entry> entries;
         try {
-            entries = parseEntries(engine.chat(MAP_SYS, mapUser(host, entrySnips)));
+            entries = parseEntries(engine.chat(SkillLibrary.augment(MAP_SYS, skills), mapUser(host, entrySnips)));
         } catch (Exception e) { return coarseFallback(host, repoPath, "step 1 error (" + e.getClass().getSimpleName() + ")"); }
         if (entries.isEmpty()) return coarseFallback(host, repoPath, "step 1 mapped no entry points (flat/non-routed app)");
 
@@ -108,7 +113,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         // --- Step 2: pin the real sink inside each child (or inline) ---
         List<StaticHint> hints;
         try {
-            hints = StaticHint.parseArray(engine.chat(SINK_SYS, sinkUser(entries, childSrc)));
+            hints = StaticHint.parseArray(engine.chat(SkillLibrary.augment(SINK_SYS, skills), sinkUser(entries, childSrc)));
         } catch (Exception e) { return coarseFallback(host, repoPath, "step 2 error (" + e.getClass().getSimpleName() + ")"); }
         if (hints.isEmpty()) return coarseFallback(host, repoPath, "step 2 produced no hints");
         // FLAT-APP MERGE: the two-step boundary-follow fits framework-routed / process-boundary apps, but a flat

@@ -31,9 +31,17 @@ public final class StaticHint {
     public final String sinkLocation;
     /** 0..1 model-estimated likelihood this param+class is genuinely exploitable. */
     public final double confidence;
+    /** Which deterministic oracle a probe should PREFER to prove this hint — a routing preference, NEVER a
+     *  verdict (the oracle still fires-or-fails). Explicit from the model when given, else derived from the
+     *  vuln class so the field is useful even without a prompt change. */
+    public final OracleMethod oracleMethod;
+
+    /** The deterministic-oracle families a source hint can steer a probe toward (see {@link #oracleMethod}). */
+    public enum OracleMethod { NONE, CROSS_USER_READ, PREDICATE_TOGGLE, TIME_DELAY, OOB_CALLBACK, REFLECT_CONTEXT }
 
     public StaticHint(String method, String path, List<String> params, String paramName,
-                      String vulnClass, String sinkType, String sinkLocation, double confidence) {
+                      String vulnClass, String sinkType, String sinkLocation, double confidence,
+                      String oracleMethod) {
         this.method = method == null ? "" : method.trim();
         this.path = path == null ? "" : path.trim();
         this.params = params == null ? new ArrayList<>() : params;
@@ -42,10 +50,13 @@ public final class StaticHint {
         this.sinkType = sinkType == null ? "" : sinkType.trim().toLowerCase();
         this.sinkLocation = sinkLocation == null ? "" : sinkLocation.trim();
         this.confidence = confidence < 0 ? 0 : (confidence > 1 ? 1 : confidence);
+        OracleMethod om = oracleFrom(oracleMethod);
+        this.oracleMethod = om != OracleMethod.NONE ? om : oracleFor(this.vulnClass);
     }
 
     public boolean hasEndpoint() { return !path.isBlank(); }
     public boolean hasParam() { return !paramName.isBlank(); }
+    public boolean hasOracleMethod() { return oracleMethod != OracleMethod.NONE; }
 
     /** EndpointDiscovery spec {@code METHOD<sep>path<sep>csv-params}; the caller passes its own delimiter. */
     public String toEndpointSpec(String sep) {
@@ -130,7 +141,8 @@ public final class StaticHint {
                 o.optString("vulnClass", o.optString("class", "")),
                 o.optString("sinkType", o.optString("sink", "")),
                 o.optString("sinkLocation", o.optString("location", "")),
-                o.optDouble("confidence", 0.5));
+                o.optDouble("confidence", 0.5),
+                o.optString("oracleMethod", o.optString("oracle", "")));
     }
 
     /** Extract the first {@code [ ... ]} array from a possibly-chatty model reply. */
@@ -157,5 +169,32 @@ public final class StaticHint {
         if (x.contains("openredirect") || x.contains("redirect")) return "Open redirect";
         if (x.contains("xss")) return "Cross-Site Scripting (Reflected)";
         return c.trim();
+    }
+
+    /** Tolerant parse of a loose model-emitted oracle-method string to the enum ("sleep-based" → TIME_DELAY). */
+    static OracleMethod oracleFrom(String s) {
+        if (s == null) return OracleMethod.NONE;
+        String x = s.toUpperCase().replaceAll("[^A-Z]", "");
+        if (x.isEmpty()) return OracleMethod.NONE;
+        if (x.contains("CROSSUSER") || x.contains("IDOR") || x.contains("BOLA") || (x.contains("USER") && x.contains("READ"))) return OracleMethod.CROSS_USER_READ;
+        if (x.contains("PREDICATE") || x.contains("BOOLEAN") || x.contains("TOGGLE") || x.contains("QUOTE")) return OracleMethod.PREDICATE_TOGGLE;
+        if (x.contains("TIME") || x.contains("SLEEP") || x.contains("DELAY")) return OracleMethod.TIME_DELAY;
+        if (x.contains("OOB") || x.contains("CALLBACK") || x.contains("COLLAB") || x.contains("OAST") || x.contains("OUTOFBAND")) return OracleMethod.OOB_CALLBACK;
+        if (x.contains("REFLECT") || x.contains("MARKER") || x.contains("CANARY") || x.contains("CONTEXT")) return OracleMethod.REFLECT_CONTEXT;
+        return OracleMethod.NONE;
+    }
+
+    /** Derive the natural deterministic oracle for a canonical vuln class when the model doesn't specify one. */
+    static OracleMethod oracleFor(String canonicalVuln) {
+        if (canonicalVuln == null) return OracleMethod.NONE;
+        String x = canonicalVuln.toLowerCase();
+        if (x.contains("sql injection") || x.contains("nosql")) return OracleMethod.PREDICATE_TOGGLE;
+        if (x.equals("idor") || x.equals("bfla")) return OracleMethod.CROSS_USER_READ;
+        if (x.contains("command inj")) return OracleMethod.TIME_DELAY;
+        if (x.equals("ssrf") || x.equals("xxe") || x.contains("deserial")) return OracleMethod.OOB_CALLBACK;
+        if (x.contains("cross-site") || x.contains("xss") || x.contains("open redirect")
+                || x.contains("path travers") || x.contains("lfi") || x.contains("file inclusion"))
+            return OracleMethod.REFLECT_CONTEXT;
+        return OracleMethod.NONE;
     }
 }

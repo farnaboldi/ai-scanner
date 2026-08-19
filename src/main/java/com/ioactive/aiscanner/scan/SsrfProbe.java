@@ -84,9 +84,59 @@ public final class SsrfProbe {
             }
         }
 
+        // (3) JSON BODY fields — a url/path/dispatch value inside a JSON body (e.g. {"theUrl":"page/Viewer/Search"})
+        // is NOT a Montoya parameter, so arms (1)/(2) never see it. A field whose NAME is url-ish (theUrl/redirectUrl/
+        // endpoint…) OR whose VALUE is an app-relative path / absolute URL is a dispatch/SSRF sink: inject a
+        // Collaborator URL and poll. The OAST oracle is zero-FP — it fires ONLY if the server actually fetches it
+        // (a pure internal-router that never egresses simply yields no callback). Generic — no app paths.
+        if (targets != null) {
+            for (HttpRequest req : targets) {
+                String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
+                String body = req.bodyToString();
+                if (body == null || body.indexOf('{') < 0) continue;
+                if (ct != null && !ct.isBlank() && !ct.toLowerCase().contains("json") && body.indexOf('"') < 0) continue;
+                java.util.regex.Matcher jm = JSON_STR.matcher(body);
+                java.util.LinkedHashSet<String> doneKeys = new java.util.LinkedHashSet<>();
+                while (jm.find()) {
+                    String key = jm.group(1), val = jm.group(2);
+                    if (!doneKeys.add(key)) continue;
+                    if (!(NAME_URLISH.matcher(key).find() || looksPathOrUrl(val))) continue;
+                    if (!seen.add(pathKey(req.url()) + "|json:" + key)) continue;
+                    fireJsonField(collab, tagToPoint, tagToRr, idx, req, body, key, withSession);
+                }
+            }
+        }
+
         if (tagToPoint.isEmpty()) return 0;
         scanLog.debug("[AI Scanner]   ssrf: fired " + tagToPoint.size() + " OAST payload(s); polling Collaborator…");
         return poll(collab, tagToPoint, tagToRr);
+    }
+
+    // A JSON "key":"value" string field; a url-ish field NAME (substring, so camelCase theUrl/redirectUrl match); and
+    // a value that looks like an app-relative path or absolute URL (the dispatch/SSRF surface inside a JSON body).
+    private static final java.util.regex.Pattern JSON_STR =
+            java.util.regex.Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"");
+    private static final java.util.regex.Pattern NAME_URLISH = java.util.regex.Pattern.compile(
+            "(?i)(url|uri|link|href|redirect|return|callback|webhook|proxy|fetch|endpoint|remote|\\bsite\\b|\\bpath\\b|dest|target)");
+    private static boolean looksPathOrUrl(String v) {
+        if (v == null || v.isEmpty() || v.length() > 200 || v.indexOf(' ') >= 0) return false;
+        return v.matches("(?i)^(https?://\\S+|//\\S+|/[\\w./%-]+|[\\w.-]+/[\\w./%-]+)$");
+    }
+
+    /** Inject a Collaborator URL into a JSON body field (by key) and send it — for a url/path dispatch sink. */
+    private void fireJsonField(CollaboratorClient collab, Map<String, String[]> tagToPoint, Map<String, HttpRequestResponse> tagToRr,
+                               int[] idx, HttpRequest req, String body, String key, UnaryOperator<HttpRequest> withSession) {
+        try {
+            String tag = "ssrf" + (idx[0]++);
+            CollaboratorPayload cp = collab.generatePayload(tag);
+            String payload = "http://" + cp.toString() + "/" + tag;
+            String mbody = body.replaceFirst(
+                    "(\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\")[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*(\")",
+                    "$1" + java.util.regex.Matcher.quoteReplacement(payload) + "$2");
+            HttpRequestResponse rr = send(req.withBody(mbody), withSession);
+            tagToPoint.put(tag, new String[]{ req.url(), key + " (JSON)" });
+            if (rr != null) tagToRr.put(tag, rr);
+        } catch (Throwable ignore) { }
     }
 
     private boolean isSsrfParam(String url, String name) {

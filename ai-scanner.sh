@@ -33,6 +33,10 @@ API_KEY="${AISCANNER_API_KEY:-}"
 # rejects disposable-email registration). The scanner POSTs these to the discovered login endpoint via Burp.
 LOGIN_EMAIL="${AISCANNER_LOGIN_EMAIL:-}"
 LOGIN_PASS="${AISCANNER_LOGIN_PASSWORD:-}"
+# Pre-seed an authenticated session (bypass the login) — paste a live browser Cookie header when the scanner
+# can't replicate the login (client-side-crypto login, SSO, MFA). AISCANNER_LANDING = the post-login entry URL.
+SEED_COOKIE="${AISCANNER_COOKIE:-}"
+SEED_LANDING="${AISCANNER_LANDING:-}"
 # Optional source repo (local path OR git URL) — drives SAST-assisted DAST. A URL is cloned HERE (shallow, temp)
 # and only a LOCAL PATH is handed to the extension, which reads files with java.nio and never clones/spawns.
 SOURCE_REPO="${AISCANNER_SOURCE_REPO:-}"
@@ -102,10 +106,20 @@ base, out, jar, proxy_port, projout = sys.argv[1], sys.argv[2], sys.argv[3], int
 cfg = json.load(open(base)) if base else {}
 uo = cfg.setdefault("user_options", {})
 ext = uo.setdefault("extender", {})
-ext["extensions"] = [{
+_ext_entry = {
     "errors": "console", "extension_file": jar, "extension_type": "java",
     "loaded": True, "name": "AI Scanner", "output": "console",
-}]
+}
+# Burp AI: the per-extension "Use AI" checkbox (Extensions → Installed) is OFF by default and is the sole gate
+# for Ai.isEnabled(). It's a persisted user setting with no documented CLI/config field, so — to enable Burp AI
+# in an automated (no-GUI-click) launch — pre-seed EVERY plausible key name for it on the extension entry.
+# Unknown keys are ignored by Burp, so this is harmless if none match; only active when a Burp-AI run is requested.
+import os as _os
+if _os.environ.get("AISCANNER_PROVIDER", "LOCAL_LLM") == "BURP_AI":
+    for _k in ("use_ai", "ai", "ai_enabled", "use_ai_features", "aiFeatures", "ai_features",
+               "use_ai_checkbox", "enable_ai", "ai_allowed"):
+        _ext_entry[_k] = True
+ext["extensions"] = [_ext_entry]
 ext.setdefault("settings", {})["automatically_reload_extensions_on_startup"] = True
 json.dump(cfg, open(out, "w"), indent=2)
 # Move Burp's proxy listener off the default 8080 so it can't collide with a target on host port 8080
@@ -229,6 +243,9 @@ fi
 # No external binaries (no Node/Playwright) — BApp-store compliant.
 exec "$JAVA" \
   "-Xmx${HEAP}" \
+  "-Xss${STACK:-16m}" \
+  -XX:-OmitStackTraceInFastThrow \
+  -XX:MaxJavaStackTraceDepth=1000000 \
   --add-opens=java.base/java.net=ALL-UNNAMED \
   "-Daiscanner.provider=${AISCANNER_PROVIDER:-LOCAL_LLM}" \
   "-Daiscanner.legacyMining=${AISCANNER_LEGACY_MINING:-false}" \
@@ -253,6 +270,8 @@ exec "$JAVA" \
   ${API_KEY:+-Daiscanner.apiKey="${API_KEY}"} \
   ${LOGIN_EMAIL:+-Daiscanner.loginEmail="${LOGIN_EMAIL}"} \
   ${LOGIN_PASS:+-Daiscanner.loginPassword="${LOGIN_PASS}"} \
+  ${SEED_COOKIE:+-Daiscanner.cookie="${SEED_COOKIE}"} \
+  ${SEED_LANDING:+-Daiscanner.landing="${SEED_LANDING}"} \
   ${REPORT_DIR:+-Daiscanner.reportDir="${REPORT_DIR}"} \
   ${SOURCE_REPO:+-Daiscanner.sourceRepo="${SOURCE_REPO}"} \
   "-Daiscanner.sastMode=${AISCANNER_SAST_MODE:-coarse}" \

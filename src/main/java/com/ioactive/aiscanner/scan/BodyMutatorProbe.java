@@ -41,7 +41,7 @@ public final class BodyMutatorProbe {
     private static final Pattern NUM_LIKE = Pattern.compile("(?i).*(rating|stars?|quant|amount|price|total|number|count|score|qty).*");
     private static final Pattern ID_LIKE = Pattern.compile("(?i).*(id|owner)$|.*(id|owner)[A-Z].*");
     // string field "key":"value"  and  numeric field "key":123
-    private static final Pattern STR_FIELD = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"(?:[^\"\\\\]|\\\\.)*\"");
+    private static final Pattern STR_FIELD = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"");
     private static final Pattern NUM_FIELD = Pattern.compile("\"([^\"]+)\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)");
 
     private static final AtomicInteger SEQ = new AtomicInteger();
@@ -97,7 +97,7 @@ public final class BodyMutatorProbe {
                 String k = sm.group(1);
                 boolean u = USER_LIKE.matcher(k).matches(), p = PASS_LIKE.matcher(k).matches();
                 if (u || p) {
-                    empt = empt.replaceFirst("(\"" + Pattern.quote(k) + "\"\\s*:\\s*)\"(?:[^\"\\\\]|\\\\.)*\"", "$1\"\"");
+                    empt = empt.replaceFirst("(\"" + Pattern.quote(k) + "\"\\s*:\\s*)\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"", "$1\"\"");
                     anyPass |= p;
                 }
             }
@@ -160,7 +160,7 @@ public final class BodyMutatorProbe {
     private static String stripPrivileges(String body) {
         String b = body;
         for (String k : PRIV_KEYS) {
-            b = b.replaceAll("(?i)\"" + Pattern.quote(k) + "\"\\s*:\\s*(\"(?:[^\"\\\\]|\\\\.)*\"|true|false|-?\\d+(?:\\.\\d+)?|null)\\s*,?", "");
+            b = b.replaceAll("(?i)\"" + Pattern.quote(k) + "\"\\s*:\\s*(\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"|true|false|-?\\d+(?:\\.\\d+)?|null)\\s*,?", "");
         }
         return b.replace("{,", "{").replace(",}", "}").replaceAll(",\\s*,", ",");
     }
@@ -172,7 +172,7 @@ public final class BodyMutatorProbe {
         while (sm.find()) {
             String k = sm.group(1);
             if (!USER_LIKE.matcher(k).matches()) continue;
-            Matcher vm = Pattern.compile("(\"" + Pattern.quote(k) + "\"\\s*:\\s*\")((?:[^\"\\\\]|\\\\.)*)(\")").matcher(body);
+            Matcher vm = Pattern.compile("(\"" + Pattern.quote(k) + "\"\\s*:\\s*\")([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)(\")").matcher(body);
             if (vm.find()) {
                 String old = vm.group(2);
                 int at = old.indexOf('@');

@@ -102,9 +102,29 @@ public final class LocalAiEngine extends PromptAiEngine {
                 logger.accept("[AI Scanner] LLM → " + u);
             }
             long t0 = System.currentTimeMillis();
-            String raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
-            LlmTiming.record(System.currentTimeMillis() - t0);   // benchmark speed column: time WAITING on the model
+            String raw;
+            try {
+                raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+            } catch (Exception transport) {
+                // Transport failure (hard-deadline hit / HTTP 0 / connection reset under load) — retry ONCE with a
+                // fresh seed so a single blip doesn't silently drop a discovery/payload call. If the retry also
+                // fails it propagates to the outer catch and we return "" as before.
+                body.put("seed", SEED_SEQ.incrementAndGet());
+                raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+            }
             String content = extractContent(raw);
+            // Retry ONCE on an empty reply. Thinking models (qwen/vLLM) intermittently return empty content even with
+            // enable_thinking=false (~1-in-4 observed) — a blank payload silently degrades fuzzing to a no-op. A fresh
+            // seed + a small temperature bump breaks the degenerate sample; the SAME exact request returns good content
+            // on retry. Only when we asked for a real answer (non-empty prompt) and got nothing back.
+            if (content.isBlank() && raw != null && !raw.isEmpty() && userPrompt != null && !userPrompt.isBlank()) {
+                body.put("seed", SEED_SEQ.incrementAndGet());
+                body.put("temperature", Math.min(1.0, cfg.temperature + 0.3));
+                String raw2 = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+                String c2 = extractContent(raw2);
+                if (!c2.isBlank()) { raw = raw2; content = c2; }
+            }
+            LlmTiming.record(System.currentTimeMillis() - t0);   // benchmark speed column: time WAITING on the model
             // Targeted per-call DEBUG (metadata only — NOT the request/response bodies, which are noise): seed +
             // sizes, so an empty/degenerate reply (the "round 2 parsed 0" mystery) is visible as resp=0 (transport
             // returned nothing) vs resp=NNN content=0 (a real reply we failed to parse). On with -Daiscanner.debug.

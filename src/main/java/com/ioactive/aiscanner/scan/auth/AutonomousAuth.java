@@ -1,6 +1,7 @@
 package com.ioactive.aiscanner.scan.auth;
 
 import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.engine.AiEngine;
@@ -324,9 +325,140 @@ public final class AutonomousAuth {
                 if (captureLoginToken(s, loginUrl, login, "(operator creds)")) return true;
             } catch (Throwable ignore) { }
         }
+        // JS-DRIVEN LOGIN FALLBACK: the endpoint may be right but need an app-specific request SHAPE the generic
+        // superset body can't produce (e.g. an ASP.NET page-method wanting {data:'{credentials:{@username,…}}'}).
+        // Have the model read the app's OWN login JS and construct the exact request(s). Generic — no per-app rule.
+        if (llmLoginFromJs(loginCandidates)) return true;
         scanLog.log("[AI Scanner] API auth: operator-supplied credentials did not authenticate (bad creds, MFA, or WAF).");
         return false;
     }
+
+    /**
+     * LLM-ASSISTED login for JS-DRIVEN logins (AJAX / ASP.NET page-method / custom request shapes) the deterministic
+     * superset-body login can't construct. The model reads the app's OWN login JavaScript and returns the exact HTTP
+     * request(s); we substitute the operator creds — kept OUT of the prompt via {@code {{USERNAME}}/{{PASSWORD}}}
+     * placeholders — then execute them in order, accumulating cookies, and capture the session. Generic: the model,
+     * not a per-app rule, derives the request shape. No-op without an engine or operator creds.
+     */
+    public boolean llmLoginFromJs(List<HttpRequest> loginCandidates) {
+        if (engine == null || !engine.isConfigured()) return false;
+        String user = arg("aiscanner.loginEmail", "AISCANNER_LOGIN_EMAIL");
+        String pass = arg("aiscanner.loginPassword", "AISCANNER_LOGIN_PASSWORD");
+        if (user == null || pass == null) return false;
+        String clientCode = gatherLoginClientCode(loginCandidates);
+        if (clientCode == null || clientCode.length() < 40) { scanLog.debug("[AI Scanner] LLM-login: no login client code to read."); return false; }
+        java.util.LinkedHashSet<String> eps = new java.util.LinkedHashSet<>();
+        if (loginCandidates != null) for (HttpRequest c : loginCandidates) { try { if (eps.size() < 12) eps.add(c.url()); } catch (Throwable ignore) {} }
+        String system = "You reverse-engineer a web app's client-side login code and output the EXACT HTTP request(s) "
+            + "needed to authenticate. Output ONLY a compact JSON array, nothing else: "
+            + "[{\"method\":\"POST\",\"url\":\"<url>\",\"contentType\":\"application/json\",\"body\":\"<verbatim body>\"}]. "
+            + "Preserve the EXACT parameter names, nesting, wrappers and constant values the JS builds (e.g. a `data` "
+            + "wrapper, @-prefixed keys, hardcoded language/GUID constants). Put the credentials where the JS puts them "
+            + "using the LITERAL placeholders {{USERNAME}} and {{PASSWORD}} (never invent real values). If login is "
+            + "multi-step (validate, then submit, etc.) include each step in order. URLs may be app-relative.";
+        String userPrompt = "BASE URL: " + baseOrigin(seedUrl) + "\nDiscovered login endpoints: " + eps
+            + "\n\nAPP LOGIN CLIENT CODE (login page HTML + its JavaScript):\n" + clientCode;
+        String out;
+        try { out = engine.chat(system, userPrompt); } catch (Throwable t) { scanLog.debug("[AI Scanner] LLM-login chat error: " + t); return false; }
+        org.json.JSONArray steps = parseLoginSteps(out);
+        if (steps == null || steps.length() == 0) { scanLog.debug("[AI Scanner] LLM-login: model returned no usable steps."); return false; }
+        scanLog.log("[AI Scanner] LLM-assisted login: model produced " + steps.length() + " request(s) from the login JS.");
+        AuthSession s = new AuthSession(api, host);
+        String landing = seedUrl;
+        for (int i = 0; i < steps.length(); i++) {
+            org.json.JSONObject st = steps.optJSONObject(i);
+            if (st == null) continue;
+            String url = absolutize(st.optString("url", ""));
+            if (url == null || url.isBlank()) continue;
+            String ct = st.optString("contentType", "application/json");
+            String body = st.optString("body", "").replace("{{USERNAME}}", user).replace("{{PASSWORD}}", pass);
+            try {
+                HttpRequestResponse r = ct.toLowerCase().contains("json") ? s.postJson(url, body) : s.postForm(url, body);
+                int code = r != null && r.response() != null ? r.response().statusCode() : -1;
+                scanLog.debug("[AI Scanner]   LLM-login step " + (i + 1) + "/" + steps.length() + " " + url + " → HTTP " + code);
+                String rb = bodyOf(r);
+                Matcher jm = JWT.matcher(rb == null ? "" : rb);
+                if (jm.find()) { session.setBearer(jm.group()); captureSigningKey(rb); }
+                // The login request's redirect-FOLLOWED final URL is the app's authenticated entry (a POST /login
+                // that 302s to e.g. /home/dashboard). Record it as the landing so the authenticated explorer seeds
+                // the REAL post-login page — the one carrying the app's navigation — not the raw seed, which for
+                // many MPAs is a bare/minimal home with no links to the feature surface. Skip login/error bounces.
+                String fu = r != null && r.request() != null ? r.request().url() : null;
+                if (fu != null && sameHost(fu) && !LANDING_SKIP.matcher(fu).find()
+                        && !fu.split("\\?")[0].equalsIgnoreCase(url.split("\\?")[0]))
+                    landing = fu;
+            } catch (Throwable ignore) { }
+        }
+        s.publishTo(session, landing, null, null, null);
+        // Success signal: a captured FORMS-AUTH / session-auth cookie or bearer is a deterministic app-session proof.
+        // (A JS-redirect login page like login.aspx keeps its hidden password form even when authenticated, so
+        // verifyAuthenticated against it false-negatives — the auth cookie is the reliable signal here.)
+        boolean authCookie = session.has() && AUTH_COOKIE.matcher(session.cookieHeader()).find();
+        if (authCookie || session.hasBearer() || verifyAuthenticated(s)) {
+            scanLog.log("[AI Scanner] LLM-assisted login SUCCEEDED — authenticated session captured"
+                + (session.has() ? " [cookie]" : "") + (session.hasBearer() ? " [bearer]" : "") + ".");
+            return true;
+        }
+        scanLog.log("[AI Scanner] LLM-assisted login did not authenticate (creds/2FA/shape).");
+        return false;
+    }
+
+    /** URL paths that are NOT a real post-login landing (login/logout/error bounces) — never seed the explorer here. */
+    private static final Pattern LANDING_SKIP = Pattern.compile(
+            "(?i)/(login|signin|sign-in|log-in|logout|signout|sign-out|sso|oauth|saml|error|denied|forbidden|unauthorized)(\\b|/|\\.|$)");
+
+    /** Cookie NAMES that denote a real authenticated app session (forms-auth / federation-issued app tokens), as
+     *  opposed to a bare session id or an SSO-redirect state cookie. Deterministic auth-success signal. */
+    private static final Pattern AUTH_COOKIE = Pattern.compile(
+            "(?i)(\\.ASPXFORMSAUTH|\\.ASPXAUTH|\\.AspNetCore\\.|\\.AspNet\\.ApplicationCookie|FedAuth|MSISAuth"
+          + "|auth[_-]?token|access[_-]?token|id[_-]?token|jwt|__Host-|__Secure-.*auth)");
+
+    /** Fetch the login page HTML + its login-related JavaScript (bounded) for the model to reverse-engineer. */
+    private String gatherLoginClientCode(List<HttpRequest> loginCandidates) {
+        try {
+            String pageUrl = seedUrl != null && !seedUrl.isBlank() ? seedUrl
+                    : (loginCandidates != null && !loginCandidates.isEmpty() ? loginCandidates.get(0).url() : null);
+            if (pageUrl == null) return null;
+            String basePage = pageUrl.replaceAll("(?i)(\\.aspx)/[A-Za-z].*$", "$1");   // login.aspx/submitLogin → login.aspx
+            String origin = baseOrigin(basePage);
+            StringBuilder sb = new StringBuilder();
+            String html = bodyOf(httpGet(basePage));
+            if (html == null) return null;
+            sb.append("== PAGE ").append(basePage).append(" ==\n").append(clip(html, 8000)).append("\n");
+            java.util.LinkedHashSet<String> jsRefs = new java.util.LinkedHashSet<>();
+            Matcher m = Pattern.compile("(?i)[\"']([a-z0-9._/-]*login[a-z0-9._/-]*\\.js)(?:\\?[^\"']*)?[\"']").matcher(html);
+            while (m.find() && jsRefs.size() < 4) jsRefs.add(m.group(1));
+            for (String j : jsRefs) {
+                String ju = j.startsWith("http") ? j : origin + "/" + j.replaceAll("^/", "");
+                String js = bodyOf(httpGet(ju));
+                if (js != null) sb.append("== JS ").append(j).append(" ==\n").append(clip(js, 20000)).append("\n");
+                if (sb.length() > 30000) break;
+            }
+            return sb.length() < 40 ? null : sb.toString();
+        } catch (Throwable t) { return null; }
+    }
+
+    private HttpRequestResponse httpGet(String url) {
+        try { return api.http().sendRequest(HttpRequest.httpRequestFromUrl(url).withMethod("GET"),
+                RequestOptions.requestOptions().withResponseTimeout(15000L)); } catch (Throwable t) { return null; }
+    }
+    private org.json.JSONArray parseLoginSteps(String out) {
+        if (out == null) return null;
+        try { int b = out.indexOf('['), e = out.lastIndexOf(']'); if (b >= 0 && e > b) return new org.json.JSONArray(out.substring(b, e + 1)); } catch (Throwable ignore) {}
+        try { org.json.JSONObject o = new org.json.JSONObject(out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1)); return o.optJSONArray("steps"); } catch (Throwable ignore) {}
+        return null;
+    }
+    private String absolutize(String url) {
+        if (url == null || url.isBlank()) return null;
+        if (url.toLowerCase().startsWith("http")) return url;
+        String origin = baseOrigin(seedUrl);
+        return origin == null ? url : origin + "/" + url.replaceAll("^/", "");
+    }
+    private static String baseOrigin(String url) {
+        try { URI u = URI.create(url); return u.getScheme() + "://" + u.getHost() + (u.getPort() > 0 ? ":" + u.getPort() : ""); }
+        catch (Throwable t) { return null; }
+    }
+    private static String clip(String s, int n) { return s == null ? "" : (s.length() <= n ? s : s.substring(0, n)); }
 
     /** Minimal JSON string escape for a single value built into a hand-assembled body. */
     private static String esc(String v) { return v == null ? "" : v.replace("\\", "\\\\").replace("\"", "\\\""); }
@@ -390,10 +522,12 @@ public final class AutonomousAuth {
         String signup = "{\"name\":\"" + tag + "\",\"username\":\"" + tag + "\",\"email\":\"" + email
                 + "\",\"number\":\"" + number + "\",\"phone\":\"" + number + "\",\"password\":\"" + pass
                 + "\",\"passwordConfirm\":\"" + pass + "\",\"repeatPassword\":\"" + pass + "\"}";
-        // Carry the registered NAME (tag) as well as the email: form-login apps often key on the account's
-        // name/handle (Spring usernameParameter), not its email — the form-encoded fallback tries each.
-        String login = "{\"email\":\"" + email + "\",\"username\":\"" + email + "\",\"name\":\"" + tag
-                + "\",\"password\":\"" + pass + "\"}";
+        // Log in with the REGISTERED HANDLE (tag) as username/user/login/name — the account was created with
+        // username=tag, so a username-keyed JSON API needs tag, NOT the email (VAmPI answers "Username does not
+        // exist" when sent the email). Keep email in the email field for email-login apps (crAPI). Superset body;
+        // lenient JSON login endpoints ignore the extra fields, and the form-encoded fallback tries each id too.
+        String login = "{\"username\":\"" + tag + "\",\"user\":\"" + tag + "\",\"login\":\"" + tag
+                + "\",\"name\":\"" + tag + "\",\"email\":\"" + email + "\",\"password\":\"" + pass + "\"}";
         if (box != null) scanLog.log("[AI Scanner] API sign-up using disposable mailbox " + email);
 
         Set<String> tried = new LinkedHashSet<>();
@@ -452,13 +586,13 @@ public final class AutonomousAuth {
                     // HTML-shell 200s so signupOk means a genuine handler ran.
                     boolean signupOk = sr != null && sr.response() != null
                             && sr.response().statusCode() < 400 && !looksHtmlShell(sr);
-                    if (captureLoginToken(s, loginUrl, login, signupUrl)) return true;   // maybe no verify needed
+                    if (captureLoginToken(s, loginUrl, login, signupUrl)) { session.setOwnIdentity(tag); return true; }   // maybe no verify needed
                     // Only wait for an emailed code if the signup endpoint actually ACCEPTED the request
                     // (2xx/3xx) — else a 404/405 sibling would make us block on the inbox for nothing.
                     if (box != null && signupOk) {
                         completeEmailVerification(s, box, signupUrl, email);   // captures the token from verify, if any
-                        if (session.authenticated()) return true;             // OTP-first flow: verify IS the auth
-                        if (captureLoginToken(s, loginUrl, login, signupUrl)) return true;   // else a separate login
+                        if (session.authenticated()) { session.setOwnIdentity(tag); return true; }             // OTP-first flow: verify IS the auth
+                        if (captureLoginToken(s, loginUrl, login, signupUrl)) { session.setOwnIdentity(tag); return true; }   // else a separate login
                         // Accepted but couldn't finalize: STOP. Re-POSTing signup on the next sibling "resends" a
                         // fresh code and invalidates the one we just used (a self-inflicted OTP race). One shot.
                         // This is the mailbox-delivery-failure case → worth trying the NEXT provider.
@@ -519,10 +653,19 @@ public final class AutonomousAuth {
             boolean stillLoginForm = body != null && PW_INPUT.matcher(body).find();
             if ((jsonResp || redirected) && !stillLoginForm) {
                 s.publishTo(session, seedUrl, null, null, null);
-                if (session.has()) {
-                    scanLog.log("[AI Scanner] API auth: registered + logged in via " + loginUrl + " → session cookie captured.");
+                // A bare session-TRACKING cookie (framework session ids like a servlet/session cookie, set pre-login)
+                // is NOT proof of auth. A self-service endpoint (e.g. a password-reset/request-access handler) can
+                // answer JSON + set such a cookie WITHOUT authenticating — accepting it poisons the session
+                // (session.has()==true) and short-circuits the REAL login, so the deep authenticated surface then
+                // bounces 401. Require a real auth signal, same as the LLM-login/form paths: a forms-auth/app-auth
+                // cookie (AUTH_COOKIE) OR reaching authenticated content.
+                boolean authCookie = session.has() && AUTH_COOKIE.matcher(session.cookieHeader()).find();
+                if (authCookie || verifyAuthenticated(s)) {
+                    scanLog.log("[AI Scanner] API auth: registered + logged in via " + loginUrl + " → authenticated session captured.");
                     return true;
                 }
+                scanLog.debug("[AI Scanner]   " + loginUrl + " returned JSON+cookie but no auth cookie and not authenticated"
+                        + " content — a session-tracking cookie, not a login; continuing to the real login.");
             }
         }
         int code = r != null && r.response() != null ? r.response().statusCode() : -1;
@@ -563,13 +706,20 @@ public final class AutonomousAuth {
                     int fc = code(fr);
                     String fb = bodyOf(fr);
                     boolean backOnLogin = fb != null && PW_INPUT.matcher(fb).find();   // failure → login page re-rendered
-                    if (fc >= 200 && fc < 400 && !backOnLogin && !s.cookieHeader().isBlank()) {
+                    // A 2xx/redirect + cookie is NOT proof of authentication: an SSO/federation endpoint (e.g. a SAML
+                    // /Saml2/SignIn that bounces to an external IdP) sets state cookies (esctx/stsservicecookie/Saml2…)
+                    // that are NOT an app session. REQUIRE that the captured session actually reaches authenticated
+                    // content (verifyAuthenticated) before accepting — otherwise we short-circuit the REAL login.
+                    if (fc >= 200 && fc < 400 && !backOnLogin && !s.cookieHeader().isBlank() && verifyAuthenticated(s)) {
                         s.publishTo(session, seedUrl, null, null, null);
                         if (session.has()) {
                             scanLog.log("[AI Scanner] API auth: logged in via " + loginUrl
-                                    + " (form-encoded) → session cookie captured.");
+                                    + " (form-encoded) → authenticated session captured.");
                             return true;
                         }
+                    } else if (fc >= 200 && fc < 400 && !s.cookieHeader().isBlank()) {
+                        scanLog.debug("[AI Scanner]   " + loginUrl + " returned a cookie but did NOT reach authenticated "
+                                + "content (SSO/federation redirect?) — not accepted; trying the real login.");
                     }
                 }
             }

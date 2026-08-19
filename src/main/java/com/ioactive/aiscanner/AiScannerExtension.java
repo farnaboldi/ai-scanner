@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 506;
+    public static final int BUILD = 595;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -118,6 +118,20 @@ public class AiScannerExtension implements BurpExtension {
             }
         });
         api.scanner().registerAuditIssueHandler(new AiTriage(scanLog, scanScope));
+        // Collect every WebSocket upgrade the crawl/proxied-browser opens so the CSWSH probe knows the app's real
+        // WS surface (WsObservations). Skip our OWN extension-initiated sockets (the probe's replays) to avoid a
+        // feedback loop. Pure Montoya websocket API — no external deps.
+        try {
+            api.websockets().registerWebSocketCreatedHandler(created -> {
+                try {
+                    if (created.toolSource() != null
+                            && created.toolSource().isFromTool(burp.api.montoya.core.ToolType.EXTENSIONS)) return;
+                    com.ioactive.aiscanner.scan.WsObservations.add(created.upgradeRequest());
+                } catch (Throwable ignore) { }
+            });
+        } catch (Throwable t) {
+            api.logging().logToOutput("[" + EXT_NAME + "] websocket-observation handler not registered: " + t);
+        }
         AiContextMenuProvider menuProvider = new AiContextMenuProvider(api, scanLog, session, scanner, scanScope,
                 this::repoForHost, this::setRepoForHost);
         api.userInterface().registerContextMenuItemsProvider(menuProvider);
@@ -213,6 +227,12 @@ public class AiScannerExtension implements BurpExtension {
         if (target != null) {
             final String[] targets = target.split("[\\s,]+");
             final String reportDir = launchArg("aiscanner.reportDir", "AISCANNER_REPORT_DIR");
+            // Pre-seed an authenticated session from a launch cookie (AISCANNER_COOKIE / -Daiscanner.cookie) — for apps
+            // whose login the scanner CANNOT replicate (client-side-crypto login, SSO, MFA): paste a live browser
+            // Cookie header and the scan runs authenticated with no login step. Optional AISCANNER_LANDING = the
+            // post-login entry URL the explorer should seed. Generic — no app-specific logic.
+            final String seedCookie = launchArg("aiscanner.cookie", "AISCANNER_COOKIE");
+            final String seedLanding = launchArg("aiscanner.landing", "AISCANNER_LANDING");
             final boolean batch = targets.length > 1;
             scanLog.log("[AI Scanner] auto-scan requested for " + targets.length + " target(s) — starting in ~5s…");
             new Thread(() -> {
@@ -230,6 +250,15 @@ public class AiScannerExtension implements BurpExtension {
                     // Per-target report file when a report DIR is given (batch) — else the single -Daiscanner.report.
                     if (reportDir != null && !reportDir.isBlank())
                         System.setProperty("aiscanner.report", reportDir.replaceAll("/+$", "") + "/" + reportFileName(url));
+                    // Seed the authenticated session (cookie in SessionStore + Burp's cookie jar so the native crawl is
+                    // authenticated too) BEFORE the scan starts, so the login flow is a no-op and the deep surface opens.
+                    if (seedCookie != null && !seedCookie.isBlank()) {
+                        session.set(seedCookie);
+                        session.setLandingUrl(seedLanding != null && !seedLanding.isBlank() ? seedLanding : url);
+                        seedCookieJar(seedCookie, url);
+                        scanLog.log("[AI Scanner] pre-seeded authenticated session from launch cookie — login skipped (names: "
+                                + seedCookie.replaceAll("=[^;]*", "=…") + ")");
+                    }
                     try { menuProvider.startScanAndWait(url); done++; }
                     catch (Throwable t) { scanLog.log("[AI Scanner] target failed (" + url + "): " + t + " — continuing."); }
                 }
@@ -266,6 +295,35 @@ public class AiScannerExtension implements BurpExtension {
         if (repoPath == null || repoPath.isBlank()) hostRepoMap.remove(h);
         else hostRepoMap.put(h, repoPath.trim());
         persist();
+    }
+
+    /** Populate Burp's cookie jar from a raw "n1=v1; n2=v2" Cookie header for {@code url}'s host, so the NATIVE
+     *  crawl/audit is authenticated (not just our own withSession requests). Best-effort; unparseable pairs skipped. */
+    private void seedCookieJar(String cookie, String url) {
+        try {
+            String host = java.net.URI.create(url).getHost();
+            if (host == null || host.isBlank()) {
+                scanLog.log("[AI Scanner] [warn] cookie-seed: no host in " + url + " — Burp's native crawl will NOT be authenticated.");
+                return;
+            }
+            int seeded = 0, attempted = 0;
+            for (String kv : cookie.split(";")) {
+                int eq = kv.indexOf('=');
+                if (eq <= 0) continue;
+                String n = kv.substring(0, eq).trim(), v = kv.substring(eq + 1).trim();
+                if (n.isEmpty()) continue;
+                attempted++;
+                try { api.http().cookieJar().setCookie(n, v, "/", host, java.time.ZonedDateTime.now().plusDays(1)); seeded++; }
+                catch (Throwable e) { scanLog.debug("[AI Scanner] cookie-seed: setCookie failed for " + n + ": " + e); }
+            }
+            // A silent failure here would leave OUR probes authenticated (SessionStore) but Burp's native crawl NOT —
+            // a partially-tested surface that masquerades as full auth. Surface it loudly instead of hiding it.
+            if (seeded == 0 && attempted > 0)
+                scanLog.log("[AI Scanner] [warn] cookie-seed: 0/" + attempted + " cookies reached Burp's jar — the native "
+                        + "crawl/audit will run UNAUTHENTICATED (our own probes are still authenticated via SessionStore).");
+        } catch (Throwable e) {
+            scanLog.log("[AI Scanner] [warn] cookie-seed: jar seeding failed (" + e + ") — Burp's native crawl may be unauthenticated.");
+        }
     }
 
     /** A launch parameter from a JVM system property, falling back to an env var. null if unset/blank. */

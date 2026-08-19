@@ -84,7 +84,12 @@ public final class BlindSqliProbe {
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
     // A JSON "key":"value" string field (value may contain escaped chars).
-    private static final Pattern JSON_STR = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+    private static final Pattern JSON_STR = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"");
+    // A JSON "key":<number> field (UNQUOTED numeric value). String-only harvesting skips these — but the classic
+    // NON-parameterizable SQLi sink is exactly here: an ORDER BY column/direction or a LIMIT/OFFSET spliced from a
+    // numeric grid field (sortorder/sortdir/offset/limit/page). We inject by quoting the value so a concat sink still
+    // receives our payload; a strict numeric parser just rejects it (clean miss — the differential oracle needs a real signal).
+    private static final Pattern JSON_NUM = Pattern.compile("\"([^\"]+)\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)(?=\\s*[,}\\]])");
 
     private SourceFindings sourceHints;   // optional SAST directives — used only to tag finding provenance
 
@@ -185,6 +190,18 @@ public final class BlindSqliProbe {
                     String cur = currentJsonValue(body, key);
                     if (runChannels(req, v -> req.withBody(setJsonString(body, key, v)),
                             key + " (JSON)", cur, seeds(cur), baseMs)) return true;
+                }
+                // Numeric JSON fields — the ORDER BY / LIMIT / paging sink that string-only harvesting misses (a grid's
+                // sortorder/sortdir/offset/limit can't be parameterized when concatenated into ORDER BY). Test each once.
+                Matcher mn = JSON_NUM.matcher(body);
+                Set<String> numKeys = new LinkedHashSet<>();
+                while (mn.find()) numKeys.add(mn.group(1));
+                numKeys.removeAll(keys);                       // don't double-test a key already handled as a string
+                for (String key : numKeys) {
+                    if (System.currentTimeMillis() > deadlineMs) return false;
+                    String cur = currentJsonNumber(body, key);
+                    if (runChannels(req, v -> req.withBody(setJsonNumber(body, key, v)),
+                            key + " (JSON#)", cur, seeds(cur), baseMs)) return true;
                 }
             }
 
@@ -342,7 +359,16 @@ public final class BlindSqliProbe {
             "quoted string not properly terminated", "sqlstate", "ora-00", "ora-01", "pg::syntaxerror",
             "psqlexception", "syntax error at or near", "sqlite3::", "sqlite error", "microsoft ole db provider",
             "odbc sql server driver", "supplied argument is not a valid mysql", "mysql_fetch", "mysql_num_rows",
-            "org.hibernate", "com.microsoft.sqlserver.jdbc" };
+            "org.hibernate", "com.microsoft.sqlserver.jdbc",
+            // MS SQL Server (T-SQL) — an ASP.NET/MSSQL app (like this one) emits these on a broken injection. Note
+            // "conversion failed when converting" is the CANONICAL tell for a string spliced into a NUMERIC context
+            // (our numeric-JSON ORDER BY/paging injection) — without it, a real numeric SQLi is triggered yet unmatched.
+            "conversion failed when converting", "incorrect syntax near", "must declare the scalar variable",
+            "the multi-part identifier could not be bound", "unclosed quotation mark after the character string",
+            "system.data.sqlclient.sqlexception", "microsoft sql native client" };
+            // NB dropped "invalid column name" (adversarial review): too generic — can appear in benign validation/
+            // help text, and an app with quote-type-differentiated errors could slip it past the parity gate. Also
+            // tightened "the multi-part identifier" → the full "…could not be bound" phrase to keep it MSSQL-specific.
 
     private static String newSqlError(String baseBody, String mutBody) {
         if (mutBody == null) return null;
@@ -451,13 +477,26 @@ public final class BlindSqliProbe {
     private static String setJsonString(String body, String key, String val) {
         String replacement = "$1" + Matcher.quoteReplacement(jsonEscape(val)) + "$2";
         return body.replaceFirst(
-                "(\"" + Pattern.quote(key) + "\"\\s*:\\s*\")(?:[^\"\\\\]|\\\\.)*(\")", replacement);
+                "(\"" + Pattern.quote(key) + "\"\\s*:\\s*\")[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*(\")", replacement);
     }
 
     private static String currentJsonValue(String body, String key) {
         Matcher m = Pattern.compile(
-                "\"" + Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(body);
+                "\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"").matcher(body);
         return m.find() ? jsonUnescape(m.group(1)) : "";
+    }
+
+    private static String currentJsonNumber(String body, String key) {
+        Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)").matcher(body);
+        return m.find() ? m.group(1) : "";
+    }
+
+    /** Replace a numeric field's UNQUOTED value with a QUOTED payload: {@code "sortorder":1} → {@code "sortorder":"<val>"}.
+     *  Reaches a string-concat ORDER BY/LIMIT sink; a strict numeric binder rejects it (no false positive). */
+    private static String setJsonNumber(String body, String key, String val) {
+        return body.replaceFirst(
+                "(\"" + Pattern.quote(key) + "\"\\s*:\\s*)(-?\\d+(?:\\.\\d+)?)",
+                "$1\"" + Matcher.quoteReplacement(jsonEscape(val)) + "\"");
     }
 
     private static String jsonEscape(String s) {
