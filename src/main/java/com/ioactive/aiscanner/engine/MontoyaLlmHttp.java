@@ -9,6 +9,11 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * {@link LlmHttp} backed by Burp's own networking (api.http()). Third-party LLM
@@ -19,6 +24,15 @@ import java.util.List;
 public final class MontoyaLlmHttp implements LlmHttp {
 
     private final MontoyaApi api;
+
+    // HARD client-side deadline for one LLM call. Montoya's withResponseTimeout does NOT bound a STALLED response body
+    // (headers arrive, then the stream stalls): observed a single call hang ~21 minutes under sustained load, freezing
+    // the whole scan and burning the audit/watchdog budget. We run the request on a daemon thread and abandon it past
+    // this deadline so the caller ALWAYS unblocks. Override with -Daiscanner.llmHardDeadlineMs.
+    private static final long HARD_DEADLINE_MS = Long.getLong("aiscanner.llmHardDeadlineMs", 180_000L);
+    private static final ExecutorService LLM_POOL = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "aiscanner-llm-http"); t.setDaemon(true); return t;   // daemon → a hung request never blocks JVM exit
+    });
 
     public MontoyaLlmHttp(MontoyaApi api) {
         this.api = api;
@@ -42,7 +56,21 @@ public final class MontoyaLlmHttp implements LlmHttp {
             }
         }
         RequestOptions opts = RequestOptions.requestOptions().withResponseTimeout(120000L);
-        HttpRequestResponse rr = api.http().sendRequest(req, opts);
+        // Enforce the HARD deadline: run on a daemon thread, abandon it (best-effort cancel) if it exceeds the bound.
+        // Montoya's own timeout can't be trusted for a stalled body, so this is the real guarantee the scan proceeds.
+        final HttpRequest fReq = req;
+        Future<HttpRequestResponse> fut = LLM_POOL.submit(() -> api.http().sendRequest(fReq, opts));
+        HttpRequestResponse rr;
+        try {
+            rr = fut.get(HARD_DEADLINE_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException te) {
+            fut.cancel(true);
+            throw new RuntimeException("LLM request exceeded hard deadline (" + (HARD_DEADLINE_MS / 1000) + "s) — abandoned (" + url + ")");
+        } catch (Exception e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new RuntimeException("LLM request failed: " + cause.getClass().getSimpleName()
+                    + (cause.getMessage() == null ? "" : ": " + cause.getMessage()) + " (" + url + ")");
+        }
         if (rr.response() == null) {
             throw new RuntimeException("No response from LLM endpoint (" + url + ")");
         }

@@ -92,12 +92,24 @@ public final class UnauthAccessProbe {
                 int anonSt = ar.response().statusCode();
                 if (anonSt < 200 || anonSt >= 300) continue;                                // properly denied → correct
                 if (shape(rr).equals(shape(ar))) {
+                    // Pinpoint WHICH secret + WHERE: name+redact it in the detail and HIGHLIGHT its bytes in the
+                    // response (a Burp response Marker) so the analyst sees it in a big body (e.g. /openapi.json).
+                    Secret sec = findSecret(ar.response().bodyToString());
+                    HttpRequestResponse ev = ar;
+                    String leaked = "";
+                    if (sec != null) {
+                        leaked = " Leaked secret — field \"" + sec.field + "\"=" + redact(sec.value) + " (highlighted in the response).";
+                        try {
+                            int off = ar.response().bodyOffset();
+                            ev = ar.withResponseMarkers(burp.api.montoya.core.Marker.marker(off + sec.start, off + sec.end));
+                        } catch (Throwable ignore) { }
+                    }
                     scanLog.found("Secret value served to an unauthenticated caller", url,
                             method + " returned a SECRET VALUE (token/key/password-hash/2FA-secret/JWT) with NO "
                                     + "credential (authed=" + baseSt + ", no-auth=" + anonSt + ", identical response "
                                     + "shape) — a secret is exposed to the anonymous public (sensitive-data exposure, "
                                     + "CWE-200/CWE-312). Deterministic: a high-entropy secret value present in the "
-                                    + "credential-less response.", ar);
+                                    + "credential-less response." + leaked, ev);
                     scanLog.incFinding();
                     hits++;
                 }
@@ -118,12 +130,28 @@ public final class UnauthAccessProbe {
     private static final Pattern JWT_VALUE = Pattern.compile("eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}");
 
     private static boolean carriesSecretValue(String body) {
-        if (body == null) return false;
+        return findSecret(body) != null;
+    }
+
+    /** The leaked secret + its position in the body (field name, value, and [start,end) offsets), or null. */
+    private static final class Secret {
+        final String field, value; final int start, end;
+        Secret(String field, String value, int start, int end) { this.field = field; this.value = value; this.start = start; this.end = end; }
+    }
+    private static Secret findSecret(String body) {
+        if (body == null) return null;
         java.util.regex.Matcher m = SECRET_VALUE.matcher(body);
-        while (m.find()) {
-            if (looksHighEntropy(m.group(2))) return true;
-        }
-        return JWT_VALUE.matcher(body).find();
+        while (m.find()) if (looksHighEntropy(m.group(2))) return new Secret(m.group(1), m.group(2), m.start(2), m.end(2));
+        java.util.regex.Matcher j = JWT_VALUE.matcher(body);
+        if (j.find()) return new Secret("JWT", j.group(), j.start(), j.end());
+        return null;
+    }
+
+    /** Redact a secret for the finding text: keep enough to identify it, never print the whole value. */
+    private static String redact(String v) {
+        if (v == null || v.isEmpty()) return "\"\"";
+        if (v.length() <= 12) return "\"" + v.charAt(0) + "…\" (" + v.length() + " chars, redacted)";
+        return "\"" + v.substring(0, 6) + "…" + v.substring(v.length() - 4) + "\" (" + v.length() + " chars, redacted)";
     }
 
     // A genuine secret value: >= 16 chars AND either long hex, or mixed letters+digits with no spaces

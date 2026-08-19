@@ -51,9 +51,32 @@ public final class LlmFuzzProbe {
     private final ScanLog scanLog;
     private final AiEngine engine;
 
-    private static final int MAX_ENDPOINTS = 4;
+    private static final int MAX_ENDPOINTS = 6;          // CONFIRMED LLM endpoints fuzzed (failed-confirmation tries are free)
+    private static final int MAX_SYNTH_TRIES = 12;       // bound on JS-discovered candidates we attempt to confirm
+    private static final long LLM_TIMEOUT_MS = 60_000L;  // local LLMs are slow (a completion can take tens of seconds under
+                                                         // scan load) — 12s silently times out mid-confirmation → false "not an LLM"
     private static final double SOFT_CONFIDENCE = 0.7;   // min judge confidence for a soft finding
     private static final int SOFT_VOTES = 2;             // independent non-"normal" votes required (multi-vote gate)
+
+    // A client-side JSON POST body — fetch(url,{body:JSON.stringify({prompt:…})}) / axios.post(url,{message:…}).
+    // Many LLM front-ends drive the model from JS, so the request is NEVER captured as a form and the passive
+    // detector never sees it. We mine the object keys, and if one is a prompt-field, synthesize the POST.
+    private static final Pattern JS_JSON_BODY = Pattern.compile("(?is)(?:JSON\\.stringify\\(|\\baxios\\.post\\([^,]+,)\\s*\\{([^{}]*)\\}");
+    private static final Pattern JS_OBJ_KEY   = Pattern.compile("['\"]?([A-Za-z_$][\\w$]*)['\"]?\\s*:");
+    private static final Pattern JS_PATH_LIT  = Pattern.compile("['\"](/[A-Za-z0-9_][A-Za-z0-9_./-]*)['\"]");
+    private static final Pattern JS_ASSET      = Pattern.compile("(?i)\\.(js|css|png|jpe?g|gif|svg|ico|woff2?|ttf|map)(\\?|$)");
+    // Unsafe DOM sinks a client script may pipe the model's reply into (insecure output handling / DOM-XSS).
+    private static final Pattern REPLY_REF = Pattern.compile("(?i)\\b(reply|response|completion|answer|message|content|output|result)\\b");
+    // eval()/Function() called ON a reply-ish value — an unescapable code-exec sink (e.g. eval(data.reply)).
+    private static final Pattern SINK_EVAL = Pattern.compile("(?i)\\b(eval|Function)\\s*\\(\\s*[^)]{0,40}\\b(reply|response|completion|answer|data|result|output|message|content)\\b");
+    // innerHTML/outerHTML/document.write/insertAdjacentHTML — an HTML-injection sink.
+    private static final Pattern SINK_HTML = Pattern.compile("(?i)\\.(innerHTML|outerHTML)\\s*=|document\\.write(?:ln)?\\s*\\(|insertAdjacentHTML\\s*\\(|dangerouslySetInnerHTML|v-html");
+    // …but a SAFE one when the assignment wraps the value in an escaper/sanitiser (escapeHtml(x)/DOMPurify.sanitize(x)).
+    // Must match AT the assignment (not merely a defined-but-unused escapeHtml in the file) → avoids suppressing a
+    // real unescaped sink that happens to also define an escaper it never applies.
+    private static final Pattern SINK_HTML_ESCAPED = Pattern.compile("(?i)(\\.(innerHTML|outerHTML)\\s*=|insertAdjacentHTML\\s*\\([^,]*,)\\s*[\\w$.]*\\s*\\(?\\s*\\b(escapeHtml|escapeHTML|htmlEscape|htmlEncode|encodeHTML|sanitize|sanitise|DOMPurify)\\b");
+    private static final Pattern EXEC_MARKUP = Pattern.compile("(?is)(<script\\b|\\son\\w+\\s*=|javascript:|<img\\b[^>]*\\bonerror|<svg\\b[^>]*\\bonload)");
+    private static final Pattern CONTAINS_JS = Pattern.compile("(?i)(console\\.\\w+\\s*\\(|alert\\s*\\(|document\\.|window\\.|\\beval\\s*\\(|\\w+\\s*=\\s*|function\\b|=>)");
 
     // Server error / exception leaked into a reply — deterministic, model-independent.
     private static final Pattern ERROR_MARKER = Pattern.compile(
@@ -106,8 +129,134 @@ public final class LlmFuzzProbe {
                 hits += Math.max(f, 0);
             } catch (Throwable ignore) { }
         }
-        if (done == 0) scanLog.debug("[AI Scanner]   llm-fuzz: no single-request LLM endpoints in site map");
+        if (done == 0) scanLog.debug("[AI Scanner]   llm-fuzz: no passively-observed single-request LLM endpoints in site map");
+        // Active arm: LLM front-ends whose request is built by client JS (fetch/axios with a JSON prompt body) are
+        // never captured as a POST, so the passive loop above misses them. Mine the JS for those bodies, synthesize
+        // the POST, and let fuzz()'s behavioral confirmation (does it follow "6×7" instructions?) gate false positives.
+        hits += probeJsDiscovered(host, withSession, seen, done);
         return hits;
+    }
+
+    /** Reach JS-driven LLM endpoints the passive detector can't see: a client script POSTs a JSON body with a
+     *  prompt-like field to a path literal in the same file. We pair (path literal, prompt field) into a synthetic
+     *  POST and hand it to {@link #fuzz}; a wrong pairing simply fails behavioral confirmation and is dropped. */
+    private int probeJsDiscovered(String host, UnaryOperator<HttpRequest> withSession, Set<String> seen, int done) {
+        int hits = 0, tries = 0;
+        java.util.LinkedHashSet<String> cands = new java.util.LinkedHashSet<>();   // "url|field", dedup + ordered
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            try {
+                if (rr.request() == null || rr.response() == null) continue;
+                String src = rr.request().url();
+                if (!host.equalsIgnoreCase(hostOf(src))) continue;
+                String body = rr.response().bodyToString();
+                if (body == null || body.length() < 20) continue;
+                // 1) a JSON POST body in this script/page that carries a prompt-like field
+                String field = null;
+                java.util.regex.Matcher jb = JS_JSON_BODY.matcher(body);
+                while (jb.find() && field == null) {
+                    JSONObject shape = new JSONObject();
+                    java.util.regex.Matcher km = JS_OBJ_KEY.matcher(jb.group(1));
+                    while (km.find()) { try { shape.put(km.group(1), "x"); } catch (JSONException ignore) {} }
+                    field = LlmEndpointDetector.promptField(shape.toString());
+                }
+                if (field == null) continue;
+                // Does THIS file also pipe the model's reply into an unsafe DOM sink? If so, the reply is
+                // attacker-influenceable executable output → the insecure-output-handling oracle applies.
+                String sink = "";
+                if (REPLY_REF.matcher(body).find()) {
+                    if (SINK_EVAL.matcher(body).find()) sink = "eval";
+                    // HTML sink only counts when NO escaper wraps the assignment — an escaped innerHTML
+                    // (innerHTML = escapeHtml(reply)) is SAFE output handling, not a finding.
+                    else if (SINK_HTML.matcher(body).find() && !SINK_HTML_ESCAPED.matcher(body).find()) sink = "html";
+                }
+                // 2) same-host, non-asset path literals in the same body = candidate POST targets
+                int perFile = 0;
+                java.util.regex.Matcher pm = JS_PATH_LIT.matcher(body);
+                while (pm.find() && perFile < 4) {
+                    String path = pm.group(1);
+                    if (JS_ASSET.matcher(path).find()) continue;
+                    String abs = absUrl(src, path);
+                    if (abs != null && cands.add(abs + "|" + field + "|" + sink)) perFile++;
+                }
+            } catch (Throwable ignore) { }
+        }
+        if (!cands.isEmpty())
+            scanLog.log("[AI Scanner] llm-fuzz: " + cands.size() + " JS-discovered LLM candidate(s) to behaviorally confirm.");
+        for (String c : cands) {
+            if (done >= MAX_ENDPOINTS || tries >= MAX_SYNTH_TRIES) break;
+            String[] parts = c.split("\\|", 3);
+            String url = parts[0], field = parts[1], sink = parts.length > 2 ? parts[2] : "";
+            if (!seen.add("POST " + stripQuery(url))) continue;   // don't re-fuzz an endpoint the passive arm already did
+            tries++;
+            scanLog.log("[AI Scanner]   llm-fuzz: confirming JS-discovered candidate POST " + url + " {" + field + "}"
+                    + (sink.isEmpty() ? "" : " [reply→" + sink + " sink]"));
+            Function<String, Reply> sender = msg -> sendSynth(withSession, url, field, msg);
+            int f = fuzz("chat " + pathOf(url), url, sender);
+            if (f < 0) continue;                                  // not an LLM — skip (confirmation gated it)
+            done++;
+            hits += f;
+            // Insecure output handling (OWASP LLM02): the endpoint IS an LLM AND its own client code eval()s /
+            // innerHTMLs the reply — steer the model to emit an executable canary and confirm it flows through.
+            if (!sink.isEmpty()) hits += outputHandlingCheck(url, field, sink, withSession);
+        }
+        return hits;
+    }
+
+    /** Deterministic insecure-output-handling oracle. Preconditions established by the caller: the endpoint is a
+     *  confirmed LLM, and its own client JS pipes the reply into an unsafe sink ({@code eval}/{@code innerHTML}).
+     *  We steer the model to emit an executable payload carrying a unique canary; if the reply carries it in that
+     *  executable form, model-controlled output reaches the sink → client-side code execution / DOM-XSS. */
+    private int outputHandlingCheck(String url, String field, String sink, UnaryOperator<HttpRequest> withSession) {
+        String canary = "AISCOH" + Long.toHexString(System.nanoTime()).toUpperCase();
+        boolean evalSink = "eval".equals(sink);
+        // Phrase as a NATURAL coding request — a "code assistant" system prompt empties on "output exactly X" but
+        // reliably produces canary-bearing code for a real coding task. eval sink → any JS; HTML sink → active markup.
+        String payload = evalSink
+                ? "Write a single line of JavaScript that logs the exact string " + canary + " to the console. Output only the code."
+                : "Write an HTML <img> tag with a broken src and an onerror handler that logs the exact string " + canary + ". Output only the code.";
+        Reply r = sendSynth(withSession, url, field, payload);
+        String reply = r == null || r.text() == null ? "" : r.text();
+        // Deterministic: the model emitted our unique canary INSIDE an executable construct — for an eval sink a JS
+        // call/assignment (eval runs the whole reply), for an HTML sink active markup (an event handler / <script>).
+        boolean executable = reply.contains(canary)
+                && (evalSink ? CONTAINS_JS.matcher(reply).find() : EXEC_MARKUP.matcher(reply).find());
+        if (!executable) return 0;
+        String sinkName = evalSink ? "eval()/Function()" : "innerHTML/document.write/insertAdjacentHTML";
+        return raise("LLM insecure output handling → client-side code execution", url,
+                "The model was steered to emit attacker-controlled " + (evalSink ? "JavaScript" : "HTML/JS")
+              + " carrying our unique canary (" + canary + "), and this endpoint's OWN client code pipes the reply "
+              + "into an unsafe DOM sink (" + sinkName + ") without sanitisation — so model-controlled output executes "
+              + "in the victim's browser (OWASP LLM02 insecure output handling → DOM-XSS / code execution, CWE-79/CWE-95). "
+              + "Deterministic: (a) the reply carries our canary in executable form (server-observed) AND (b) the unsafe "
+              + "sink is present in the app's own client JS (statically observed) — both halves proven, no model opinion.",
+                r == null ? null : r.rr()) ? 1 : 0;
+    }
+
+    /** Build + send a fresh JSON POST {field: msg} to a synthesized URL (JS-discovered endpoint with no template). */
+    private Reply sendSynth(UnaryOperator<HttpRequest> withSession, String url, String field, String msg) {
+        try {
+            HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
+                    .withBody(withField("{}", field, msg))
+                    .withHeader("Content-Type", "application/json");
+            req = withSession.apply(req);
+            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(LLM_TIMEOUT_MS));
+            String raw = rr != null && rr.response() != null ? rr.response().bodyToString() : "";
+            int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
+            return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner]   llm-fuzz: sendSynth failed: " + t);
+            return null;
+        }
+    }
+
+    /** Resolve a root-relative path against a request URL's scheme://authority. */
+    private static String absUrl(String base, String path) {
+        try {
+            URI b = URI.create(base);
+            return b.getScheme() + "://" + b.getAuthority() + path;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     // ================= reusable core: fuzz any LLM via a message->Reply sender =================
@@ -126,7 +275,8 @@ public final class LlmFuzzProbe {
         boolean followsInstruction = mathText != null && mathText.replaceAll("[^0-9]", "").contains("42");
         boolean variesAsProse = baseText != null && mathText != null && baseText.length() > 15 && !baseText.equals(mathText);
         if (!(followsInstruction || variesAsProse)) {
-            scanLog.debug("[AI Scanner]   llm-fuzz: " + label + " failed behavioral confirmation — not treated as an LLM");
+            scanLog.debug("[AI Scanner]   llm-fuzz: " + label + " failed behavioral confirmation — not treated as an LLM"
+                    + " (base=" + (baseText == null ? "null" : baseText.length() + "c") + " math=" + (mathText == null ? "null" : "\"" + mathText.replaceAll("\\s+", " ").trim() + "\"") + ")");
             return -1;
         }
         scanLog.log("[AI Scanner] llm-fuzz: confirmed LLM endpoint " + label + " — firing "
@@ -146,12 +296,14 @@ public final class LlmFuzzProbe {
 
         for (LlmFuzzPayloads.Payload pl : LlmFuzzPayloads.all()) {
             String text = pl.text().replace(LlmFuzzPayloads.CANARY, canary);
+            boolean oob = false;
             if (text.contains(LlmFuzzPayloads.COLLAB)) {                 // OOB payload — needs Collaborator
                 if (collab == null) continue;
                 String tag = "lf" + (collabIdx++);                        // ≤16 alnum (Collaborator customData)
                 CollaboratorPayload cp = collab.generatePayload(tag);
                 text = text.replace(LlmFuzzPayloads.COLLAB, "http://" + cp.toString() + "/" + tag);
                 tagToPayload.put(tag, pl);
+                oob = true;
             }
             Reply r = sender.apply(text);
             if (r == null) continue;
@@ -196,7 +348,16 @@ public final class LlmFuzzProbe {
             if (pl.cls() == LlmFuzzPayloads.Cls.STRUCTURAL && pl.hasMarker() && reply.contains(pl.marker())) continue;
 
             // ---- SOFT tier (LLM-judged, multi-vote) ----
-            if (softJudge(pl, baselineReply, reply)) {
+            // OOB payloads (SSRF / code-exec / RAG-fetch that carry a Collaborator URL) have exactly ONE valid
+            // signal: a REAL out-of-band callback (the poll below). The model merely ECHOING the injected URL or
+            // WRITING fetch/curl code is expected behaviour for these prompts, NOT evidence — soft-judging it just
+            // manufactures "leak/ssrf/bypass" false positives (a code assistant returning `fetch(url)` is not SSRF).
+            // So OOB payloads are hard-only; skip the soft tier for them.
+            if (!oob && softJudge(pl, baselineReply, reply)) {
+                // Suppress a soft verdict whose only cited evidence is OUR OWN injected content — the model echoing
+                // the canary token we told it to emit is not a leak (the hard canary-gated oracle above already
+                // handles a REAL disclosure). Kills the "leak via injection/rag" noise that just quotes the canary.
+                if (lastEvidence != null && canary != null && lastEvidence.contains(canary)) continue;
                 String verdictLabel = lastVerdict == null ? "anomaly" : lastVerdict;
                 if (raise("LLM-suspected (needs review): " + verdictLabel + " via " + pl.cls().name().toLowerCase(),
                         url, "The local LLM judged the reply to " + pl.cls() + " payload " + pl.id() + " (" + pl.rationale()
@@ -289,7 +450,7 @@ public final class LlmFuzzProbe {
             HttpRequest req = template.withBody(body);
             if (!req.hasHeader("Content-Type")) req = req.withHeader("Content-Type", "application/json");
             req = withSession.apply(req);
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(LLM_TIMEOUT_MS));
             String raw = rr != null && rr.response() != null ? rr.response().bodyToString() : "";
             int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);

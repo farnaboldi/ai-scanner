@@ -1,6 +1,7 @@
 package com.ioactive.aiscanner.scan.sast;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 
 /**
@@ -17,6 +18,18 @@ public final class SourceFindings {
     }
 
     public static SourceFindings empty() { return new SourceFindings(new ArrayList<>()); }
+
+    /** Union two hint sets, deduped by (method,path,param,class); {@code a} wins ties (e.g. LLM over harvested). */
+    public static SourceFindings combine(SourceFindings a, SourceFindings b) {
+        LinkedHashMap<String, StaticHint> m = new LinkedHashMap<>();
+        if (a != null) for (StaticHint h : a.all()) m.putIfAbsent(key(h), h);
+        if (b != null) for (StaticHint h : b.all()) m.putIfAbsent(key(h), h);
+        return new SourceFindings(new ArrayList<>(m.values()));
+    }
+
+    private static String key(StaticHint h) {
+        return (h.method + "|" + h.path + "|" + h.paramName + "|" + h.vulnClass).toLowerCase();
+    }
 
     public boolean isEmpty() { return hints.isEmpty(); }
     public int size() { return hints.size(); }

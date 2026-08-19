@@ -27,6 +27,20 @@ public final class ScanLog {
     private final JTextArea area = new JTextArea(14, 100);
     private final JLabel status = new JLabel(" ");
     private final JLabel phase = new JLabel(" ");
+    /** Progress bar: fraction of probe phases completed this scan run. Hidden when idle. */
+    private final JProgressBar probeProgress = new JProgressBar(0, 100);
+    /** Running count of phase() calls this scan — numerator for the progress bar. */
+    private final java.util.concurrent.atomic.AtomicInteger phaseSeen = new java.util.concurrent.atomic.AtomicInteger(0);
+    // Canonical phases (per ScanPhases) already counted this run — so re-entering a phase (a mid-scan re-auth) or a
+    // transient sub-status never advances the step number twice. One entry per distinct ScanPhases label.
+    private final java.util.Set<String> countedPhases = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private volatile int lastStep = 0;   // current step number = the active phase's position in ScanPhases
+    /** Best-known total for the progress bar. The first-run estimate is DERIVED from SettingsTab's module lists
+     *  (pre-attack + attack + post-attack) — the same lists that render the Settings→Modules checkboxes, so the
+     *  two can never disagree — and is then self-corrected to the actual phase() count at each scan end. */
+    private volatile int phasesTotal = SettingsTab.fullRunPhaseCount();
+    /** Panel holding the progress bar + (later) the chat row — occupies BorderLayout.SOUTH. */
+    private final JPanel southPanel = new JPanel(new BorderLayout());
     private final Consumer<String> mirror;
     private final AtomicInteger scanned = new AtomicInteger();
     private final AtomicInteger findings = new AtomicInteger();
@@ -59,11 +73,34 @@ public final class ScanLog {
     /** Enable/disable the Stop and Rescan buttons (scan start → true, scan end / clicked → false). EDT-safe. */
     public void setScanActive(boolean active) {
         this.scanActive = active;
-        if (active) { scanStartMillis = System.currentTimeMillis(); hostClassClaimed.clear(); }   // start clock + reset host gate
+        if (active) {
+            scanStartMillis = System.currentTimeMillis();
+            hostClassClaimed.clear();
+            // Estimate from the only= filter: lifecycle phases (always) + selected attack probes + post phases.
+            // 6 lifecycle-before + N attack + 3 post. If no filter, use phasesTotal from last scan (learned).
+            String flt = moduleFilter();
+            if (flt != null) {
+                long attack = com.ioactive.aiscanner.scan.ScanPhases.ALL.stream()
+                        .filter(p -> p.isAttack() && p.key != null && flt.contains(p.key)).count();
+                phasesTotal = (int) Math.max(SettingsTab.lifecyclePhaseCount() + attack, SettingsTab.lifecyclePhaseCount());  // floor = lifecycle-only run
+            }
+            // If flt == null (full run) keep phasesTotal from the previous scan — it's more accurate than any formula.
+            phaseSeen.set(0);
+            countedPhases.clear();
+            lastStep = 0;
+        } else {
+            // Scan ended: learn the real total so the next run has a better estimate.
+            int actual = phaseSeen.get();
+            if (actual > 0) phasesTotal = actual;
+        }
         javax.swing.SwingUtilities.invokeLater(() -> {
             if (stopBtn != null) stopBtn.setEnabled(active);
-            // Rescan is available only when idle and a previous target exists.
             if (rescanBtn != null) rescanBtn.setEnabled(!active && lastTarget != null);
+            probeProgress.setVisible(active || probeProgress.getValue() > 0);
+            if (active) { probeProgress.setValue(0); probeProgress.setString("Starting…"); }
+            else if (phaseSeen.get() > 0) {
+                probeProgress.setValue(100); probeProgress.setString("Complete ✓");
+            }
         });
     }
 
@@ -108,34 +145,8 @@ public final class ScanLog {
     /** Lifecycle/prerequisite phases that -Daiscanner.only NEVER skips — they set up the attack surface and
      *  session that every selected probe depends on. Listing "auth" in only= is informational only (it always runs).
      *  These appear in the log so the analyst can see what the scanner is doing even when using a narrow only= filter. */
-    private static boolean isLifecyclePhase(String title) {
-        String s = title.toLowerCase();
-        return s.contains("authenticating") || s.contains("automatic user registration") || s.contains("source analysis")
-            || s.startsWith("crawling") || s.contains("exploring") || s.contains("submitting") || s.contains("idle")
-            || s.contains("native baseline") || s.startsWith("auditing at") || s.contains("re-authenticat");
-    }
-    /** Short module names → a substring of the phase title, so `-Daiscanner.only=rxss,sqli,idor` is ergonomic.
-     *  Lifecycle phases (auth, crawl, discovery) appear here for visibility but are never skipped by the filter. */
-    private static final java.util.Map<String,String> MODULE_ALIASES = java.util.Map.ofEntries(
-            // ---- lifecycle (always run, listed for visibility only — isLifecyclePhase prevents skipping) ----
-            java.util.Map.entry("auth", "automatic user registration"),
-            // ---- attack probes (filterable) ----
-            java.util.Map.entry("rxss", "reflected-xss"), java.util.Map.entry("xss", "reflected-xss"),
-            java.util.Map.entry("sqli", "blind sqli"), java.util.Map.entry("cmdi", "command inject"),
-            java.util.Map.entry("idor", "idor"), java.util.Map.entry("ssrf", "ssrf"),
-            java.util.Map.entry("xxe", "xxe"), java.util.Map.entry("nosql", "nosql"),
-            java.util.Map.entry("bfla", "bfla"), java.util.Map.entry("jwt", "jwt"),
-            java.util.Map.entry("csrf", "csrf"), java.util.Map.entry("lfi", "lfi"),
-            java.util.Map.entry("graphql", "graphql"), java.util.Map.entry("deser", "deserial"),
-            java.util.Map.entry("redirect", "open-redirect"), java.util.Map.entry("oauth", "oauth"),
-            java.util.Map.entry("secrets", "secret-exposure"), java.util.Map.entry("webhook", "webhook"),
-            java.util.Map.entry("flow", "flow-engine"), java.util.Map.entry("chain", "chain"),
-            java.util.Map.entry("tamper", "tampering"), java.util.Map.entry("fileserve", "file-serve"),
-            java.util.Map.entry("bodymut", "body-mutation"), java.util.Map.entry("unauth", "unauthenticated"),
-            java.util.Map.entry("pathtrav", "path travers"), java.util.Map.entry("privparity", "privilege-parity"),
-            java.util.Map.entry("agentflow", "agent-flow"), java.util.Map.entry("llmfuzz", "llm-fuzz"),
-            java.util.Map.entry("saml", "saml"), java.util.Map.entry("verberr", "verbose-error"),
-            java.util.Map.entry("stacktrace", "verbose-error"));
+    // (Phase classification + the -Daiscanner.only= module filter now derive entirely from ScanPhases — the one
+    //  registry the Settings panel also reads — so there is no per-phase list to keep in sync here.)
     private volatile String currentPhase = "Idle";
     private volatile boolean filterAnnounced = false;   // -Daiscanner.only banner printed once per session
     public String currentPhase() { return currentPhase; }
@@ -218,6 +229,16 @@ public final class ScanLog {
         if (area.getCaret() instanceof javax.swing.text.DefaultCaret dc)
             dc.setUpdatePolicy(javax.swing.text.DefaultCaret.NEVER_UPDATE);
         panel.add(scroll, BorderLayout.CENTER);
+
+        // Progress bar — sits in the SOUTH panel above the chat row (added later by enableChat).
+        probeProgress.setStringPainted(true);
+        probeProgress.setString("Idle");
+        probeProgress.setVisible(false);   // hidden when no scan is running
+        JPanel progressWrap = new JPanel(new BorderLayout());
+        progressWrap.setBorder(BorderFactory.createEmptyBorder(2, 6, 0, 6));
+        progressWrap.add(probeProgress, BorderLayout.CENTER);
+        southPanel.add(progressWrap, BorderLayout.NORTH);
+        panel.add(southPanel, BorderLayout.SOUTH);
 
         // Cmd-F (mac) / Ctrl-F → focus the filter field
         int menuMask = Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx();
@@ -393,8 +414,8 @@ public final class ScanLog {
         };
         sendBtn.addActionListener(e -> go.run());
         chatInput.addActionListener(e -> go.run());
-        panel.add(row, BorderLayout.SOUTH);
-        panel.revalidate();
+        southPanel.add(row, BorderLayout.SOUTH);
+        southPanel.revalidate();
     }
 
     /** Turns a confirmed finding into a Burp AuditIssue so it shows on the dashboard (site map issues),
@@ -500,31 +521,27 @@ public final class ScanLog {
         return emittedFindings.add((familyKey(vulnClass) + "|" + pathKey(url)).toLowerCase());
     }
 
-    /** Set the current activity shown prominently in the panel (and echoed to the log). */
-    public void phase(String s) {
+    /** Set the current activity from a raw title (lifecycle phases emit these); classified against ScanPhases. */
+    public void phase(String s) { phaseInternal(s, com.ioactive.aiscanner.scan.ScanPhases.match(s == null ? "" : s)); }
+
+    /** Set the current activity from a ScanPhases entry — the data-driven attack battery calls THIS, so the phase
+     *  identity comes straight from the registry (no title string to drift, no match() to guess). */
+    public void phase(com.ioactive.aiscanner.scan.ScanPhases.Phase p) { phaseInternal(p == null ? "Idle" : p.label, p); }
+
+    private void phaseInternal(String s, com.ioactive.aiscanner.scan.ScanPhases.Phase cp) {
         // Single-point stop: every probe calls phase() first, so throwing here unwinds the current probe and the
         // whole remaining battery drains (each subsequent phase() throws again → body skipped) with no per-probe
         // checkpoint. Thrown only after the user hit Stop; a normal run never trips it.
         java.util.function.BooleanSupplier sc = stopCheck;
         if (sc != null && sc.getAsBoolean()) throw new ScanStopped();
         currentPhase = (s == null || s.isBlank()) ? "Idle" : s;
-        // Module selector for fast debugging: -Daiscanner.only=rxss,sqli runs ONLY the matching PROBE phases.
-        // Applies solely to probe phases (title contains "probe") so crawl/auth/discovery/audit prerequisites
-        // always run — and skipping the earlier probes means the selected one runs with a FRESHER session.
+        // Module selector for fast debugging: -Daiscanner.only=rxss,sqli runs ONLY the selected ATTACK phases;
+        // lifecycle phases (crawl/auth/discovery/audit) always run. Each attack probe is wrapped in its own
+        // try/catch(Throwable), so throwing PhaseSkipped skips just that phase and the battery drains on.
         String only = moduleFilter();
-        // Filter ONLY phases whose title contains "probe" — that is EXACTLY the set of probe phases each wrapped in
-        // its own try/catch(Throwable), so throwing PhaseSkipped skips just that phase. Non-"probe" phases (crawl,
-        // discovery, explore, re-auth, audit submit, and the few probes without "probe" in their title) are NOT
-        // individually caught, so a thrown skip there would abort the whole scan — never filter them.
-        if (only != null && currentPhase.toLowerCase().contains("probe") && !isLifecyclePhase(currentPhase)) {
-            String tl = currentPhase.toLowerCase();
+        if (only != null && cp != null && cp.isAttack() && cp.key != null) {
             boolean match = false;
-            for (String k : only.split(",")) {
-                String t = k.trim().toLowerCase();
-                if (t.isEmpty()) continue;
-                String needle = MODULE_ALIASES.getOrDefault(t, t);   // short alias → title substring
-                if (tl.contains(needle)) { match = true; break; }
-            }
+            for (String k : only.split(",")) { if (cp.key.equalsIgnoreCase(k.trim())) { match = true; break; } }
             if (!match) {
                 if (!filterAnnounced) {   // announce the active filter ONCE, then just mark each skip tersely
                     filterAnnounced = true;
@@ -536,6 +553,28 @@ public final class ScanLog {
         }
         log("[AI Scanner] ── " + currentPhase);
         updatePhase();
+        // The step NUMBER is the phase's position among the phases that ACTUALLY RUN under the active -Daiscanner.only
+        // filter, over the count of those phases — both derived from the ONE ScanPhases registry. With NO filter this
+        // equals the phase's absolute registry position, so the status-bar step still matches the Settings "Modules"
+        // panel row for row (no emission-order to sync). Under only= it is the ordinal within just the executed subset
+        // (e.g. cswsh → 8/11, not its absolute 40/44). A transient sub-status (cp == null) keeps the step, refreshes text.
+        if (cp != null) {
+            lastStep = com.ioactive.aiscanner.scan.ScanPhases.filteredPosition(cp, only);
+            // Track distinct phases entered so the scan-end block can flip the bar to "Complete ✓" (it gates on
+            // phaseSeen>0) and learn the real phase count. The DISPLAYED step is filteredPosition above, not this.
+            if (countedPhases.add(String.valueOf(com.ioactive.aiscanner.scan.ScanPhases.position(cp)))) phaseSeen.incrementAndGet();
+        }
+        int done = lastStep;
+        int total = com.ioactive.aiscanner.scan.ScanPhases.filteredTotal(only);
+        int pct = total > 0 ? Math.min(100, done * 100 / total) : 0;
+        String label = done + "/" + total + " — " + (cp != null ? cp.label : currentPhase);
+        if (label.length() > 60) label = label.substring(0, 57) + "…";
+        final String barLabel = label;
+        javax.swing.SwingUtilities.invokeLater(() -> {
+            probeProgress.setValue(pct);
+            probeProgress.setString(barLabel);
+            probeProgress.setVisible(true);
+        });
     }
 
     public void clear() {

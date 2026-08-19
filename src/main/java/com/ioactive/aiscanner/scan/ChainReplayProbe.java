@@ -134,7 +134,7 @@ public final class ChainReplayProbe {
     /** Same JSON shape, all field VALUES replaced with fixed dummies — isolates value-dependence. */
     private static String controlRecord(String json) {
         if (json == null || json.isEmpty()) return "";
-        String c = Pattern.compile("(\"[^\"]+\"\\s*:\\s*\")(?:[^\"\\\\]|\\\\.)*\"")
+        String c = Pattern.compile("(\"[^\"]+\"\\s*:\\s*\")[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"")
                 .matcher(json).replaceAll(m -> m.group(1) + "AiscCtrlZ9\"");   // string values
         c = Pattern.compile("(\"[^\"]+\"\\s*:\\s*)-?\\d+(?:\\.\\d+)?")
                 .matcher(c).replaceAll(m -> m.group(1) + "424242");            // numeric values

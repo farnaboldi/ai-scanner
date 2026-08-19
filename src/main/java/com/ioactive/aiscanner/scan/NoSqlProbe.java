@@ -123,14 +123,14 @@ public final class NoSqlProbe {
                         + " (baseline HTTP " + baseStatus + ", " + baseLen + "b) body="
                         + (body != null && body.length() > 120 ? body.substring(0, 120) + "…" : body));
                 // Mutate ANY JSON field's value (string, null, bool) to a Mongo operator object.
-                Matcher vm = Pattern.compile("\"([^\"]+)\"\\s*:\\s*(\"(?:[^\"\\\\]|\\\\.)*\"|null|true|false)").matcher(body);
+                Matcher vm = Pattern.compile("\"([^\"]+)\"\\s*:\\s*(\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"|null|true|false)").matcher(body);
                 while (vm.find()) {
                     String key = vm.group(1);
                     if (IDENTITY_FIELD.matcher(key).find()) continue;   // don't object-ify an identity field → crash-safe
                     // NOTE: the replacement contains "$ne" — the '$' MUST be quoted, else replaceFirst reads
                     // it as an (illegal) group reference and throws, which silently killed this whole probe.
                     String mutated = body.replaceFirst(
-                            "(\"" + Pattern.quote(key) + "\"\\s*:\\s*)(\"(?:[^\"\\\\]|\\\\.)*\"|null|true|false)",
+                            "(\"" + Pattern.quote(key) + "\"\\s*:\\s*)(\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"|null|true|false)",
                             "$1" + Matcher.quoteReplacement("{\"$ne\":null}"));
                     if (mutated.equals(body)) continue;
                     if (hit(base, baseLen, baseStatus, send(req.withBody(mutated)), req.url(), key + " (JSON $ne)")) return true;

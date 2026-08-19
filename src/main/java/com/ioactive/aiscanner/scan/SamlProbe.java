@@ -636,21 +636,22 @@ public final class SamlProbe {
             if (cn == null || !isSelfSigned(b64Der)) continue;
             if (!TEST_CERT_CN.matcher(cn).find()) continue;
             String authRequestNote = s.authnRequestsSigned
-                    ? " The SP is configured to sign outbound authentication requests with this key "
-                      + "(AuthnRequestsSigned=\"true\"), meaning forged signed requests can be submitted "
-                      + "to the IdP claiming to be this service provider."
+                    ? " The SP signs outbound authentication requests with this key (AuthnRequestsSigned=\"true\"), so"
+                      + " its request signatures can be forged; whether the IdP acts on a forged signed request"
+                      + " depends on the IdP verifying SP signatures."
                     : "";
             scanLog.found("SAML signing key is a self-signed test certificate", s.metadataUrl(),
                     "The SP metadata contains a self-signed certificate (CN=\"" + cn + "\") whose name "
                     + "indicates it is a library-shipped test or demo credential. Such certificates and their "
                     + "private keys are typically distributed publicly with the SAML library (source repository, "
-                    + "package registry), making the private key effectively public."
+                    + "package registry), making the private key effectively public (CWE-321: Use of Hard-coded "
+                    + "Cryptographic Key)."
                     + authRequestNote
-                    + " Consequences: (1) SP impersonation — signed authentication requests can be forged; "
-                    + "(2) assertion decryption if the same keypair covers the encryption slot; "
-                    + "(3) XML Signature Wrapping attacks without any key-cracking "
-                    + "(CWE-321: Use of Hard-coded Cryptographic Key). "
-                    + "Replace with a fresh, environment-specific keypair.",
+                    + " Concrete impact of the public private key: (1) forgery of anything the SP itself signs with "
+                    + "it (metadata, AuthnRequest/LogoutRequest) — request-integrity tampering, not a user login by "
+                    + "itself; (2) decryption of any assertion encrypted to this key if the same keypair covers the "
+                    + "encryption slot. This is demonstrated at the key-material/config layer (end-to-end acceptance "
+                    + "of a forged message was not proven here). Replace with a fresh, environment-specific keypair.",
                     false, s.metadataRr);
             scanLog.incFinding();
             return true;

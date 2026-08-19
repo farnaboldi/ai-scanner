@@ -99,6 +99,12 @@ public final class GraphqlProbe {
                     hits++;
                 }
             }
+
+            // (3) request AMPLIFICATION via aliasing / array-batching — one request triggers N operations with no
+            // query-cost/complexity or per-operation rate limit → auth-throttle bypass (batched credential brute-
+            // force) + DoS (CWE-770). Non-destructive (benign __typename); zero-FP (N results for ONE request).
+            hits += amplificationTest(url);
+
             scanLog.log("[AI Scanner] graphql probe: " + hits + " finding(s) over " + tested + " resolver(s) with a string arg.");
             return hits;
         } catch (Throwable t) {
@@ -209,6 +215,71 @@ public final class GraphqlProbe {
     }
 
     // ---- helpers ----
+    // ---- request amplification (aliasing / array batching) ----
+    /** One HTTP request → N GraphQL operations. A server returning ~N results for one request enforces no
+     *  query-complexity/cost or per-operation rate limit (CWE-770): an attacker aliases a login/OTP resolver to
+     *  bypass auth throttling (batched brute-force) or an expensive resolver for DoS. Non-destructive (benign
+     *  __typename), zero-FP (only a server that actually executed N ops can return N results). */
+    private int amplificationTest(String url) {
+        final int N = 100;
+        StringBuilder q = new StringBuilder("{");
+        for (int i = 0; i < N; i++) q.append("a").append(i).append(":__typename ");
+        q.append("}");
+        HttpRequestResponse ar = send(url, new JSONObject().put("query", q.toString()).toString());
+        int aliased = aliasCount(ar);
+        if (aliased >= N / 2) {
+            scanLog.found("GraphQL request amplification — no query-cost/rate limit (aliasing)", url,
+                    "One request carrying " + N + " aliased operations returned " + aliased + " results — the endpoint "
+                  + "enforces no query-complexity/cost or per-operation rate limit, so a single request multiplies work "
+                  + "N-fold. An attacker aliases a login/OTP resolver to bypass auth throttling (batched credential brute-"
+                  + "force) or an expensive resolver for denial of service (CWE-770). Deterministic: " + aliased
+                  + " results returned for ONE request.", ar);
+            return 1;
+        }
+        final int B = 25;
+        StringBuilder batch = new StringBuilder("[");
+        for (int i = 0; i < B; i++) { if (i > 0) batch.append(","); batch.append("{\"query\":\"{__typename}\"}"); }
+        batch.append("]");
+        HttpRequestResponse br = send(url, batch.toString());
+        int batched = batchCount(br);
+        if (batched >= B / 2) {
+            scanLog.found("GraphQL request amplification — no rate limit (array batching)", url,
+                    "A single HTTP request carrying a JSON array of " + B + " GraphQL operations executed " + batched
+                  + " of them (array response of " + batched + ") — no per-operation rate limit, enabling batched "
+                  + "credential brute-force (auth-throttle bypass) and DoS (CWE-770). Deterministic: " + batched
+                  + " results for one request.", br);
+            return 1;
+        }
+        return 0;
+    }
+
+    /** Count populated aXX alias keys in the data envelope (how many aliased ops the server executed). */
+    private int aliasCount(HttpRequestResponse rr) {
+        try {
+            if (rr == null || rr.response() == null) return 0;
+            JSONObject data = new JSONObject(rr.response().bodyToString()).optJSONObject("data");
+            if (data == null) return 0;
+            int n = 0;
+            for (String k : data.keySet()) if (k.length() > 1 && k.charAt(0) == 'a' && !data.isNull(k)) n++;
+            return n;
+        } catch (Throwable t) { return 0; }
+    }
+
+    /** If the response is a JSON ARRAY of operation results (batching enabled), count the data-bearing ones. */
+    private int batchCount(HttpRequestResponse rr) {
+        try {
+            if (rr == null || rr.response() == null) return 0;
+            Object parsed = new org.json.JSONTokener(rr.response().bodyToString()).nextValue();
+            if (parsed instanceof JSONArray) {
+                JSONArray a = (JSONArray) parsed;
+                int n = 0;
+                for (int i = 0; i < a.length(); i++) { JSONObject o = a.optJSONObject(i); if (o != null && o.has("data")) n++; }
+                return n;
+            }
+        } catch (Throwable ignore) { }
+        return 0;
+    }
+
     private HttpRequestResponse send(String url, String jsonBody) {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")

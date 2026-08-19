@@ -12,9 +12,11 @@ public final class VulnClasses {
 
     /** Canary token embedded in XSS payloads; the oracle looks for it reflected unescaped. */
     public static final String XSS_CANARY = "ioaxss7";
-    /** SSTI arithmetic canary: 1337*1337 evaluates to this if the template engine runs it. */
-    public static final String SSTI_INPUT = "1337*1337";
-    public static final String SSTI_RESULT = "1787569";
+    /** SSTI arithmetic canary: {@code SSTI_A*SSTI_A} evaluates to SSTI_RESULT iff the template engine runs it.
+     *  Product is COMPUTED from the operand — never hand-typed — so the oracle value can't drift from the payload. */
+    private static final long SSTI_A = 1337L;
+    public static final String SSTI_INPUT = SSTI_A + "*" + SSTI_A;
+    public static final String SSTI_RESULT = String.valueOf(SSTI_A * SSTI_A);
 
     private VulnClasses() { }
 

@@ -42,7 +42,7 @@ public final class PathReflectionProbe {
 
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
-    private static final Pattern JSON_STR = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+    private static final Pattern JSON_STR = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"");
 
     public PathReflectionProbe(MontoyaApi api, ScanLog scanLog) {
         this.api = api;
@@ -133,12 +133,12 @@ public final class PathReflectionProbe {
     }
 
     private static String setJsonString(String body, String key, String val) {
-        return body.replaceFirst("(\"" + Pattern.quote(key) + "\"\\s*:\\s*\")(?:[^\"\\\\]|\\\\.)*(\")",
+        return body.replaceFirst("(\"" + Pattern.quote(key) + "\"\\s*:\\s*\")[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*(\")",
                 "$1" + Matcher.quoteReplacement(val.replace("\\", "\\\\").replace("\"", "\\\"")) + "$2");
     }
 
     private static String currentJsonValue(String body, String key) {
-        Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(body);
+        Matcher m = Pattern.compile("\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"").matcher(body);
         return m.find() ? m.group(1).replace("\\\"", "\"").replace("\\\\", "\\") : null;
     }
 

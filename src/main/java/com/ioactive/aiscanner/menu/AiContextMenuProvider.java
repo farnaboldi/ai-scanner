@@ -106,7 +106,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
 
         // Single entry: the full autonomous flow (crawl → default-creds login → explore → audit).
         JMenuItem crawlScan = new JMenuItem("Crawl and scan this host");
-        crawlScan.addActionListener(e -> { maybePromptForRepo(host); crawlAndScan(host); });
+        crawlScan.addActionListener(e -> { maybePromptForScanInputs(host); crawlAndScan(host); });
         List<Component> items = new ArrayList<>();
         items.add(crawlScan);
         return items;
@@ -116,26 +116,75 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
      * Interactive only: if no source repo is associated with this host yet, offer to point at a LOCAL checkout
      * (drives SAST-assisted testing). Cancel or blank → black-box scan, unchanged. Never runs headless/autoscan.
      */
-    private void maybePromptForRepo(String seed) {
+    /**
+     * Register a SECOND, distinct user into its OWN session and adopt it as identity B on the shared SessionStore,
+     * enabling true cross-user access-control differentials. Prefers the JSON/API register path (captures a BEARER,
+     * so it does NOT clobber identity A's cookie in Burp's cookie jar); falls back to the form register path.
+     * Best-effort and idempotent — a no-op if the app has no self-registration or B turns out identical to A.
+     */
+    private void mintSecondIdentity(String host, String seed) {
+        try {
+            SessionStore sessionB = new SessionStore();
+            AutonomousAuth authB = new AutonomousAuth(api, sessionB, scanLog, host, seed).withEngine(scanner.engine());
+            authB.apiRegisterThenLogin(scanner.discoverAuthRequests(host));   // bearer-first (no cookie-jar clobber)
+            if (!sessionB.authenticated()) authB.registerThenLogin();          // form fallback
+            if (sessionB.authenticated()) {
+                session.setSecondary(sessionB);
+                if (session.hasSecondIdentity())
+                    scanLog.log("[AI Scanner] second identity B registered — TRUE cross-user access-control differential enabled.");
+                else
+                    scanLog.debug("[AI Scanner] second registration yielded the same identity as A — no distinct B.");
+            } else {
+                scanLog.debug("[AI Scanner] no second identity (app has no reachable self-registration) — single-session authz probes.");
+            }
+        } catch (Throwable t) {
+            scanLog.debug("[AI Scanner] second-identity minting skipped: " + t);
+        }
+    }
+
+    private void maybePromptForScanInputs(String seed) {
         if (repoForHost == null || setRepoForHost == null) return;
         if (java.awt.GraphicsEnvironment.isHeadless()) return;   // autoscan/container path never prompts
         String h = hostOf(seed);
-        String existing = repoForHost.apply(h);
-        if (existing != null && !existing.isBlank()) return;     // already associated → use it silently
-        // Single-button (OK-only) prompt: a JTextField as the message body + one "OK" option, so there's no
-        // Cancel — leaving it blank IS the black-box choice. Closing the dialog (X) reads as blank too.
-        javax.swing.JTextField field = new javax.swing.JTextField(30);
+        String existingRepo = repoForHost.apply(h);
+        boolean haveRepo  = existingRepo != null && !existingRepo.isBlank();
+        String existingUser = System.getProperty("aiscanner.loginEmail");
+        boolean haveCreds = existingUser != null && !existingUser.isBlank();
+        if (haveRepo && haveCreds) return;   // already fully configured → don't nag
+
+        // One OK-only dialog for the optional inputs that unlock deeper testing. Any field left blank is skipped
+        // (repo blank → black-box; creds blank → unauthenticated). Closing the dialog (X) reads as all-blank.
+        javax.swing.JTextField userField = new javax.swing.JTextField(30);
+        if (haveCreds) userField.setText(existingUser);
+        javax.swing.JPasswordField passField = new javax.swing.JPasswordField(30);
+        javax.swing.JTextField repoField = new javax.swing.JTextField(30);
+        if (haveRepo) repoField.setText(existingRepo);
         Object[] body = {
-                "Do you have a repo associated to this website to pass on to the LLM?\n"
-                + "Enter a source repo for " + h + " to drive SAST-assisted testing — a local path OR a\n"
-                + "GitHub/GitLab URL (a URL is fetched over HTTP automatically). Leave blank for black-box:",
-                field
+                "Optional inputs for scanning " + h + " — leave any blank to skip:",
+                " ",
+                new javax.swing.JLabel("Username / email  (for authenticated scanning):"), userField,
+                new javax.swing.JLabel("Password:"), passField,
+                new javax.swing.JLabel("Source repo  (local path OR Git URL — drives SAST-assisted testing):"), repoField,
         };
-        javax.swing.JOptionPane.showOptionDialog(null, body, "AI Scanner — source repo",
+        javax.swing.JOptionPane.showOptionDialog(null, body, "AI Scanner — scan inputs",
                 javax.swing.JOptionPane.DEFAULT_OPTION, javax.swing.JOptionPane.QUESTION_MESSAGE,
                 null, new Object[]{ "OK" }, "OK");
-        String input = field.getText();
-        if (input != null && !input.trim().isBlank()) setRepoForHost.accept(h, input.trim());
+
+        // Repo: PERSISTED per host (as before).
+        String repo = repoField.getText();
+        if (repo != null && !repo.trim().isBlank()) setRepoForHost.accept(h, repo.trim());
+        // Credentials: session-only, NEVER written to disk — set as the same system properties AutonomousAuth reads
+        // for the -Daiscanner.loginEmail / AISCANNER_LOGIN_EMAIL launch flags, so authenticated scanning works from
+        // the UI without relaunching Burp with env vars.
+        String user = userField.getText();
+        char[] pw = passField.getPassword();
+        String pass = pw == null ? "" : new String(pw);
+        boolean gotUser = user != null && !user.trim().isBlank();
+        if (gotUser)        System.setProperty("aiscanner.loginEmail", user.trim());
+        if (!pass.isBlank()) System.setProperty("aiscanner.loginPassword", pass);
+        if (pw != null) java.util.Arrays.fill(pw, '\0');   // scrub the password char[] (String copy is unavoidable for the prop)
+        if (gotUser || !pass.isBlank())
+            scanLog.log("[AI Scanner] operator credentials set for this session — authenticated scanning enabled for " + h + ".");
     }
 
     private List<HttpRequestResponse> collectSelected(ContextMenuEvent event) {
@@ -522,6 +571,19 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                                 + (bal != null ? bal : "unknown (WorkspaceConfig.json not readable yet)"));
                     }
                 } catch (Throwable ignore) { }
+                // CREDIT GATE — with Burp AI, do NOT start a scan unless the balance is > 1 credit. A scan begun
+                // with ≤1 credit would exhaust mid-run and yield a half-done, misleading report; better to skip it
+                // outright. In a batch this deliberately trips once credits deplete, so every remaining target is
+                // cleanly SKIPPED (recorded as a 0-with-reason report) rather than run to a partial result.
+                String creditBlock = scanner.creditGateReason();
+                if (creditBlock != null) {
+                    scanLog.phase("Skipped — insufficient Burp AI credits");
+                    scanLog.log("[AI Scanner] ⚠ SCAN SKIPPED for " + host + " — " + creditBlock
+                            + ". Refusing to start a scan that would run out of credits mid-audit.");
+                    scanner.writeSkipReport(creditBlock);
+                    scanner.exitIfRequested();
+                    return;
+                }
                 boolean wasAuthed = session.authenticated();
                 excludeLogoutFromScope(seed);   // fence off *logout* BEFORE any crawl — never visited
                 scanLog.phase("Crawling " + host);
@@ -578,7 +640,10 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     // form-encoded POST to well-known login paths (Spring formLogin / SPA that renders no <form>),
                     // which needs no discovered candidate. No-op when operator creds are unset.
                     List<HttpRequest> loginEps = scanner.discoverAuthRequests(host);
-                    new AutonomousAuth(api, session, scanLog, host, seed).loginWithProvidedCreds(loginEps);
+                    // withEngine: enables the LLM-assisted login-from-JS fallback for JS-driven page-method logins
+                    // whose custom body shape (nested/stringified credential wrappers) the generic body can't build.
+                    new AutonomousAuth(api, session, scanLog, host, seed)
+                            .withEngine(scanner.engine()).loginWithProvidedCreds(loginEps);
                 }
 
                 // CHEAPEST auth FIRST — a classic HTML login FORM (WordPress/DVWA/most CMSes) almost always takes
@@ -724,6 +789,12 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // each specific user (generic; trips identity-gated login challenges).
                 if (session.authenticated()) impersonateHarvestedIdentities(host);
 
+                // SECOND IDENTITY B — register a SECOND distinct user into its own session and adopt it, so the
+                // access-control probes (BOLA/BFLA/mass-assignment/GraphQL-authz) can run a TRUE cross-user
+                // differential ("A reads/writes B's exact object") instead of a single-session distinctness+PII
+                // heuristic. Best-effort: only possible where the app self-registers; no-op otherwise.
+                if (session.authenticated() && !session.hasSecondIdentity()) mintSecondIdentity(host, seed);
+
                 // If we JUST authenticated, discover the surface that only exists once logged in.
                 // Order matters: (1) a general authenticated Burp pass first (carries the session
                 // cookie jar) to surface the protected pages (e.g. /bank/*), THEN (2) the authenticated
@@ -783,6 +854,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // them. AiScanner calls this back just before its authenticated reflected-XSS phase. No-op unless
                 // a re-authable session was captured (canReauth()).
                 scanner.setReauth(this::reauthenticate);
+                // Register B-minting at the battery start (auth is settled there), the reliable point vs the earlier
+                // best-effort attempt above which can race the async login.
+                scanner.setSecondIdentityMinter(() -> mintSecondIdentity(host, seed));
                 if (levels.isEmpty()) {
                     scanLog.phase("Submitting discovered requests to Burp active audit");
                     scanner.summarize(scanner.scanDiscovered(host), host, false);   // main audit — concise line; banner prints once at the end
@@ -1255,9 +1329,14 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         if (resp == null || resp.response() == null) return false;
         var r = resp.response();
 
-        // Strongest signal: a NEW session cookie the failed attempt didn't set → definitively authenticated.
+        // Strongest signal: a NEW session cookie the failed attempt didn't set → definitively authenticated —
+        // BUT only on a NON-ERROR response. Django emits a sessionid/csrftoken cookie even on a 500 (allauth
+        // /accounts/signup email-verify misconfig 500s while still Set-Cookie'ing) — that is NOT a successful
+        // auth. Treating it as one false-succeeds and short-circuits the working register path (PyGoat: allauth
+        // signup 500s, but the custom /register 302s straight to an authenticated session). A real login/register
+        // returns 2xx or a 3xx redirect, never 4xx/5xx.
         Set<String> badCookies = cookieNames(bad);
-        for (Cookie c : r.cookies()) {
+        if (r.statusCode() < 400) for (Cookie c : r.cookies()) {
             if (SESSION_COOKIE.matcher(c.name()).matches() && !badCookies.contains(c.name())
                     && c.value() != null && !c.value().isBlank()) {
                 return true;

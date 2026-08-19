@@ -184,8 +184,16 @@ public final class CsrfProbe {
         String bl = rr.response().bodyToString();
         bl = bl == null ? "" : bl.toLowerCase();
         if (bl.contains("csrf") || bl.contains("forbidden") || bl.contains("invalid token")
-                || bl.contains("access denied") || bl.contains("not authorized") || bl.contains("please log in")) return false;
-        if (st >= 200 && st < 300) return true;
+                || bl.contains("access denied") || bl.contains("not authorized") || bl.contains("please log in")
+                // the forged (wrong-content-type / token-stripped) request was REJECTED, not processed — a framework
+                // validation/error envelope is NOT a forged action, so it must not count as "accepted".
+                || bl.contains("invalid web service call") || bl.contains("missing value for parameter")
+                || bl.contains("an error has occurred") || bl.contains("exceptionmessage") || bl.contains("\"stacktrace\"")) return false;
+        // An EMPTY 2xx body is NOT proof of a processed action: an endpoint that only accepts a specific content-type
+        // (e.g. a JSON page-method) silently IGNORES a form-encoded, browser-forgeable body and answers an empty 200.
+        // A genuinely forged state change returns evidence — a rendered page / JSON result / success redirect. Require
+        // non-empty content so an ignored-request 200 can't be mistaken for a CSRF (keeps the oracle zero-FP).
+        if (st >= 200 && st < 300) return !bl.isBlank();
         if (st >= 300 && st < 400) {
             String loc = rr.response().hasHeader("Location") ? rr.response().headerValue("Location") : "";
             return loc == null || !loc.toLowerCase().matches("(?s).*(login|signin|error|denied|unauthor).*");

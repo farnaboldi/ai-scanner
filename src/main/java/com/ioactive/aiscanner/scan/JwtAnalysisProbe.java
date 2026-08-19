@@ -158,9 +158,10 @@ public final class JwtAnalysisProbe {
                     String hit = crackHmac(tok, alg);
                     if (hit != null) {
                         if (raise(host, "JWT signed with a weak/guessable HMAC secret",
-                                "The HS* signing key is a common/default value ('" + hit + "') — recovered offline by "
-                              + "verifying the token's own signature. With the key, an attacker forges ANY token "
-                              + "(arbitrary user/role) (CWE-326/CWE-798). alg=" + alg, ev)) hits++;
+                                "The HS256/384/512 signing key was recovered offline (by re-verifying the token's own "
+                              + "signature): the secret is \"" + hit + "\" — a common/default value. With this key an "
+                              + "attacker forges ANY token — e.g. change the subject/role claim to an admin — a full "
+                              + "authentication bypass (CWE-326/CWE-798). alg=" + alg, true, ev)) hits++;
                     }
                 }
 
@@ -234,6 +235,15 @@ public final class JwtAnalysisProbe {
 
     private boolean raise(String host, String vulnClass, String detail, HttpRequestResponse... evidence) {
         scanLog.found(vulnClass, "https://" + host + "/", detail, evidence);
+        scanLog.incFinding();
+        return true;
+    }
+
+    /** As {@link #raise} but RAISES our dashboard issue even for a Burp-covered class (forceRaise) — for a finding
+     *  where our wording is materially clearer than Burp's (e.g. the cracked HMAC secret QUOTED, vs Burp's ambiguous
+     *  "The key used was <secret>" which reads as an adjective). */
+    private boolean raise(String host, String vulnClass, String detail, boolean forceRaise, HttpRequestResponse... evidence) {
+        scanLog.found(vulnClass, "https://" + host + "/", detail, forceRaise, evidence);
         scanLog.incFinding();
         return true;
     }

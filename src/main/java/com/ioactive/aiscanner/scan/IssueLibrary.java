@@ -21,6 +21,7 @@ public final class IssueLibrary {
     private static final AuditIssueSeverity HIGH = AuditIssueSeverity.HIGH;
     private static final AuditIssueSeverity MEDIUM = AuditIssueSeverity.MEDIUM;
     private static final AuditIssueSeverity LOW = AuditIssueSeverity.LOW;
+    private static final AuditIssueSeverity INFO = AuditIssueSeverity.INFORMATION;
 
     public static Info describe(String vulnClass) {
         String v = vulnClass == null ? "" : vulnClass.toLowerCase();
@@ -31,14 +32,18 @@ public final class IssueLibrary {
                 "<p>The SP metadata contains a self-signed certificate whose Subject CN indicates it is "
                 + "a library-shipped test or demo credential. Such certificates &mdash; and their private keys "
                 + "&mdash; are typically committed to the SAML library's public source repository or "
-                + "distributed with its test packages, making the private key effectively public. This removes "
-                + "all cryptographic assurance: (1) <b>SP impersonation</b> &mdash; anyone can sign "
-                + "<code>AuthnRequest</code>s as this SP, because IdP federation trust is based on the "
-                + "(now-public) certificate; (2) <b>assertion decryption</b> &mdash; if the same keypair "
-                + "covers the encryption slot, any <code>EncryptedAssertion</code> can be decrypted; "
-                + "(3) <b>XSW precondition</b> &mdash; a validly signed envelope over attacker-controlled "
-                + "content is trivially producible without cracking anything "
-                + "(CWE-321: Use of Hard-coded Cryptographic Key).</p>",
+                + "distributed with its test packages, making the private key effectively public (CWE-321: Use of "
+                + "Hard-coded Cryptographic Key). Because the SP signs (and, if the same keypair covers the "
+                + "encryption slot, decrypts) with this key, the private half being downloadable means: "
+                + "(1) <b>forgery of anything the SP itself signs</b> with this key &mdash; its metadata, "
+                + "<code>AuthnRequest</code>s and <code>LogoutRequest</code>s (the concrete impact of a forged "
+                + "signed <code>AuthnRequest</code> is integrity tampering of the request &mdash; ForceAuthn, "
+                + "RequestedAuthnContext, ACS-URL/RelayState &mdash; and depends on the IdP verifying SP "
+                + "signatures; it does NOT by itself log in a victim user); "
+                + "(2) <b>assertion decryption</b> if the same keypair covers the encryption slot, so any "
+                + "<code>EncryptedAssertion</code> sent to this SP can be decrypted. The demonstrated defect is at "
+                + "the key-material/configuration layer; end-to-end acceptance of a forged message was not proven "
+                + "here.</p>",
                 "<p>Generate a fresh, environment-specific RSA-2048 or ECDSA-P256 keypair. Update the SP "
                 + "configuration with the new certificate and private key, register the new public certificate "
                 + "with the IdP, and rotate in all environments where the test certificate appears. Do not "
@@ -96,7 +101,7 @@ public final class IssueLibrary {
                 + "generated, environment-specific certificate and is not reused from any library test package.</p>");
 
         if (v.contains("saml") && v.contains("artifact"))
-            return new Info(LOW,
+            return new Info(INFO,
                 "<p>The SP metadata advertises an AssertionConsumerService with the HTTP-Artifact binding "
                 + "(alongside or instead of the HTTP-POST binding). Artifact binding keeps the SAML assertion "
                 + "out of the browser entirely &mdash; only an opaque artifact token transits the user-agent, "

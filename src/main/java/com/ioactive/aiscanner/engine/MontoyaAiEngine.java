@@ -58,6 +58,26 @@ public final class MontoyaAiEngine extends PromptAiEngine {
         } catch (Throwable t) { return null; }
     }
 
+    /** A balance string formatted for DISPLAY with NO decimals — a fractional "-5.996" was misread as "-5996"
+     *  (the '.' looked like a thousands separator). Rounds to the nearest whole credit; non-numeric shown as-is.
+     *  Use this EVERYWHERE a balance is shown to the user; keep the raw string for delta math. */
+    public static String displayBalance(String raw) {
+        if (raw == null || raw.isBlank()) return raw;
+        try {
+            return String.valueOf(Math.round(Double.parseDouble(raw.replaceAll("[^0-9.\\-]", ""))));
+        } catch (Exception e) {
+            return raw;
+        }
+    }
+
+    /** Numeric value of Burp's cached AI credit balance (strips currency/formatting), or NaN if unreadable.
+     *  Used by the pre-scan credit gate (refuse to start a scan when credits are not &gt; 1). */
+    public static double readCreditBalanceValue() {
+        String b = readCreditBalance();
+        if (b == null || b.isBlank()) return Double.NaN;
+        try { return Double.parseDouble(b.replaceAll("[^0-9.\\-]", "")); } catch (Exception e) { return Double.NaN; }
+    }
+
     // ---- Burp AI CREDIT EXHAUSTION: Burp AI is PAID; when the balance hits 0, prompt().execute() fails. Montoya
     // exposes NO balance/error code, so we DETECT it by the error signature (broad keyword set), then HALT: set a
     // session-wide flag so (1) further chat() calls short-circuit instead of re-failing and burning wall-clock, and
@@ -133,7 +153,7 @@ public final class MontoyaAiEngine extends PromptAiEngine {
         if (CREDIT_START_LOGGED.compareAndSet(false, true)) {
             scanStartCredits = readCreditBalance();
             if (scanStartCredits != null)
-                logger.accept("[AI Scanner] Burp AI credits available (start of scan): " + scanStartCredits);
+                logger.accept("[AI Scanner] Burp AI credits available (start of scan): " + displayBalance(scanStartCredits));
         }
         PromptOptions opts = PromptOptions.promptOptions().withTemperature(clampTemp(cfg.temperature));
         Message[] msgs = (systemPrompt != null && !systemPrompt.isEmpty())
