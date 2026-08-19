@@ -107,7 +107,7 @@ public final class CoarseSourceAnalyzer implements SourceAnalyzer {
         if (!skills.isBlank()) scanLog.debug("[AI Scanner] SAST: injected stack skill guidance (" + skills.length() + " chars).");
         String reply;
         try {
-            reply = engine.chat(SkillLibrary.augment(systemPrompt(), skills), userPrompt(host, snips));
+            reply = engine.chat(SkillLibrary.augment(systemPrompt(), skills), userPrompt(host, snips), "sast: coarse");
         } catch (Exception e) {
             scanLog.debug("[AI Scanner] SAST: model call failed: " + e);
             return SourceFindings.empty();

@@ -14,7 +14,6 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.net.URI;
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -122,7 +121,7 @@ public final class LlmFuzzProbe {
                 String field = LlmEndpointDetector.promptField(body);
                 if (field == null) continue;
                 String url = req.url();
-                if (!seen.add(req.method() + " " + stripQuery(url))) continue;
+                if (!seen.add(req.method() + " " + Net.stripQuery(url))) continue;
                 Function<String, Reply> sender = msg -> sendChat(withSession, req, field, msg);
                 int f = fuzz("chat " + pathOf(url), url, sender);
                 if (f >= 0) done++;
@@ -186,7 +185,7 @@ public final class LlmFuzzProbe {
             if (done >= MAX_ENDPOINTS || tries >= MAX_SYNTH_TRIES) break;
             String[] parts = c.split("\\|", 3);
             String url = parts[0], field = parts[1], sink = parts.length > 2 ? parts[2] : "";
-            if (!seen.add("POST " + stripQuery(url))) continue;   // don't re-fuzz an endpoint the passive arm already did
+            if (!seen.add("POST " + Net.stripQuery(url))) continue;   // don't re-fuzz an endpoint the passive arm already did
             tries++;
             scanLog.log("[AI Scanner]   llm-fuzz: confirming JS-discovered candidate POST " + url + " {" + field + "}"
                     + (sink.isEmpty() ? "" : " [reply→" + sink + " sink]"));
@@ -490,7 +489,6 @@ public final class LlmFuzzProbe {
         return true;
     }
 
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String url) { return Net.authority(url); }
     private static String pathOf(String url) { try { String p = URI.create(url).getRawPath(); return p == null ? url : p; } catch (Exception e) { return url; } }
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
 }

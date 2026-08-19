@@ -30,9 +30,22 @@ public final class ChatAssistant {
     private volatile java.util.function.Consumer<String> scanHandler;
     public void setScanHandler(java.util.function.Consumer<String> h) { this.scanHandler = h; }
 
+    /** Wired by the extension to launchParallel() — CONCURRENT multi-target DAST+SAST. Each String[] = {url, repoOrNull}. */
+    private volatile java.util.function.Consumer<java.util.List<String[]>> batchScanHandler;
+    public void setBatchScanHandler(java.util.function.Consumer<java.util.List<String[]>> h) { this.batchScanHandler = h; }
+
     /** Matches "scan / escanea / audit / crawl / test" followed by a URL or bare hostname. */
     private static final java.util.regex.Pattern SCAN_CMD = java.util.regex.Pattern.compile(
             "(?i)^\\s*(?:scan|escanea|audit(?:ar)?|crawl|test)\\s+(https?://\\S+|[\\w.-]+\\.[a-z]{2,}(?:/\\S*)?)\\s*$");
+
+    /** Leading scan/audit/… keyword (so we only multi-parse an explicit scan intent). */
+    private static final java.util.regex.Pattern SCAN_KEYWORD = java.util.regex.Pattern.compile(
+            "(?i)^\\s*(?:scan|escanea|audit(?:ar)?|crawl|test)\\b");
+
+    /** One `URL (REPO)` occurrence: an http(s) URL, then an OPTIONAL parenthesized repo (git URL / URL / local path). */
+    private static final java.util.regex.Pattern TARGET_WITH_REPO = java.util.regex.Pattern.compile(
+            "(https?://\\S+?)(?:\\s*\\(\\s*(\\S+?)\\s*\\))?(?=\\s*(?:,|\\band\\b|$)|\\s+https?://)",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
 
     public ChatAssistant(Supplier<AiEngine> engine, MontoyaApi api, ScanScope scope, ScanLog scanLog) {
         this.engine = engine;
@@ -41,9 +54,60 @@ public final class ChatAssistant {
         this.scanLog = scanLog;
     }
 
+    /**
+     * Parse an ordered list of (url, repoOrNull) pairs from a `scan URL1 (REPO1) and URL2 (REPO2) …` message.
+     * Only http(s) URLs are matched; each URL may carry an OPTIONAL parenthesized SAST source (git URL / URL /
+     * local path). Returns an empty list if no URL is found (so callers fall through to normal handling).
+     */
+    static java.util.List<String[]> parseTargets(String msg) {
+        java.util.List<String[]> out = new java.util.ArrayList<>();
+        if (msg == null) return out;
+        String s = msg.trim();
+        java.util.regex.Matcher kw = SCAN_KEYWORD.matcher(s);
+        if (!kw.find()) return out;   // require an explicit scan/audit/… intent
+        String body = s.substring(kw.end());
+        java.util.regex.Matcher m = TARGET_WITH_REPO.matcher(body);
+        while (m.find()) {
+            String url = m.group(1);
+            if (url == null || url.isBlank()) continue;
+            url = url.replaceAll("[),;]+$", "");   // trim trailing punctuation the URL regex may have swallowed
+            String repo = m.group(2);
+            if (repo != null) { repo = repo.trim(); if (repo.isBlank()) repo = null; }
+            out.add(new String[]{ url, repo });
+        }
+        return out;
+    }
+
     /** Produce a reply to the user's message, grounded in scope + log + conversation. Blocking. */
     public String reply(String userMsg) {
-        // --- scan intent: deterministic, no LLM tokens needed ---
+        // --- multi-target scan intent: `scan URL1 (REPO1) and URL2 (REPO2)` → CONCURRENT DAST+SAST scans ---
+        if (userMsg != null && userMsg.trim().toLowerCase().startsWith("scan ")) {
+            java.util.List<String[]> pairs = parseTargets(userMsg);
+            // Only take the batch path for a genuine multi-target OR a URL-with-repo request; a lone `scan <url>`
+            // with no repo keeps the EXISTING single-URL behavior below (backward compat).
+            boolean batchWorthy = pairs.size() > 1 || (pairs.size() == 1 && pairs.get(0)[1] != null);
+            if (batchWorthy) {
+                java.util.function.Consumer<java.util.List<String[]>> bh = batchScanHandler;
+                if (bh == null) return "(parallel scan not available — batch handler not wired)";
+                final java.util.List<String[]> targets = pairs;
+                new Thread(() -> bh.accept(targets), "chat-scan-batch").start();
+                StringBuilder desc = new StringBuilder();
+                for (int i = 0; i < targets.size(); i++) {
+                    String[] t = targets.get(i);
+                    String host; try { host = new java.net.URI(t[0]).getAuthority(); } catch (Exception ex) { host = t[0]; }
+                    if (host == null || host.isBlank()) host = t[0];
+                    desc.append(host);
+                    if (t[1] != null) desc.append(" (").append(t[1]).append(')');
+                    if (i < targets.size() - 1) desc.append(", ");
+                }
+                String reply = "launching " + targets.size() + " parallel scan(s): " + desc
+                        + ". Watch the log tab for progress.";
+                history.add("User: " + userMsg);
+                history.add("Assistant: " + reply);
+                return reply;
+            }
+        }
+        // --- single-URL scan intent: deterministic, no LLM tokens needed ---
         java.util.regex.Matcher m = SCAN_CMD.matcher(userMsg.trim());
         if (m.matches()) {
             java.util.function.Consumer<String> h = scanHandler;

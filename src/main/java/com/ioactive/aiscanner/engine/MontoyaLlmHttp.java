@@ -30,6 +30,12 @@ public final class MontoyaLlmHttp implements LlmHttp {
     // the whole scan and burning the audit/watchdog budget. We run the request on a daemon thread and abandon it past
     // this deadline so the caller ALWAYS unblocks. Override with -Daiscanner.llmHardDeadlineMs.
     private static final long HARD_DEADLINE_MS = Long.getLong("aiscanner.llmHardDeadlineMs", 180_000L);
+    private static final long RESP_TIMEOUT_MS = Long.getLong("aiscanner.llmResponseTimeoutMs", 120_000L);
+    // LIVE count of scans hitting the LLM concurrently — each scan increments on start / decrements on end
+    // (AiContextMenuProvider.crawlAndScan), so it stays correct even when scans are ADDED at will (an Agent-tab
+    // command launching more targets into a running Burp). N concurrent scans share ONE local model → each call waits
+    // ~N× longer, so we scale BOTH timeouts by max(1,N). 0 when idle → max(1,0)=1× (no effect).
+    public static final java.util.concurrent.atomic.AtomicInteger PARALLELISM = new java.util.concurrent.atomic.AtomicInteger(0);
     private static final ExecutorService LLM_POOL = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "aiscanner-llm-http"); t.setDaemon(true); return t;   // daemon → a hung request never blocks JVM exit
     });
@@ -55,17 +61,19 @@ public final class MontoyaLlmHttp implements LlmHttp {
                 }
             }
         }
-        RequestOptions opts = RequestOptions.requestOptions().withResponseTimeout(120000L);
+        int par = Math.max(1, PARALLELISM.get());   // scale timeouts by the number of concurrent scans sharing the model
+        RequestOptions opts = RequestOptions.requestOptions().withResponseTimeout(RESP_TIMEOUT_MS * par);
+        long hardDeadline = HARD_DEADLINE_MS * par;
         // Enforce the HARD deadline: run on a daemon thread, abandon it (best-effort cancel) if it exceeds the bound.
         // Montoya's own timeout can't be trusted for a stalled body, so this is the real guarantee the scan proceeds.
         final HttpRequest fReq = req;
         Future<HttpRequestResponse> fut = LLM_POOL.submit(() -> api.http().sendRequest(fReq, opts));
         HttpRequestResponse rr;
         try {
-            rr = fut.get(HARD_DEADLINE_MS, TimeUnit.MILLISECONDS);
+            rr = fut.get(hardDeadline, TimeUnit.MILLISECONDS);
         } catch (TimeoutException te) {
             fut.cancel(true);
-            throw new RuntimeException("LLM request exceeded hard deadline (" + (HARD_DEADLINE_MS / 1000) + "s) — abandoned (" + url + ")");
+            throw new RuntimeException("LLM request exceeded hard deadline (" + (hardDeadline / 1000) + "s) — abandoned (" + url + ")");
         } catch (Exception e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;
             throw new RuntimeException("LLM request failed: " + cause.getClass().getSimpleName()

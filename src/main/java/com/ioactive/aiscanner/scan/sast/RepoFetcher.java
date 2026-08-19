@@ -42,16 +42,45 @@ public final class RepoFetcher {
     public static String ensureLocal(String repoOrPath, ScanLog log) {
         if (repoOrPath == null || repoOrPath.isBlank()) return null;
         String r = repoOrPath.trim();
+        // Optional MONOREPO SUBPATH: "<repo-url>#<subdir>" scopes SAST to ONE lab inside a monorepo — download the
+        // whole repo once, then analyze only that subtree (e.g. globocom/secDevLabs#owasp-top10-2021-apps/a3/mongection).
+        // Without this a 6000-file monorepo would be analyzed whole (slow + cross-lab noise). Generic; no app specifics.
+        String subpath = null;
+        int hash = r.indexOf('#');
+        if (hash > 0) { subpath = r.substring(hash + 1).trim(); r = r.substring(0, hash).trim(); }
         // Already a local dir (the launcher may pre-clone, or the operator points at a checkout). Still unpack any
         // nested source archive here — NOT only on the download path — so a raw URL handed straight to the
         // extension AND a local clone both get {README + code.zip}-style repos (e.g. vegabird/xvna) made analyzable.
-        try { Path p = Paths.get(r); if (Files.isDirectory(p)) { extractNestedZips(p, log); return r; } } catch (Exception ignore) { }
+        try { Path p = Paths.get(r); if (Files.isDirectory(p)) { extractNestedZips(p, log); return subDir(r, subpath, log); } } catch (Exception ignore) { }
         if (!isRemote(r)) { log.log("[AI Scanner] source repo is neither a local directory nor a URL: " + r); return null; }
-        String cached = CACHE.get(r);
+        String cacheKey = subpath == null ? r : r + "#" + subpath;
+        String cached = CACHE.get(cacheKey);
         if (cached != null) { try { if (Files.isDirectory(Paths.get(cached))) return cached; } catch (Exception ignore) { } }
         String local = fetch(r, log);
-        if (local != null) CACHE.put(r, local);
-        return local;
+        if (local == null) return null;
+        String scoped = subDir(local, subpath, log);
+        CACHE.put(cacheKey, scoped);
+        return scoped;
+    }
+
+    /** Resolve {@code subpath} under an extracted repo root, descending through the single top-level dir a GitHub/
+     *  GitLab zipball wraps everything in. Returns the root unchanged when subpath is null/absent (analyze whole repo). */
+    private static String subDir(String root, String subpath, ScanLog log) {
+        if (subpath == null || subpath.isBlank()) return root;
+        try {
+            Path base = Paths.get(root);
+            Path direct = base.resolve(subpath);
+            if (Files.isDirectory(direct)) { log.log("[AI Scanner] SAST scoped to subpath: " + subpath); return direct.toString(); }
+            try (var s = Files.list(base)) {   // zipball wrapper dir (e.g. globocom-secDevLabs-<sha>/)
+                for (Path child : (Iterable<Path>) s::iterator) {
+                    if (!Files.isDirectory(child)) continue;
+                    Path cand = child.resolve(subpath);
+                    if (Files.isDirectory(cand)) { log.log("[AI Scanner] SAST scoped to subpath: " + subpath); return cand.toString(); }
+                }
+            }
+            log.log("[AI Scanner] [warn] SAST subpath not found (" + subpath + ") — analyzing full repo");
+        } catch (Exception e) { log.debug("[AI Scanner] subDir error: " + e); }
+        return root;
     }
 
     private static boolean isRemote(String s) {

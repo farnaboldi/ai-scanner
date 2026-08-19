@@ -6,7 +6,6 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -149,7 +148,5 @@ public final class MassAssignProbe {
         try { return rr != null && rr.response() != null ? rr.response().statusCode() : -1; } catch (Throwable t) { return -1; }
     }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

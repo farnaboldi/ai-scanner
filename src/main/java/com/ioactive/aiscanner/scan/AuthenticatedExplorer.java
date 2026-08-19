@@ -75,7 +75,6 @@ public final class AuthenticatedExplorer {
 
     // ---- POST-form exercise (so search/filter forms' BODY params enter the audit) ----
     private static final Pattern FORM_BLOCK  = Pattern.compile("(?is)<form\\b.*?</form>");
-    private static final Pattern FORM_METHOD = Pattern.compile("(?is)\\bmethod\\s*=\\s*" + Q);
     private static final Pattern FIELD_TAG   = Pattern.compile("(?is)<(input|textarea|select)\\b([^>]*)>");
     private static final Pattern ATTR_NAME   = Pattern.compile("(?is)\\bname\\s*=\\s*" + Q);
     private static final Pattern ATTR_VALUE  = Pattern.compile("(?is)\\bvalue\\s*=\\s*" + Q);
@@ -132,7 +131,7 @@ public final class AuthenticatedExplorer {
             boolean js = isScript(finalUrl);
             if (js) scripts++;
             // show original → final so redirects (e.g. a protected page bouncing to login) are visible
-            boolean bounced = !stripQuery(finalUrl).equalsIgnoreCase(norm);
+            boolean bounced = !Net.stripQuery(finalUrl).equalsIgnoreCase(norm);
             String shown = bounced ? norm + " → " + finalUrl : finalUrl;
             // On a bounce, print the Cookie actually SENT (from the request itself) + any Set-Cookie the
             // server returned — this shows exactly when/why the session is lost (stale cookie? rotated?).
@@ -193,7 +192,7 @@ public final class AuthenticatedExplorer {
         if (landingUrl != null && !landingUrl.isBlank()) out.add(stripFragment(landingUrl));
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
             String url = rr.request().url();
-            if (sameHost(url, host) && isHtmlUrl(url) && !SESSION_RESET.matcher(url).matches()) out.add(stripQuery(url));
+            if (sameHost(url, host) && isHtmlUrl(url) && !SESSION_RESET.matcher(url).matches()) out.add(Net.stripQuery(url));
         }
         return new ArrayList<>(out);
     }
@@ -520,7 +519,7 @@ public final class AuthenticatedExplorer {
     }
 
     private static String dirOf(String url) {
-        String u = stripFragment(stripQuery(url));
+        String u = stripFragment(Net.stripQuery(url));
         int s = u.lastIndexOf('/');
         return s >= 0 ? u.substring(0, s + 1) : u + "/";
     }
@@ -565,7 +564,7 @@ public final class AuthenticatedExplorer {
      *  (e.g. .../static/chunks/static/chunks/x) — the signature of a mis-resolved bundle-relative token. */
     static boolean hasRepeatedSegmentRun(String url) {
         try {
-            String path = URI.create(stripFragment(stripQuery(url))).getPath();
+            String path = URI.create(stripFragment(Net.stripQuery(url))).getPath();
             if (path == null || path.isEmpty()) return false;
             String[] segs = path.split("/");
             List<String> s = new ArrayList<>();
@@ -643,17 +642,13 @@ public final class AuthenticatedExplorer {
         catch (Throwable t) { return -1; }
     }
 
-    private static String stripQuery(String url) {
-        int i = url.indexOf('?');
-        return i < 0 ? url : url.substring(0, i);
-    }
 
     private static String safeHeader(HttpRequestResponse rr, String name) {
         try { return rr.response().headerValue(name); } catch (Exception e) { return null; }
     }
 
     private static boolean sameHost(String url, String host) {
-        try { return host.equalsIgnoreCase(URI.create(url).getHost()); } catch (Exception e) { return false; }
+        try { return host.equalsIgnoreCase(Net.authority(url)); } catch (Exception e) { return false; }
     }
 
     private static String stripFragment(String url) {

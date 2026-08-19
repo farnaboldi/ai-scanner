@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 595;
+    public static final int BUILD = 629;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -50,6 +50,12 @@ public class AiScannerExtension implements BurpExtension {
     private volatile LogLevel logLevelSetting;
     private volatile AiEngine engine;
     private volatile boolean unloaded = false;
+    /** Scanner-wide identity guard — promoted to a field so {@link #launchParallel} (a method) can register
+     *  each parallel target's SessionStore with it. Set in {@link #initialize}. */
+    private volatile com.ioactive.aiscanner.scan.SelfAccountProtector selfAccountProtector;
+    /** The log mirror (Burp output + optional -Daiscanner.logFile) — promoted to a field so per-target
+     *  {@link ScanLog}s built in {@link #launchParallel} share the same sink. Set in {@link #initialize}. */
+    private volatile java.util.function.Consumer<String> logMirror;
 
     /** True once Burp has unloaded the extension — long-running loops check this to stop promptly. */
     public boolean isUnloaded() { return unloaded; }
@@ -83,6 +89,7 @@ public class AiScannerExtension implements BurpExtension {
         } else {
             logMirror = s -> api.logging().logToOutput(s);
         }
+        this.logMirror = logMirror;   // field ref so launchParallel() can build per-target mirrors
         this.scanLog = new ScanLog(logMirror);
         // Surface the AI Scanner's OWN findings (probes + flow-engine + auth) as Burp AuditIssues so they
         // appear on the dashboard / site-map issues, not only in our log. Scope-gated to hosts we scan.
@@ -103,6 +110,12 @@ public class AiScannerExtension implements BurpExtension {
         scanLog.log("[AI Scanner] log level: " + LogLevel.current());
 
         api.extension().setName(EXT_NAME);
+        // Scanner-wide session self-preservation: neutralize any phase's state-changing request to OUR OWN account
+        // (path carries the authenticated identity) → a harmless GET, so no probe/audit can reset/delete our creds
+        // mid-scan and bounce the deep authenticated surface to /login. Generic; other identities untouched.
+        final com.ioactive.aiscanner.scan.SelfAccountProtector protector =
+                new com.ioactive.aiscanner.scan.SelfAccountProtector(api, session, scanLog);
+        this.selfAccountProtector = protector;   // field ref so launchParallel() can register per-target sessions
         AiScanner scanner = new AiScanner(api, this::getEngine, scanConfig, scanLog, session, this::isUnloaded, this::repoForHost);
         // Agent-tab Stop button. Root mechanism (no per-probe checkpoints): (1) scanLog.phase() throws once
         // stopRequested, so the probe battery drains from a single point since every probe calls phase() first;
@@ -149,6 +162,9 @@ public class AiScannerExtension implements BurpExtension {
         com.ioactive.aiscanner.ui.ChatAssistant chat =
                 new com.ioactive.aiscanner.ui.ChatAssistant(this::getEngine, api, scanScope, scanLog);
         chat.setScanHandler(url -> menuProvider.startScan(url));
+        // Multi-target chat command: `scan URL1 (REPO1) and URL2 (REPO2)` → CONCURRENT DAST+SAST scans, one
+        // per-target unit each. Fire-and-forget (Burp stays open); NEVER touches aiscanner.exitOnComplete.
+        chat.setBatchScanHandler(pairs -> launchParallel(pairs, null, /*exitWhenDone=*/false));
         scanLog.enableChat(msg -> {
             scanLog.log("[you] " + msg);
             new Thread(() -> scanLog.log("[ai] " + chat.reply(msg)), "ais-chat").start();
@@ -226,6 +242,12 @@ public class AiScannerExtension implements BurpExtension {
         String target = launchArg("aiscanner.autoscan", "AISCANNER_AUTOSCAN");
         if (target != null) {
             final String[] targets = target.split("[\\s,]+");
+            // Optional PER-TARGET SAST source repos, aligned index-wise with the autoscan URLs (comma-separated,
+            // empty slots allowed → that target stays black-box). Lets a headless parallel run drive DAST+SAST with a
+            // DIFFERENT repo per target — the CLI equivalent of the Agent-tab `scan <url> (<repo>) and …` command.
+            // Generic; falls back to the launch-wide sourceRepo when absent.
+            final String reposArg = launchArg("aiscanner.autoscanRepos", "AISCANNER_AUTOSCAN_REPOS");
+            final String[] autoscanRepos = (reposArg == null || reposArg.isBlank()) ? new String[0] : reposArg.split(",", -1);
             final String reportDir = launchArg("aiscanner.reportDir", "AISCANNER_REPORT_DIR");
             // Pre-seed an authenticated session from a launch cookie (AISCANNER_COOKIE / -Daiscanner.cookie) — for apps
             // whose login the scanner CANNOT replicate (client-side-crypto login, SSO, MFA): paste a live browser
@@ -234,9 +256,27 @@ public class AiScannerExtension implements BurpExtension {
             final String seedCookie = launchArg("aiscanner.cookie", "AISCANNER_COOKIE");
             final String seedLanding = launchArg("aiscanner.landing", "AISCANNER_LANDING");
             final boolean batch = targets.length > 1;
-            scanLog.log("[AI Scanner] auto-scan requested for " + targets.length + " target(s) — starting in ~5s…");
+            String parFlag = launchArg("aiscanner.parallel", "AISCANNER_PARALLEL");
+            final boolean parallel = batch && parFlag != null && !"false".equalsIgnoreCase(parFlag) && !"0".equals(parFlag);
+            scanLog.log("[AI Scanner] auto-scan requested for [" + String.join(",", targets) + "] — starting in ~5s…");
             new Thread(() -> {
                 try { Thread.sleep(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+                if (parallel) {
+                    // CLI parallel autoscan: reuse the shared parallel engine. Per-target SAST repo comes from
+                    // -Daiscanner.autoscanRepos (index-aligned with the URLs); absent slots fall back to the
+                    // launch-wide sourceRepo (via repoForHost). exitWhenDone honors -Daiscanner.exitOnComplete.
+                    boolean wantExit = System.getProperty("aiscanner.exitOnComplete") != null
+                            && !"false".equalsIgnoreCase(System.getProperty("aiscanner.exitOnComplete"));
+                    java.util.List<String[]> pairs = new java.util.ArrayList<>();
+                    for (int i = 0; i < targets.length; i++) {
+                        String url = normalizeTarget(targets[i]);
+                        if (url == null) continue;
+                        String repo = (i < autoscanRepos.length && !autoscanRepos[i].isBlank()) ? autoscanRepos[i].trim() : null;
+                        pairs.add(new String[]{ url, repo });
+                    }
+                    launchParallel(pairs, reportDir, wantExit);
+                    return;
+                }
                 int done = 0;
                 for (int i = 0; i < targets.length; i++) {
                     if (unloaded) return;
@@ -267,6 +307,77 @@ public class AiScannerExtension implements BurpExtension {
         }
     }
 
+    /**
+     * TRUE-CONCURRENT multi-target scan engine, shared by the CLI parallel autoscan and the chat batch command.
+     * Each target gets its OWN {SessionStore, ScanLog (tagged mirror + per-target findings/report), AiScanner,
+     * AiContextMenuProvider} so auth/logs/scores don't cross-contaminate; the self-account protector guards every
+     * identity; LLM timeouts scale by N.
+     *
+     * @param targets      each String[] = {url, repoOrNull}. url is the DAST target; repoOrNull is the per-target
+     *                     SAST source (git URL / URL / local path) — applied via {@link #setRepoForHost} BEFORE the
+     *                     unit is built so AiScanner's SAST picks it up (RepoFetcher downloads git URLs as a ZIP).
+     * @param reportDir    optional directory for per-target report files (one per host); null → no report path set.
+     * @param exitWhenDone true (CLI): join all threads, then shut Burp down. false (chat): fire-and-forget — start
+     *                     the threads and RETURN immediately; NEVER touch aiscanner.exitOnComplete; Burp stays open.
+     */
+    void launchParallel(java.util.List<String[]> targets, String reportDir, boolean exitWhenDone) {
+        if (targets == null || targets.isEmpty()) return;
+        // First pass: normalize + apply per-target source repos, and count real targets so PARALLELISM is accurate.
+        java.util.List<String[]> valid = new java.util.ArrayList<>();
+        for (String[] t : targets) {
+            if (t == null || t.length == 0) continue;
+            String url = normalizeTarget(t[0]);
+            if (url == null) continue;
+            String repo = t.length > 1 ? t[1] : null;
+            if (repo != null && !repo.isBlank()) {
+                String host; try { host = com.ioactive.aiscanner.scan.Net.authority(url); } catch (Exception ex) { host = null; }
+                if (host != null && !host.isBlank()) setRepoForHost(host, repo.trim());   // SAST picked up via repoForHost
+            }
+            valid.add(new String[]{ url, repo });
+        }
+        if (valid.isEmpty()) return;
+        // LLM timeouts scale by the LIVE concurrent-scan count — each scan increments/decrements it in
+        // crawlAndScan, so it's correct even when THESE targets are added to scans already running (chat "at will").
+        boolean wantExit = exitWhenDone;
+        if (wantExit) System.clearProperty("aiscanner.exitOnComplete");   // no per-unit self-shutdown; exit centrally after ALL join
+        java.util.List<Thread> pthreads = new java.util.ArrayList<>();
+        for (String[] t : valid) {
+            final String url = t[0];
+            String auth; try { auth = java.net.URI.create(url).getAuthority(); } catch (Exception ex) { auth = null; }
+            final String tag = (auth != null && !auth.isBlank()) ? auth : url;
+            final String rp = (reportDir != null && !reportDir.isBlank())
+                    ? reportDir.replaceAll("/+$", "") + "/" + reportFileName(url) : null;
+            final ScanLog plog = new ScanLog(logMirror);   // per-line [host] tag comes from ScanLog.TARGET_TAG
+            plog.setUiMirror(scanLog);   // keep the shared UI status bar live (tagged) during the parallel run
+            plog.setIssueSink(this::raiseAiIssue);
+            final SessionStore psess = new SessionStore();
+            final AiScanner psc = new AiScanner(api, this::getEngine, scanConfig, plog, psess, this::isUnloaded, this::repoForHost);
+            // Parallel isolation: tell THIS scan about the OTHER concurrent co-targets so it won't pull them in
+            // (Burp scope is additive). Excludes only the known co-target authorities — legit siblings unaffected.
+            for (String[] other : valid) if (!other[0].equals(url)) psc.addSiblingTarget(other[0]);
+            psc.setSelfExitAllowed(false);   // parallel: NO per-unit self-shutdown (env AISCANNER_EXIT_ON_COMPLETE
+                                             // survives clearProperty); launchParallel shuts down centrally after join
+            if (rp != null) psc.setReportPath(rp);
+            if (selfAccountProtector != null) selfAccountProtector.addSession(psess);   // protect THIS target's own identity too
+            final AiContextMenuProvider pmp = new AiContextMenuProvider(api, plog, psess, psc, scanScope,
+                    this::repoForHost, this::setRepoForHost);
+            pthreads.add(new Thread(() -> {
+                ScanLog.TARGET_TAG.set("[" + tag + "] ");   // every line this scan's thread-lineage emits is tagged
+                try { pmp.startScanAndWait(url); }
+                catch (Throwable ex) { plog.log("[AI Scanner] target failed (" + url + "): " + ex); }
+            }, "ais-par-" + tag));
+        }
+        for (Thread th : pthreads) th.start();
+        if (!wantExit) {
+            // Chat / fire-and-forget: threads run in the background; return immediately so Burp stays interactive.
+            scanLog.log("[AI Scanner] ===== launched " + pthreads.size() + " new scan(s) — total concurrent shown in the status bar =====");
+            return;
+        }
+        for (Thread th : pthreads) { try { th.join(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; } }
+        scanLog.log("[AI Scanner] ===== PARALLEL complete: " + pthreads.size() + " target(s) scanned =====");
+        try { api.burpSuite().shutdown(); } catch (Throwable th) { scanLog.log("[AI Scanner] shutdown unavailable: " + th); }
+    }
+
     /** Add a scheme if the target is a bare host (dev/uat hosts are given without http(s)://). Defaults to https. */
     private static String normalizeTarget(String t) {
         if (t == null || t.isBlank()) return null;
@@ -276,9 +387,13 @@ public class AiScannerExtension implements BurpExtension {
 
     /** A filesystem-safe per-target report filename derived from the URL's host. */
     private static String reportFileName(String url) {
-        String h = url.replaceFirst("(?i)^https?://", "").replaceFirst("[/:?#].*$", "");
-        if (h.isBlank()) h = "target";
-        return h.replaceAll("[^A-Za-z0-9._-]", "_") + ".report.txt";
+        // Use the port-aware authority (host[:port]) so two CONCURRENT localhost targets on different ports get
+        // DISTINCT report files — the old host-only name collapsed localhost:1337 + localhost:9500 to one
+        // "localhost.report.txt" and the second scan's report overwrote the first. Default ports stay elided
+        // (prod https target → "example.com.report.txt", unchanged). ':' is not filesystem-safe → '_'.
+        String a = com.ioactive.aiscanner.scan.Net.authority(url);
+        if (a == null || a.isBlank()) a = "target";
+        return a.replaceAll("[^A-Za-z0-9._-]", "_") + ".report.txt";
     }
 
     /** Resolve the LOCAL source-repo path for a host: per-host mapping first, else the launch-wide repo, else null. */

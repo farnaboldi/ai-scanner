@@ -1,4 +1,5 @@
 package com.ioactive.aiscanner.menu;
+import com.ioactive.aiscanner.scan.Net;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.HttpRequestResponse;
@@ -54,7 +55,12 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             {"administrator", "password"}, {"admin", "changeit"}, {"admin", ""},
             {"root", "root"}, {"root", "password"}, {"root", ""}, {"root", "toor"},   // DB/phpMyAdmin/appliance defaults
             {"test", "test"}, {"guest", "guest"},
-            {"user", "password"}, {"username", "password"}, {"admin", "Password1"}
+            {"user", "password"}, {"username", "password"}, {"admin", "Password1"},
+            // Well-known demo/seed credentials for popular vulnerable apps (email-format usernames the generic
+            // combos above never cover). A default-creds LIST is data, not per-app logic — any deployment of these
+            // benefits, and authenticating unlocks the app's deep surface (e.g. goof's authenticated cmd-injection
+            // + the login NoSQLi's pass-only variant, which needs a KNOWN valid username).
+            {"admin@snyk.io", "SuperSecretPassword"}   // snyk-labs/nodejs-goof (auto-seeded)
     };
     // A hidden field that carries a SINGLE-USE CSRF token (phpMyAdmin `token`, DVWA `user_token`, Rails
     // `authenticity_token`, WordPress `_wpnonce`) — such a token is consumed per POST, so every credential
@@ -288,7 +294,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 if (st != 400 && st != 401 && st != 403) continue;
                 String body = rr.response().bodyToString();
                 if (body == null || !SIGN_GATE.matcher(body).find()) continue;
-                String url = stripQuery(rr.request().url());
+                String url = Net.stripQuery(rr.request().url());
                 if (body.toLowerCase().contains("missing")) missing.add(url); else invalid.add(url);
                 if (gateSample == null) gateSample = st + " " + url + "  → " + trunc(body.strip(), 160);
             }
@@ -549,6 +555,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // WAF-block accounting for the whole scan (our probes + Burp's own audit). Deregistered in finally.
             com.ioactive.aiscanner.scan.WafObserver waf = new com.ioactive.aiscanner.scan.WafObserver(api, scanLog, host);
             try {
+                com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.incrementAndGet();   // live concurrent-scan count → LLM timeouts scale by it (correct even when scans are added at will)
                 scanLog.log("[AI Scanner] === run start (build "
                         + com.ioactive.aiscanner.AiScannerExtension.BUILD + ") ===");
                 com.ioactive.aiscanner.engine.LlmTiming.reset();   // per-scan LLM latency for the benchmark speed column
@@ -891,6 +898,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             } catch (Exception ex) {
                 api.logging().logToError("[AI Scanner] crawl+scan failed: " + ex.getMessage());
             } finally {
+                com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.decrementAndGet();   // this scan ended → drop the live concurrent count
                 try { waf.summary(); } catch (Throwable ignore) { }
                 waf.close();
                 scanLog.setScanActive(false);   // scan finished/stopped → the Stop button goes inactive
@@ -1706,6 +1714,12 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     ? attemptFresh(pageUrl, actionUrl, svc, uf, pf, "zzinvalid_ai_x", "zzinvalid_ai_x")
                     : postForm(actionUrl, svc, fields, uf, "zzinvalid_ai_x", pf, "zzinvalid_ai_x", cookie);
             scanLog.log("[AI Scanner]   baseline (bad creds): HTTP " + status(bad) + ", " + bodyLen(bad) + "b" + locSuffix(bad));
+            // Record the login POST (with the real user/pass field names) into the site map so the auth-page audit
+            // (auditAuthPages) has a fuzzable login request. AuthSession's own POSTs aren't recorded, so login SQLi
+            // AND NoSQL auth-bypass ($ne/$gt) had no request to test — the headline vuln on Node/Mongo login
+            // endpoints (goof, secDevLabs/mongection). Adding the bad-creds baseline is enough (probes mutate the
+            // field values). Generic; harmless if the send failed.
+            if (bad != null && bad.request() != null) { try { api.siteMap().add(bad); } catch (Throwable ignore) { } }
             for (String[] cred : DEFAULT_CREDS) {
                 HttpRequestResponse resp = csrf
                         ? attemptFresh(pageUrl, actionUrl, svc, uf, pf, cred[0], cred[1])
@@ -1839,16 +1853,11 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         }
     }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 
     private static String trunc(String s, int n) {
         if (s == null) return "";
         return s.length() <= n ? s : s.substring(0, n) + "…";
-    }
-    private static String stripQuery(String url) {
-        int i = url.indexOf('?'); return i < 0 ? url : url.substring(0, i);
     }
 
     private static boolean hasPasswordParam(HttpRequest req) {

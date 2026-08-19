@@ -11,6 +11,7 @@ import org.json.JSONObject;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Pattern;
 
 /**
  * GraphQL probe — GENERIC and deterministic. Burp natively DETECTS a GraphQL endpoint, but it won't exercise the
@@ -36,6 +37,16 @@ public final class GraphqlProbe {
     private final MontoyaApi api;
     private final ScanLog scanLog;
     private static final int MAX_RESOLVERS = 40;
+
+    /** Engine-agnostic SQL-error signatures (SQLite/Python, MySQL, PostgreSQL, Oracle, MSSQL, generic ORM). Used by
+     *  the error-based resolver-arg SQLi differential — the `'`-vs-`''` guard makes even a broad pattern zero-FP. */
+    private static final Pattern SQL_ERROR = Pattern.compile("(?i)("
+            + "sqlite3?\\.(Operational|Programming|Integrity|Interface)Error|SQLITE_ERROR|unrecognized token|no such column|"   // SQLite / Python
+            + "You have an error in your SQL syntax|MySQLSyntaxError|Warning:\\s*mysqli|"                                       // MySQL
+            + "PG::\\w+|psycopg2|invalid input syntax for|syntax error at or near|"                                             // PostgreSQL
+            + "ORA-\\d{5}|"                                                                                                     // Oracle
+            + "Incorrect syntax near|Unclosed quotation mark|System\\.Data\\.SqlClient|"                                        // MSSQL
+            + "SQLSTATE\\[|\\bOperationalError\\b|ProgrammingError|\\[SQL:)");                                                  // generic ORM/SQLAlchemy
 
     // Minimal introspection: query/mutation type names + each field's name and its arguments' (unwrapped) types.
     private static final String INTROSPECTION =
@@ -83,6 +94,18 @@ public final class GraphqlProbe {
                 if (r.stringArgs.isEmpty()) continue;
                 tested++;
                 String arg = r.stringArgs.get(0);
+                // (2a) error-based SQLi on the resolver arg: a single quote that breaks the SQL string surfaces a DB
+                //      error the balanced quote ('') does not → the value reaches a SQL sink unescaped (CWE-89).
+                //      Zero-FP differential (a non-SQL error, e.g. a missing required arg, errors on BOTH → no finding).
+                HttpRequestResponse sqlBad = sendResolver(url, r.name, arg, "aisc'");
+                if (sqlError(sqlBad) && !sqlError(sendResolver(url, r.name, arg, "aisc''"))) {
+                    scanLog.found("GraphQL SQL injection", url,
+                            "Resolver '" + r.name + "(" + arg + ")' reaches a SQL sink: a single quote in the argument "
+                          + "surfaced a database error that the balanced quote ('') did not, so the value is concatenated "
+                          + "into a SQL statement unescaped (CWE-89). Deterministic error-based differential — DB error: "
+                          + clip(sqlErrText(sqlBad)) + ".", sqlBad);
+                    hits++;
+                }
                 String nonce = "AISC" + Long.toHexString(System.nanoTime()).toUpperCase();
                 HttpRequestResponse rr = sendResolver(url, r.name, arg, "echo " + nonce);
                 String reply = resolverValue(rr, r.name);
@@ -203,6 +226,23 @@ public final class GraphqlProbe {
         return send(url, q.toString());
     }
 
+    /** True if the response body carries a SQL/DB error signature (see {@link #SQL_ERROR}). */
+    private static boolean sqlError(HttpRequestResponse rr) {
+        if (rr == null || rr.response() == null) return false;
+        String b = rr.response().bodyToString();
+        return b != null && SQL_ERROR.matcher(b).find();
+    }
+
+    /** The matched SQL-error snippet (+ a little trailing context) for the finding's evidence; "" if none. */
+    private static String sqlErrText(HttpRequestResponse rr) {
+        if (rr == null || rr.response() == null) return "";
+        String b = rr.response().bodyToString();
+        if (b == null) return "";
+        java.util.regex.Matcher m = SQL_ERROR.matcher(b);
+        if (!m.find()) return "";
+        return b.substring(m.start(), Math.min(b.length(), m.end() + 60)).replaceAll("\\s+", " ");
+    }
+
     /** The scalar value the resolver returned (data.<resolver>), stringified; null if absent/error. */
     private String resolverValue(HttpRequestResponse rr, String resolver) {
         try {
@@ -303,7 +343,7 @@ public final class GraphqlProbe {
     }
 
     private static String hostOf(String u) {
-        try { return URI.create(u).getHost(); } catch (Throwable t) { return ""; }
+        return Net.authority(u);
     }
     private static String clip(String s) {
         s = s.replaceAll("\\s+", " ").trim();

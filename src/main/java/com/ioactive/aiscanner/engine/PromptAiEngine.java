@@ -42,7 +42,7 @@ public abstract class PromptAiEngine implements AiEngine {
         }
         user.append("\nReturn the JSON array now.");
 
-        return parseStringArray(chat(system, user.toString()), count);
+        return parseStringArray(chat(system, user.toString(), "llm-fuzz: payloads"), count);
     }
 
     @Override
@@ -52,7 +52,7 @@ public abstract class PromptAiEngine implements AiEngine {
                 + "payload confirms a " + vulnClass + " issue at the insertion point, referencing the concrete\n"
                 + "evidence. Name the technique. No markdown, no preamble.";
         String user = requestContext + "\n\nPayload sent:\n" + payload + "\n\nObserved evidence:\n" + evidence;
-        String out = chat(system, user);
+        String out = chat(system, user, "explain-finding");
         return out == null ? "" : out.trim();
     }
 
@@ -67,7 +67,7 @@ public abstract class PromptAiEngine implements AiEngine {
                 + "Output ONLY a JSON array of strings, each the EXACT substring (verbatim, copied from the\n"
                 + "request) of the VALUE to fuzz — not the key, not a description. Max " + max + " items.\n"
                 + "If there are no non-obvious points, output [].";
-        return parseStringArray(chat(system, "Raw HTTP request:\n" + requestText + "\n\nReturn the JSON array now."), max);
+        return parseStringArray(chat(system, "Raw HTTP request:\n" + requestText + "\n\nReturn the JSON array now.", "insertion-values"), max);
     }
 
     @Override
@@ -83,7 +83,7 @@ public abstract class PromptAiEngine implements AiEngine {
                 + "Output ONLY a JSON array of objects, no markdown/comments:\n"
                 + "[{\"method\":\"POST\",\"path\":\"/rest/user/login\",\"params\":[\"email\",\"password\"]}]\n"
                 + "Use server PATHS only (no scheme/host). Skip static assets (.css/.js/.png/…). [] if none.";
-        String raw = chat(system, "Client-side code:\n" + clientCode + "\n\nReturn the JSON array now.");
+        String raw = chat(system, "Client-side code:\n" + clientCode + "\n\nReturn the JSON array now.", "discovery: endpoints");
         if (raw == null) return "";
         return sliceEndpointArray(raw);
     }
@@ -178,7 +178,7 @@ public abstract class PromptAiEngine implements AiEngine {
         if (feedback != null && !feedback.isBlank())
             user.append("\nPrior steps (adapt; do not repeat a request that failed):\n").append(feedback).append('\n');
         user.append("\nReturn the JSON object now.");
-        return firstJsonObject(chat(system, user.toString()));
+        return firstJsonObject(chat(system, user.toString(), "agent-flow: plan"));
     }
 
     @Override
@@ -195,7 +195,7 @@ public abstract class PromptAiEngine implements AiEngine {
                 + "idiomatic guesses.\n"
                 + "Output ONLY a JSON array of path strings. No markdown, no commentary. Max " + max + " items.";
         String user = fingerprint + "\n\nReturn the JSON array of candidate paths now.";
-        return parseStringArray(chat(system, user), max);
+        return parseStringArray(chat(system, user, "discovery: sensitive-paths"), max);
     }
 
     // ---- shared tolerant parsing ----

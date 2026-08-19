@@ -39,6 +39,23 @@ public final class SessionStore {
     private volatile String ownIdentity = "";
     public void setOwnIdentity(String v) { this.ownIdentity = v == null ? "" : v.trim(); }
     public String ownIdentity() { return ownIdentity; }
+    /** True when a STATE-CHANGING request (method + path) would mutate THIS authenticated identity's OWN account —
+     *  its own handle appears as a path segment (e.g. POST /users/{ownIdentity} or its email local-part). The single
+     *  source of truth consulted by every request-sending phase (native audit, discovery form-exercise, probes) so
+     *  none of them reset/change/delete the very credentials we logged in with — self-mutation drops the session and
+     *  bounces every later authenticated request to /login. The SAME verbs against OTHER identities are allowed (those
+     *  are legitimate cross-user IDOR/BOLA writes). Generic — keyed on the captured own identity, no app-specific path. */
+    public boolean mutatesOwnAccount(String method, String path) {
+        if (!authenticated() || ownIdentity == null || method == null || path == null) return false;
+        String own = ownIdentity.trim();
+        if (own.length() < 3) return false;                          // too short → avoid a spurious substring match
+        String m = method.toUpperCase();
+        if (m.equals("GET") || m.equals("HEAD") || m.equals("OPTIONS")) return false;
+        String seg = own.contains("@") ? own.substring(0, own.indexOf('@')) : own;   // email → local-part is the usual path token
+        String alt = (seg.length() >= 3 && !seg.equalsIgnoreCase(own)) ? "|" + java.util.regex.Pattern.quote(seg) : "";
+        return java.util.regex.Pattern.compile("(?i)/(" + java.util.regex.Pattern.quote(own) + alt + ")(/|$)")
+                .matcher(path).find();
+    }
     /** Identity B's own registered handle (copied from B's session by {@link #setSecondary}). "" if unknown. */
     private volatile String identityB = "";
     public String identityB() { return identityB; }

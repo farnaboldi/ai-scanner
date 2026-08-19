@@ -11,7 +11,6 @@ import com.ioactive.aiscanner.scan.sast.SourceFindings;
 import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -55,6 +54,19 @@ public final class IdorGetProbe {
     private static final Pattern TENANT_DATA = Pattern.compile("(?i)(\"?e-?mail\"?|\"?owner\"?|\"?user(name)?\"?|\\bvin\\b|first_?name|last_?name|address|phone|ssn|credit|is_?admin|\"admin\"|superuser|is_?staff|creator_?id|author_?id|owner_?id|money_?made|account_?balance|\\bsalary\\b)");
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
+    // Auth-flow pages are NOT ownable objects: an id-style tail like /Account/Login or /account/register must
+    // never be treated as a per-tenant object, else the cross-identity read flags the SHARED public login page as
+    // BOLA (observed: WebGoatCore /Account/Login). Skipped for every IDOR/BOLA branch.
+    private static final Pattern AUTH_FLOW = Pattern.compile(
+            "(?i)/(log-?in|log-?on|sign-?in|sign-?up|signup|signin|register|registration|log-?out|sign-?out|logout|signout)(/|$|\\.)");
+    // Markers of a login / access-denied page returned to an UNAUTHENTICATED probe — proof the resource IS
+    // access-controlled (so a login bounce is NOT mistaken for "public content"). MUST be tight: a bare
+    // "Login"/"Sign in" word appears in the NAV BAR of essentially every page (incl. public ones), so matching it
+    // wrongly marked a public /Product/Details catalogue as "protected" and defeated the FP gate. Require a real
+    // login FORM (password input) or an explicit denial / "please log in to …" gate instead.
+    private static final Pattern LOGIN_PAGE = Pattern.compile(
+            "(?is)type\\s*=\\s*['\"]?password|\\b(unauthoriz|unauthorised|forbidden|access denied|not authori|"
+            + "please (log|sign) ?in to|you must (log|sign) ?in|login required|authentication required)\\b");
 
     private SourceFindings sourceHints;   // optional SAST directives — only ADD coverage / provenance, never remove
 
@@ -104,6 +116,7 @@ public final class IdorGetProbe {
                 String url = req.url();
                 if (!host.equalsIgnoreCase(hostOf(url)) || SKIP.matcher(url).matches()) continue;
                 String base = url.split("\\?")[0];
+                if (AUTH_FLOW.matcher(base).find()) continue;   // login/register/logout are not ownable objects
 
                 // (A00) RIGOROUS provably-owned cross-user read — runs BEFORE the A0 heuristic because it is the
                 // STRONGEST (it rules out an intended public directory). For a string/handle-keyed endpoint, read B's
@@ -135,7 +148,7 @@ public final class IdorGetProbe {
                                 HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
                                 if (r != null && r.response() != null && r.response().statusCode() == 200) {
                                     String bBody = r.response().bodyToString();
-                                    if (bBody != null && bBody.contains(token)) {
+                                    if (bBody != null && bBody.contains(token) && !publiclyReadable(base)) {
                                         scanLog.found("Broken Object Level Authorization (BOLA)", base,
                                                 "The SAME id-bearing object was returned to TWO DISTINCT authenticated identities — "
                                                 + "identity A and a second, separately-registered user identity B — each receiving "
@@ -218,7 +231,8 @@ public final class IdorGetProbe {
                                 if (r == null || r.response() == null) continue;
                                 String b = r.response().bodyToString();
                                 if (r.response().statusCode() == 200 && b != null && b.length() > 20 && !b.equals(selfBody)
-                                        && !b.toLowerCase().contains("error") && TENANT_DATA.matcher(b).find()) {
+                                        && !b.toLowerCase().contains("error") && TENANT_DATA.matcher(b).find()
+                                        && !publiclyReadable(base)) {
                                     scanLog.found("Insecure Direct Object Reference (IDOR)", base,
                                             "identity '" + self + "' → '" + other + "' returned another user's private "
                                             + "record using the SAME session — an object keyed by an enumerable identity "
@@ -259,7 +273,8 @@ public final class IdorGetProbe {
                         // output varies with the number trips a FP — e.g. /uptime/{flag} (a command arg, not
                         // an object id) returns different text per value but has no tenant data. Zero-FP.
                         if (r.response().statusCode() == 200 && b.length() > 20 && !b.equals(origBody)
-                                && !b.toLowerCase().contains("error") && TENANT_DATA.matcher(b).find()) {
+                                && !b.toLowerCase().contains("error") && TENANT_DATA.matcher(b).find()
+                                && !publiclyReadable(base)) {
                             scanLog.found("Insecure Direct Object Reference (IDOR)", base,
                                     "id " + id + " → " + other + " returned a different record with tenant/PII data "
                                     + "using the SAME session — evidence: your own object (id " + id + ") and another "
@@ -322,6 +337,25 @@ public final class IdorGetProbe {
         return "'" + t.substring(0, Math.min(2, t.length())) + "…' (" + t.length() + " chars)";
     }
 
+    /** True when {@code url} returns real (non-login) content to an UNAUTHENTICATED client — i.e. a PUBLIC
+     *  resource, so serving different ids to different users is NOT an access-control flaw. This is the gate that
+     *  kills IDOR/BOLA false positives on public catalogues + description pages (VulnLab /vuln/{id} challenge
+     *  pages whose prose merely contains words like "user"/"owner"/"address"; a public /Product/Details catalogue).
+     *  CONSERVATIVE — returns false (⇒ KEEP the finding) on any error / non-2xx / empty body / login-or-deny page,
+     *  so a genuinely access-controlled object is never suppressed. */
+    private boolean publiclyReadable(String url) {
+        try {
+            HttpRequest bare = HttpRequest.httpRequestFromUrl(url).withMethod("GET");   // NO Cookie / Authorization
+            HttpRequestResponse r = api.http().sendRequest(bare, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            if (r == null || r.response() == null) return false;
+            int sc = r.response().statusCode();
+            if (sc < 200 || sc >= 300) return false;               // unauth denied / redirected → access-controlled → real
+            String b = r.response().bodyToString();
+            if (b == null || b.length() < 20) return false;        // empty / stub → treat as protected
+            return !LOGIN_PAGE.matcher(b).find();                  // login/deny page → protected; real content → PUBLIC
+        } catch (Throwable t) { return false; }
+    }
+
     /** RIGOROUS cross-user read: identity B's PROVABLY-OWN object ({@code root}+{@code identityB}) is read AS A. B just
      *  registered, so that record is definitively B's private data; A (a different user) receiving it — confirmed by
      *  A's response carrying B's unique handle — is an unambiguous BOLA that rules out an intended public directory. */
@@ -367,7 +401,5 @@ public final class IdorGetProbe {
         return "{" + id.substring(0, 5) + "…}";
     }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

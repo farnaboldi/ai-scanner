@@ -8,7 +8,6 @@ import com.ioactive.aiscanner.scan.sast.SourceFindings;
 import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -195,7 +194,5 @@ public final class BolaWriteProbe {
         return m.find() ? m.group(1) : null;
     }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

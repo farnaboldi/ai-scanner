@@ -73,7 +73,7 @@ public final class WebhookAuthProbe {
                 // Confirm: the same POST with NO signature header at all is also accepted (definitively fail-open).
                 HttpRequestResponse none = post(url, false);
                 if (!accepted(none)) continue;
-                String key = stripQuery(url);
+                String key = Net.stripQuery(url);
                 if (!fired.add(key)) continue;
                 int st = bad.response().statusCode();
                 scanLog.found("Webhook signature verification fail-open (unauthenticated forgery)", url,
@@ -154,6 +154,5 @@ public final class WebhookAuthProbe {
         try { String p = URI.create(url).getRawPath(); return p == null || p.isEmpty() ? "/" : p; }
         catch (Exception e) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
     }
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

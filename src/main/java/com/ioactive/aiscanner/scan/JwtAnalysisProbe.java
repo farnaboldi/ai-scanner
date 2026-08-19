@@ -261,7 +261,7 @@ public final class JwtAnalysisProbe {
         try { return rr != null && rr.response() != null ? rr.response().statusCode() : -1; } catch (Throwable t) { return -1; }
     }
     private static String hostOf(String url) {
-        try { return java.net.URI.create(url).getHost(); } catch (Exception e) { return ""; }
+        return Net.authority(url);
     }
     private interface Sup { String get() throws Exception; }
     private static String safe(Sup s) { try { return s.get(); } catch (Exception e) { return null; } }

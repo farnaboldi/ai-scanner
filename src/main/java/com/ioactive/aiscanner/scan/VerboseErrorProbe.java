@@ -66,7 +66,7 @@ final class VerboseErrorProbe {
                 if (rr == null || rr.request() == null) continue;
                 String url = rr.request().url();
                 if (!inScope(host, url)) continue;
-                String key = stripQuery(url);
+                String key = Net.stripQuery(url);
                 inScope.add(key);
                 if (!leaks.containsKey(key) && StackTraceOracle.hasStackTrace(rr)) leaks.put(key, rr);
                 if (PAGE_METHOD.matcher(pathOf(key)).find() || isJsonApi(key, rr)) fuzzTargets.add(key);
@@ -124,9 +124,9 @@ final class VerboseErrorProbe {
             anyDb |= StackTraceOracle.leaksDbSchema(leaks.get(ep));
         }
         String detail = "The application returns a framework stack trace on malformed input, leaking exception types, "
-                + "class/method names, framework version and internal paths (CWE-209). This is a host-wide verbose-error "
-                + "misconfiguration (e.g. ASP.NET customErrors Off), reproducible across multiple endpoints and layers "
-                + "(page-methods, ASMX, and rest/JSON Web-API routes) — not a single page."
+                + "class/method names, framework version and internal source paths (CWE-209). This is a host-wide "
+                + "verbose-error misconfiguration (e.g. ASP.NET customErrors Off, or a Node/Express default error "
+                + "handler leaking V8 frames), reproducible across endpoints — not a single page."
                 + (anyDb ? " At least one endpoint additionally leaks DATABASE SCHEMA / SQL error text (database, table "
                         + "and/or column names, and the data-access stack), which materially aids SQL-injection targeting "
                         + "and data-model reconnaissance." : "")
@@ -186,7 +186,6 @@ final class VerboseErrorProbe {
         String s = String.join(", ", items.subList(0, n));
         return items.size() > n ? s + " (+" + (items.size() - n) + " more)" : s;
     }
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return null; } }
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
+    private static String hostOf(String url) { return Net.authority(url); }
     private static String pathOf(String url) { try { String p = URI.create(url).getPath(); return p == null ? "" : p; } catch (Exception e) { return url; } }
 }

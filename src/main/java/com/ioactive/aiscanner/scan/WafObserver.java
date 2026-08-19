@@ -181,9 +181,7 @@ public final class WafObserver implements HttpHandler {
         try { if (reg != null) reg.deregister(); } catch (Throwable ignore) { }
     }
 
-    private static String hostOf(String u) {
-        try { return URI.create(u).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String u) { return Net.authority(u); }
     private static String pathOnly(String u) {
         try { String p = URI.create(u).getPath(); return (p == null || p.isEmpty()) ? u : p; }
         catch (Exception e) { return u; }

@@ -391,9 +391,7 @@ public final class AgentFlowProbe {
         return true;
     }
 
-    private static String hostOf(String url) {
-        try { return URI.create(url).getHost(); } catch (Exception e) { return ""; }
-    }
+    private static String hostOf(String url) { return Net.authority(url); }
 
     private static String pathOnly(String url) {
         try { String p = URI.create(url).getRawPath(); return p == null || p.isEmpty() ? "/" : p; }

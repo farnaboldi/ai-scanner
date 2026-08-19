@@ -1,4 +1,5 @@
 package com.ioactive.aiscanner.scan.flow;
+import com.ioactive.aiscanner.scan.Net;
 
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
@@ -9,7 +10,6 @@ import com.ioactive.aiscanner.vulns.Signal;
 import com.ioactive.aiscanner.vulns.VulnClass;
 import com.ioactive.aiscanner.vulns.VulnClasses;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -208,7 +208,7 @@ public final class FlowEngine {
     }
 
     private static boolean sameHost(String url, String host) {
-        try { return host.equalsIgnoreCase(URI.create(url).getHost()); } catch (Exception e) { return false; }
+        try { return host.equalsIgnoreCase(Net.authority(url)); } catch (Exception e) { return false; }
     }
 
     private StepResult safeSend(HttpRequest req) {

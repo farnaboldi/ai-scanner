@@ -155,5 +155,5 @@ public final class PrivilegeParityProbe {
         } catch (Exception e) { return null; }
     }
 
-    private static String hostOf(String url) { try { return URI.create(url).getHost(); } catch (Exception e) { return ""; } }
+    private static String hostOf(String url) { return Net.authority(url); }
 }
