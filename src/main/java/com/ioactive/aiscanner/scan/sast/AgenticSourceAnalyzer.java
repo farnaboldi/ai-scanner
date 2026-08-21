@@ -66,14 +66,14 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         if (engine == null || repoPath == null || repoPath.isBlank()) return SourceFindings.empty();
         final Path root;
         try { root = Paths.get(repoPath).toRealPath(); } catch (Exception e) {
-            scanLog.debug("[AI Scanner] SAST(agentic): repo unreadable: " + e); return SourceFindings.empty();
+            scanLog.debug("SAST(agentic): repo unreadable: " + e); return SourceFindings.empty();
         }
         if (!Files.isDirectory(root)) return SourceFindings.empty();
 
         // Stack-specific steering — detected-framework skills (when recognized) plus generic vuln attack-surface
         // cues — injected into BOTH the map and sink prompts. Steering only; the deterministic oracle still decides.
         String skills = SkillLibrary.promptExcerpt(root, 3500);
-        if (!skills.isBlank()) scanLog.debug("[AI Scanner] SAST(agentic): injected stack skill guidance (" + skills.length() + " chars).");
+        if (!skills.isBlank()) scanLog.debug("SAST(agentic): injected stack skill guidance (" + skills.length() + " chars).");
 
         // Index every code file by basename (for child resolution) and gather entry/dispatch snippets.
         Map<String, Path> byName = new LinkedHashMap<>();
@@ -87,7 +87,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         }
         if (entrySnips.isEmpty()) return coarseFallback(host, repoPath, "no entry/dispatch signals found");
 
-        scanLog.log("[AI Scanner] SAST(agentic): " + entrySnips.size() + " entry/dispatch signal(s) across "
+        scanLog.log("SAST(agentic): " + entrySnips.size() + " entry/dispatch signal(s) across "
                 + byName.size() + " unit file(s) → step 1 (map entry points)…");
 
         // --- Step 1: map entry points + dispatch targets ---
@@ -107,7 +107,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
                 childSrc.put(en.dispatch, rel + "\n" + readBounded(cp));
             }
         }
-        scanLog.log("[AI Scanner] SAST(agentic): mapped " + entries.size() + " entry point(s); following "
+        scanLog.log("SAST(agentic): mapped " + entries.size() + " entry point(s); following "
                 + childSrc.size() + " child unit(s) → step 2 (pin real sinks)…");
 
         // --- Step 2: pin the real sink inside each child (or inline) ---
@@ -123,13 +123,13 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         // step 1 mapped, UNION with the coarse flat-sink pass. Hints only STEER probes (oracles still decide), so
         // merging can only ADD coverage — never a false finding.
         if (hints.size() < Math.max(3, entries.size() / 2)) {
-            scanLog.log("[AI Scanner] SAST(agentic): under-produced (" + hints.size() + " hint(s) for "
+            scanLog.log("SAST(agentic): under-produced (" + hints.size() + " hint(s) for "
                     + entries.size() + " mapped entry point(s)) → merging the coarse flat-sink pass.");
             try {
                 SourceFindings coarse = new CoarseSourceAnalyzer(engine, scanLog).analyze(host, repoPath);
                 hints = mergeHints(hints, coarse.all());
-                scanLog.log("[AI Scanner] SAST(agentic+coarse): " + hints.size() + " merged hint(s).");
-            } catch (Throwable t) { scanLog.debug("[AI Scanner] SAST: coarse merge failed: " + t); }
+                scanLog.log("SAST(agentic+coarse): " + hints.size() + " merged hint(s).");
+            } catch (Throwable t) { scanLog.debug("SAST: coarse merge failed: " + t); }
         }
         return new SourceFindings(hints);
     }
@@ -150,9 +150,9 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
     /** Agentic mapping fits framework-routed apps with process boundaries; flat apps (file-based PHP, no
      *  routes/dispatch) yield nothing there. Fall back to the coarse flat-sink pass so agentic is never worse. */
     private SourceFindings coarseFallback(String host, String repoPath, String why) {
-        scanLog.log("[AI Scanner] SAST(agentic): " + why + " → falling back to coarse SAST.");
+        scanLog.log("SAST(agentic): " + why + " → falling back to coarse SAST.");
         try { return new CoarseSourceAnalyzer(engine, scanLog).analyze(host, repoPath); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner] SAST: coarse fallback failed: " + t); return SourceFindings.empty(); }
+        catch (Throwable t) { scanLog.debug("SAST: coarse fallback failed: " + t); return SourceFindings.empty(); }
     }
 
     // ---- indexing ----

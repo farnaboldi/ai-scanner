@@ -127,7 +127,7 @@ public final class BodyMutatorProbe {
                 if (!mut.equals(body)) accepted(req.withBody(mut), req.url(), "IDOR " + k + "→" + other, false);
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] body-mutator error: " + t);
+            scanLog.debug("body-mutator error: " + t);
         }
     }
 

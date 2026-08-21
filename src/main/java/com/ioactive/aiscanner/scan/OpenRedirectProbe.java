@@ -72,7 +72,7 @@ public final class OpenRedirectProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] open-redirect probe error: " + t);
+            scanLog.debug("open-redirect probe error: " + t);
         }
         return false;
     }

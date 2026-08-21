@@ -49,8 +49,8 @@ public final class OAuthLogicProbe {
             for (String authzUrl : discoverAuthorizeRequests(host, sess)) {
                 if (checkRedirectUriValidation(authzUrl, sess)) hits++;
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] oauth-logic: " + t); }
-        if (hits == 0) scanLog.log("[AI Scanner] OAuth-logic probe: 0 authorization-server flaw(s).");
+        } catch (Throwable t) { scanLog.debug("oauth-logic: " + t); }
+        if (hits == 0) scanLog.log("OAuth-logic probe: 0 authorization-server flaw(s).");
         return hits;
     }
 
@@ -92,7 +92,7 @@ public final class OAuthLogicProbe {
         // Browser-like ACTIVE harvest: if nothing crawled surfaced a client_id, fetch the well-known client-registry
         // pages WITH the session. Many authorization servers let a logged-in user LIST the registered OAuth clients
         // (the same page a human would open). Generic convention, not app-specific; no-ops when unauthenticated (302).
-        scanLog.debug("[AI Scanner] oauth-logic: passive client_id harvest = " + clientIds.size() + " from site map");
+        scanLog.debug("oauth-logic: passive client_id harvest = " + clientIds.size() + " from site map");
         if (clientIds.isEmpty()) {
             String origin = originOf(host);
             if (origin != null) for (String p : CLIENT_REGISTRY_PATHS) {
@@ -103,14 +103,14 @@ public final class OAuthLogicProbe {
                 HttpRequestResponse rr = send(sess, req);
                 int sc = (rr != null && rr.response() != null) ? rr.response().statusCode() : -1;
                 String body = respBody(rr);
-                scanLog.debug("[AI Scanner] oauth-logic: registry GET " + origin + p + " → HTTP " + sc
+                scanLog.debug("oauth-logic: registry GET " + origin + p + " → HTTP " + sc
                         + " cookie=" + sess.apply(req).hasHeader("Cookie") + " body[" + (body == null ? 0 : body.length())
                         + "]=" + (body == null ? "" : body.replaceAll("\\s+", " ").substring(0, Math.min(90, body.length()))));
                 if (sc != 200) continue;
                 int before = clientIds.size();
                 harvestClientIds(body, clientIds);
                 if (clientIds.size() > before) {
-                    scanLog.debug("[AI Scanner] oauth-logic: harvested " + (clientIds.size() - before)
+                    scanLog.debug("oauth-logic: harvested " + (clientIds.size() - before)
                             + " client_id(s) from authenticated " + p);
                     // The registry is reachable by a logged-in (non-admin) user AND returns client secrets in
                     // cleartext → OAuth client-credential disclosure + broken access control. Deterministic.
@@ -142,7 +142,7 @@ public final class OAuthLogicProbe {
                 if (out.size() >= 12) break;
             }
         }
-        scanLog.debug("[AI Scanner] oauth-logic: " + out.size() + " authorize target(s) ("
+        scanLog.debug("oauth-logic: " + out.size() + " authorize target(s) ("
                 + authzEndpoints.size() + " endpoint(s), " + clientIds.size() + " client_id(s))");
         return out;
     }
@@ -196,14 +196,14 @@ public final class OAuthLogicProbe {
         String sentinel = "http://" + sentinelHost + "/cb";
         String url = replaceParam(authzUrl, "redirect_uri", sentinel);
         url = replaceParam(url, "state", "aischeckstate");   // set a known state so we can tell code-in-redirect apart
-        scanLog.debug("[AI Scanner] oauth-logic: driving " + url);
+        scanLog.debug("oauth-logic: driving " + url);
 
         HttpRequest getReq = sess.apply(HttpRequest.httpRequestFromUrl(url).withMethod("GET"));
-        scanLog.debug("[AI Scanner] oauth-logic: cookie sent = ["
+        scanLog.debug("oauth-logic: cookie sent = ["
                 + (getReq.hasHeader("Cookie") ? getReq.headerValue("Cookie") : "NONE") + "]");
         HttpRequestResponse rr = send(sess, HttpRequest.httpRequestFromUrl(url).withMethod("GET"));
         if (rr == null || rr.response() == null) return false;
-        scanLog.debug("[AI Scanner] oauth-logic: GET " + url + " → HTTP " + rr.response().statusCode()
+        scanLog.debug("oauth-logic: GET " + url + " → HTTP " + rr.response().statusCode()
                 + " loc=" + (rr.response().hasHeader("Location") ? rr.response().headerValue("Location") : "-")
                 + " consent=" + (safeBody(rr) != null && safeBody(rr).toLowerCase().contains("decision")));
 
@@ -235,7 +235,7 @@ public final class OAuthLogicProbe {
 
         HttpRequestResponse dec = send(sess, HttpRequest.httpRequestFromUrl(action).withMethod("POST")
                 .withAddedHeader("Content-Type", "application/x-www-form-urlencoded").withBody(form.toString()));
-        scanLog.debug("[AI Scanner] oauth-logic: decision POST " + action + " body=[" + form + "] → HTTP "
+        scanLog.debug("oauth-logic: decision POST " + action + " body=[" + form + "] → HTTP "
                 + (dec != null && dec.response() != null ? dec.response().statusCode() : -1)
                 + " loc=" + (dec != null && dec.response() != null && dec.response().hasHeader("Location") ? dec.response().headerValue("Location") : "-"));
         if (dec != null && dec.response() != null && locationLeaksTo(dec, sentinelHost)) {
@@ -263,7 +263,7 @@ public final class OAuthLogicProbe {
         try {
             return AiScanner.decompress(api.http().sendRequest(sess.apply(req),
                     RequestOptions.requestOptions().withResponseTimeout(12000L)));
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] oauth-logic send failed: " + t); return null; }
+        } catch (Throwable t) { scanLog.debug("oauth-logic send failed: " + t); return null; }
     }
 
     /** Replace (or append) a query parameter's value in a URL. */

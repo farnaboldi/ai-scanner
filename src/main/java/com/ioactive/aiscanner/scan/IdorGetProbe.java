@@ -26,6 +26,13 @@ public final class IdorGetProbe {
     private final MontoyaApi api;
     private final ScanLog scanLog;
     private static final Pattern NUM_TAIL = Pattern.compile("^(.*/)(\\d{1,7})$");
+    /** A page-route tail (…/x.mvc, /x.lesson, /x.jsp, /x.php, /x.aspx, /x.action, …) is a ROUTE to a page, NOT an
+     *  object reference. Treating one as an opaque object handle causes BOLA false positives on shared/public
+     *  authenticated pages whose static content contains an example email (e.g. WebGoat lesson pages, all served
+     *  identically to every logged-in user). Real object handles are numeric / hex / UUID / slugs — never a
+     *  server-page extension. Data files (.pdf/.csv/…) are deliberately NOT excluded — those CAN be IDOR'd. */
+    private static final Pattern PAGE_ROUTE = Pattern.compile("(?i)\\.(mvc|lesson|jsp|jspx|jsf|php|aspx?|html?|action|do|cgi|py|rb|pl)(?:$|[?#])");
+    private static boolean isPageRoute(String url) { return url != null && PAGE_ROUTE.matcher(url).find(); }
     // OPAQUE (non-arithmetic) resource-key tail: /collection/<slug|username|email | ObjectId | UUID>. Neighbors
     // can't be computed for these, so candidate identities are sourced from the collection's OWN listing (generic,
     // not guessed). Covers a digit-leading 24-hex Mongo ObjectId and a UUID — which a letter-leading-only matcher
@@ -123,7 +130,7 @@ public final class IdorGetProbe {
                 // OWN object /root/{identityB} AS A: B just registered that account so the record is definitively B's.
                 if (identityB != null && !identityB.isBlank()) {
                     java.util.regex.Matcher om = OPAQUE_TAIL.matcher(base);
-                    if (om.matches() && tried.add("rig:" + om.group(1))
+                    if (om.matches() && !isPageRoute(base) && tried.add("rig:" + om.group(1))
                             && rigorousBOwnRead(om.group(1), identityB, cookieHeader, bearer, cookieB, bearerB, base)) {
                         hits++;
                         continue;   // definitive — skip the weaker heuristics for this url
@@ -135,7 +142,7 @@ public final class IdorGetProbe {
                 // identity B, re-request the SAME url AS B. If B — a genuinely different registered user — receives
                 // A's exact private record (matched by a per-user distinctive token), the endpoint enforces no
                 // ownership check: a definitive cross-user read, no heuristic.
-                if (haveB && (NUM_TAIL.matcher(base).matches() || OPAQUE_TAIL.matcher(base).matches())
+                if (haveB && !isPageRoute(base) && (NUM_TAIL.matcher(base).matches() || OPAQUE_TAIL.matcher(base).matches())
                         && tried.add("b:" + base)) {
                     String aBody = rr.response().bodyToString();
                     if (aBody != null && aBody.length() >= 20 && TENANT_DATA.matcher(aBody).find()) {
@@ -218,7 +225,7 @@ public final class IdorGetProbe {
                 // like the numeric branch (same TENANT_DATA gate ⇒ zero-FP). Gated to a record that itself
                 // carries tenant data so we only enumerate real private-object endpoints.
                 java.util.regex.Matcher sm = OPAQUE_TAIL.matcher(base);
-                if (sm.matches() && tried.add("str:" + base)) {
+                if (sm.matches() && !isPageRoute(base) && tried.add("str:" + base)) {
                     String selfBody = rr.response().bodyToString();
                     if (selfBody != null && selfBody.length() >= 20 && TENANT_DATA.matcher(selfBody).find()) {
                         String root = sm.group(1), self = sm.group(2);
@@ -289,7 +296,7 @@ public final class IdorGetProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] IDOR probe error: " + t);
+            scanLog.debug("IDOR probe error: " + t);
         }
         return hits;
     }
@@ -384,7 +391,7 @@ public final class IdorGetProbe {
                     asB, asA);
             scanLog.incFinding();
             return true;
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] rigorous BOLA read error: " + t); return false; }
+        } catch (Throwable t) { scanLog.debug("rigorous BOLA read error: " + t); return false; }
     }
 
     private HttpRequestResponse get(String url, String cookie, String bearer) {

@@ -52,7 +52,7 @@ public final class SsrfProbe {
     public int probe(String baseUrl, List<HttpRequest> targets, UnaryOperator<HttpRequest> withSession) {
         CollaboratorClient collab;
         try { collab = api.collaborator().createClient(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   ssrf: Collaborator unavailable — OAST SSRF skipped"); return 0; }
+        catch (Throwable t) { scanLog.debug("  ssrf: Collaborator unavailable — OAST SSRF skipped"); return 0; }
 
         Map<String, String[]> tagToPoint = new LinkedHashMap<>();   // tag -> {url, point-label}
         Map<String, HttpRequestResponse> tagToRr = new LinkedHashMap<>();   // tag -> the request that carried the payload
@@ -108,7 +108,7 @@ public final class SsrfProbe {
         }
 
         if (tagToPoint.isEmpty()) return 0;
-        scanLog.debug("[AI Scanner]   ssrf: fired " + tagToPoint.size() + " OAST payload(s); polling Collaborator…");
+        scanLog.debug("  ssrf: fired " + tagToPoint.size() + " OAST payload(s); polling Collaborator…");
         return poll(collab, tagToPoint, tagToRr);
     }
 
@@ -211,7 +211,7 @@ public final class SsrfProbe {
                 }
             }
         } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   ssrf: poll error: " + t); }
+        catch (Throwable t) { scanLog.debug("  ssrf: poll error: " + t); }
         return hits;
     }
 

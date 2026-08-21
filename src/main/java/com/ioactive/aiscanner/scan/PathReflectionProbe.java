@@ -74,7 +74,7 @@ public final class PathReflectionProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] path-reflection probe error: " + t);
+            scanLog.debug("path-reflection probe error: " + t);
         }
         return false;
     }

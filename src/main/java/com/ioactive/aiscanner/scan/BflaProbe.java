@@ -71,7 +71,7 @@ public final class BflaProbe {
             }
             hits += probeRoleFunctions(host, cookieHeader, bearer);   // directly-observed privileged-role functions
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] BFLA probe error: " + t);
+            scanLog.debug("BFLA probe error: " + t);
         }
         return hits;
     }
@@ -138,7 +138,7 @@ public final class BflaProbe {
                 hits++;
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] BFLA role-function probe error: " + t);
+            scanLog.debug("BFLA role-function probe error: " + t);
         }
         return hits;
     }

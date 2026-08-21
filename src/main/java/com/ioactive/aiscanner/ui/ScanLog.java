@@ -84,11 +84,24 @@ public final class ScanLog {
     /** True while a scan is running — read by the Suite tab to auto-focus the Agent view when you open it mid-scan. */
     private volatile boolean scanActive = false;
     public boolean isScanActive() { return scanActive; }
+
+    // ---- stall watchdog: every log line stamps lastProgressMillis; a daemon thread dumps the scan threads' stacks
+    //      when no line has appeared for Tuning.stallWarnSec (so a phase blocked on a hung Burp/Collaborator/LLM call
+    //      surfaces the exact blocked method in minutes, not after a multi-hour silent hang), and force-ends the scan
+    //      after Tuning.stallAbortSec. The watchdog's OWN output is excluded from progress so a continuing stall keeps
+    //      being reported. See Tuning.stallWarnSec/stallAbortSec.
+    private volatile long lastProgressMillis = System.currentTimeMillis();
+    private volatile Thread watchdog;
+    private volatile boolean abortRequested = false;
+    private void touchProgress() { if (Thread.currentThread() != watchdog) lastProgressMillis = System.currentTimeMillis(); }
     /** Enable/disable the Stop and Rescan buttons (scan start → true, scan end / clicked → false). EDT-safe. */
     public void setScanActive(boolean active) {
         this.scanActive = active;
         if (active) {
             scanStartMillis = System.currentTimeMillis();
+            lastProgressMillis = System.currentTimeMillis();
+            abortRequested = false;
+            startWatchdog();
             hostClassClaimed.clear();
             // Estimate from the only= filter: lifecycle phases (always) + selected attack probes + post phases.
             // 6 lifecycle-before + N attack + 3 post. If no filter, use phasesTotal from last scan (learned).
@@ -106,6 +119,7 @@ public final class ScanLog {
             // Scan ended: learn the real total so the next run has a better estimate.
             int actual = phaseSeen.get();
             if (actual > 0) phasesTotal = actual;
+            stopWatchdog();
         }
         javax.swing.SwingUtilities.invokeLater(() -> {
             if (stopBtn != null) stopBtn.setEnabled(active);
@@ -116,6 +130,72 @@ public final class ScanLog {
                 probeProgress.setValue(100); probeProgress.setString("Complete ✓");
             }
         });
+    }
+
+    /** Start the stall watchdog daemon (idempotent — replaces any prior one). */
+    private void startWatchdog() {
+        stopWatchdog();
+        Thread t = new Thread(this::watchdogLoop, "aiscanner-stall-watchdog");
+        t.setDaemon(true);
+        watchdog = t;
+        t.start();
+    }
+
+    private void stopWatchdog() {
+        Thread t = watchdog; watchdog = null;
+        if (t != null) t.interrupt();
+    }
+
+    /** Poll for lack-of-progress; dump scan-thread stacks on a stall and force-end a truly wedged scan. */
+    private void watchdogLoop() {
+        long warnMs  = com.ioactive.aiscanner.scan.Tuning.stallWarnSec()  * 1000L;
+        long abortMs = com.ioactive.aiscanner.scan.Tuning.stallAbortSec() * 1000L;   // 0 → disabled
+        long checkMs = Math.max(5000L, warnMs / 4);
+        long nextWarn = warnMs;
+        while (scanActive && watchdog == Thread.currentThread()) {
+            try { Thread.sleep(checkMs); } catch (InterruptedException e) { return; }
+            if (!scanActive) return;
+            long idle = System.currentTimeMillis() - lastProgressMillis;
+            if (idle < warnMs) { nextWarn = warnMs; continue; }              // healthy → re-arm
+            if (idle >= nextWarn) { dumpStall(idle); nextWarn = idle + warnMs; }   // stalled → dump, re-arm one interval out
+            if (abortMs > 0 && idle >= abortMs && !abortRequested) {
+                abortRequested = true;
+                log("[AI Scanner] ⚠ WATCHDOG: no progress for " + (idle / 1000) + "s (> "
+                        + (abortMs / 1000) + "s abort budget) — force-ending the wedged scan via the Stop handler. "
+                        + "Raise -Daiscanner.stallAbortSec if a phase is legitimately this slow.");
+                Runnable stop = stopHandler;
+                if (stop != null) { try { stop.run(); } catch (Throwable ignore) { } }
+            }
+        }
+    }
+
+    /** Emit a stall warning plus a stack dump of every thread currently executing our scan code — turns a silent
+     *  multi-hour hang into a log line that names the exact blocked method (Burp audit-status / Collaborator poll /
+     *  LLM send / socket read). Its own log() calls don't reset the progress clock (watchdog thread is excluded). */
+    private void dumpStall(long idleMs) {
+        log("[AI Scanner] ⚠ WATCHDOG: no scan progress for " + (idleMs / 1000) + "s — phase '" + currentPhase
+                + "' appears blocked. Stacks of scan threads (topmost frame = where it is stuck):");
+        int dumped = 0;
+        for (java.util.Map.Entry<Thread, StackTraceElement[]> e : Thread.getAllStackTraces().entrySet()) {
+            Thread th = e.getKey();
+            if (th == watchdog || th == Thread.currentThread()) continue;
+            StackTraceElement[] st = e.getValue();
+            if (st == null || st.length == 0) continue;
+            boolean ours = false;
+            for (StackTraceElement f : st) if (f.getClassName().startsWith("com.ioactive.aiscanner")) { ours = true; break; }
+            if (!ours) continue;
+            StringBuilder sb = new StringBuilder("[AI Scanner]   thread '" + th.getName() + "' [" + th.getState() + "]");
+            int n = 0;
+            for (StackTraceElement f : st) {
+                sb.append("\n[AI Scanner]       at ").append(f);
+                if (++n >= 20) { sb.append("\n[AI Scanner]       … (").append(st.length - n).append(" more)"); break; }
+            }
+            log(sb.toString());
+            if (++dumped >= 6) break;   // bound the dump — the culprit is almost always the first blocked scan thread
+        }
+        if (dumped == 0)
+            log("[AI Scanner]   (no thread currently in com.ioactive.aiscanner code — the block is inside a Burp/JDK "
+                    + "call invoked from our thread; check WAITING/BLOCKED threads in Burp's own diagnostics.)");
     }
 
     /** Host-wide one-shot gate for SYSTEMIC classes (e.g. stack-trace disclosure) that several probes may each
@@ -300,8 +380,13 @@ public final class ScanLog {
 
     /** Always shown — reserve for phases, counts, and vulnerabilities. */
     public void log(String s) {
+        touchProgress();   // every emitted line = scan progress → resets the stall watchdog clock
         String tag = TARGET_TAG.get();
-        String line = LocalDateTime.now().format(TS) + " " + (tag != null ? tag : "") + s;
+        // Normalize: EVERY line carries the "[AI Scanner]" tag exactly once. Most callers embed it, but helpers
+        // (e.g. scanned(), a few debug lines) pass a bare string — without this those render as "TS scanning …"
+        // with no tag, breaking the log's uniform structure.
+        String core = (s != null && s.startsWith("[AI Scanner]")) ? s : "[AI Scanner] " + (s == null ? "" : s);
+        String line = LocalDateTime.now().format(TS) + " " + (tag != null ? tag : "") + core;
         mirror.accept(line);
         if (s.contains(">>>")) {
             findingsLog.add(s.replaceAll(".*>>>\\s*", "").trim());   // capture findings for the harness report (per-target)
@@ -495,7 +580,7 @@ public final class ScanLog {
         // the endpoint) — otherwise both engines raise a duplicate. Our finding + provenance still reach the report.
         // forceRaise overrides this for a confirmed finding Burp only reports as INFO (see the ReflectedXssProbe).
         boolean deferToBurp = !forceRaise && DEFER_TO_BURP && burpNativeAudit && BURP_COVERED.contains(familyKey(vulnClass));
-        log("[AI Scanner] >>> VULNERABILITY: " + vulnClass + "  @ " + url
+        log(">>> VULNERABILITY: " + vulnClass + "  @ " + url
                 + (point == null || point.isBlank() ? "" : "  (" + point + ")")
                 + (deferToBurp ? "  [dashboard issue deferred to Burp's native audit]" : ""));
         IssueSink s = issueSink;
@@ -565,13 +650,13 @@ public final class ScanLog {
             if (!match) {
                 if (!filterAnnounced) {   // announce the active filter ONCE, then just mark each skip tersely
                     filterAnnounced = true;
-                    log("[AI Scanner] module filter active: -Daiscanner.only=" + only + " — skipping all non-selected probe phases");
+                    log("module filter active: -Daiscanner.only=" + only + " — skipping all non-selected probe phases");
                 }
-                log("[AI Scanner] ── " + currentPhase + "  (skip)");
+                log("── " + currentPhase + "  (skip)");
                 throw new PhaseSkipped();
             }
         }
-        log("[AI Scanner] ── " + currentPhase);
+        log("── " + currentPhase);
         updatePhase();
         // The step NUMBER is the phase's position among the phases that ACTUALLY RUN under the active -Daiscanner.only
         // filter, over the count of those phases — both derived from the ONE ScanPhases registry. With NO filter this

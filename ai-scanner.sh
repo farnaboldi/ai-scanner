@@ -179,14 +179,24 @@ fi
 # too. Only enforced for the local-LLM provider; override with AISCANNER_SKIP_LLM_CHECK=1.
 if [ "${AISCANNER_PROVIDER:-LOCAL_LLM}" = "LOCAL_LLM" ] && [ "${AISCANNER_SKIP_LLM_CHECK:-0}" != "1" ]; then
   echo "preflight: testing LLM ${BASE_URL%/}/chat/completions (model=$MODEL)…"
-  PF_CODE=$(curl -s -o /tmp/aiscanner-preflight.json -w "%{http_code}" --max-time 30 \
-    -X POST "${BASE_URL%/}/chat/completions" \
-    -H "Content-Type: application/json" \
-    -H "ngrok-skip-browser-warning: 1" \
-    ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} \
-    -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"reply OK\"}],\"max_tokens\":5}" || echo "000")
+  # Retry a transient endpoint blip (e.g. an ngrok tunnel dropping for a minute) instead of aborting the whole
+  # scan → 0. Auth failures (401/403) are NOT retried (a key won't appear by waiting). Tunable via env.
+  PF_RETRIES="${AISCANNER_PREFLIGHT_RETRIES:-10}"; PF_WAIT="${AISCANNER_PREFLIGHT_WAIT:-30}"; PF_CODE="000"
+  pf_i=1
+  while [ "$pf_i" -le "$PF_RETRIES" ]; do
+    PF_CODE=$(curl -s -o /tmp/aiscanner-preflight.json -w "%{http_code}" --max-time 30 \
+      -X POST "${BASE_URL%/}/chat/completions" \
+      -H "Content-Type: application/json" \
+      -H "ngrok-skip-browser-warning: 1" \
+      ${API_KEY:+-H "Authorization: Bearer ${API_KEY}"} \
+      -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"reply OK\"}],\"max_tokens\":5}" || echo "000")
+    [ "$PF_CODE" = "200" ] && break
+    [ "$PF_CODE" = "401" ] || [ "$PF_CODE" = "403" ] && break   # auth error → retrying is pointless
+    echo "  preflight attempt $pf_i/$PF_RETRIES → HTTP $PF_CODE; retrying in ${PF_WAIT}s…" >&2
+    pf_i=$((pf_i+1)); [ "$pf_i" -le "$PF_RETRIES" ] && sleep "$PF_WAIT"
+  done
   if [ "$PF_CODE" != "200" ]; then
-    echo "ERROR: LLM preflight FAILED — HTTP $PF_CODE from ${BASE_URL%/}/chat/completions" >&2
+    echo "ERROR: LLM preflight FAILED after $PF_RETRIES attempt(s) — HTTP $PF_CODE from ${BASE_URL%/}/chat/completions" >&2
     echo "  body: $(head -c 200 /tmp/aiscanner-preflight.json 2>/dev/null)" >&2
     if [ "$PF_CODE" = "401" ] || [ "$PF_CODE" = "403" ]; then
       echo "  → the endpoint requires a key: set AISCANNER_API_KEY." >&2

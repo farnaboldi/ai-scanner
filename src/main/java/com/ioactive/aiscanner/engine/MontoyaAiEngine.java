@@ -153,7 +153,7 @@ public final class MontoyaAiEngine extends PromptAiEngine {
         if (CREDIT_START_LOGGED.compareAndSet(false, true)) {
             scanStartCredits = readCreditBalance();
             if (scanStartCredits != null)
-                logger.accept("[AI Scanner] Burp AI credits available (start of scan): " + displayBalance(scanStartCredits));
+                logger.accept("Burp AI credits available (start of scan): " + displayBalance(scanStartCredits));
         }
         PromptOptions opts = PromptOptions.promptOptions().withTemperature(clampTemp(cfg.temperature));
         Message[] msgs = (systemPrompt != null && !systemPrompt.isEmpty())
@@ -171,12 +171,12 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                 String content = resp == null || resp.content() == null ? "" : resp.content().trim();
                 // Count CALLS only (exact). No token estimate — chars/4 was unreliable and we don't display it.
                 long n = CALLS.incrementAndGet();
-                if (LogLevel.debug()) logger.accept("[AI Scanner] Burp AI call #" + String.format("%03d", n)
+                if (LogLevel.debug()) logger.accept("Burp AI call #" + String.format("%03d", n)
                         + " (session: " + n + " call(s))");
                 if (LogLevel.trace()) {
                     String c = content.replaceAll("\\s+", " ").trim();
                     if (c.length() > 160) c = c.substring(0, 160) + "…";
-                    logger.accept("[AI Scanner] Burp AI ← " + c);
+                    logger.accept("Burp AI ← " + c);
                 }
                 return content;
             } catch (Throwable e) {   // PromptException is a RuntimeException — cover it and any transport error
@@ -191,7 +191,7 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                               .append(c.getMessage() == null ? "" : ": " + c.getMessage());
                     java.io.StringWriter sw = new java.io.StringWriter();
                     e.printStackTrace(new java.io.PrintWriter(sw));
-                    logger.accept("[AI Scanner] Burp AI call FULL ERROR (debug) on attempt " + attempt + "/" + MAX_ATTEMPTS
+                    logger.accept("Burp AI call FULL ERROR (debug) on attempt " + attempt + "/" + MAX_ATTEMPTS
                             + ": " + e.getClass().getName() + (e.getMessage() == null ? "" : ": " + e.getMessage())
                             + causes + "\n" + sw);
                 }
@@ -203,7 +203,7 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                     if (EXHAUSTION_LOGGED.compareAndSet(false, true)) {
                         String bal = readCreditBalance();
                         boolean degrade = "false".equalsIgnoreCase(System.getProperty("aiscanner.haltOnCreditExhaustion", "true"));
-                        logger.accept("[AI Scanner] *** BURP AI CREDITS EXHAUSTED *** — " + lastError()
+                        logger.accept("*** BURP AI CREDITS EXHAUSTED *** — " + lastError()
                                 + ". Credits at scan start: " + (scanStartCredits == null ? "?" : scanStartCredits)
                                 + (bal == null ? "" : " -> now: " + bal) + ". Burp AI spend this session: " + CALLS.get()
                                 + " call(s). Further AI calls are "
@@ -219,12 +219,12 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                 if (attempt < MAX_ATTEMPTS && transientErr) {
                     TRANSIENT_FAILS.incrementAndGet();
                     long wait = BACKOFF_MS[Math.min(attempt - 1, BACKOFF_MS.length - 1)];
-                    logger.accept("[AI Scanner] Burp AI transient failure (attempt " + attempt + "/" + MAX_ATTEMPTS
+                    logger.accept("Burp AI transient failure (attempt " + attempt + "/" + MAX_ATTEMPTS
                             + ", connectivity): " + lastError() + " — retrying in " + (wait / 1000) + "s");
                     try { Thread.sleep(wait); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return ""; }
                     continue;
                 }
-                logger.accept("[AI Scanner] Burp AI call failed" + (transientErr ? " (gave up after " + MAX_ATTEMPTS + " tries)" : "") + ": " + lastError());
+                logger.accept("Burp AI call failed" + (transientErr ? " (gave up after " + MAX_ATTEMPTS + " tries)" : "") + ": " + lastError());
                 return "";
             }
         }

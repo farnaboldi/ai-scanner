@@ -147,14 +147,14 @@ public final class WafObserver implements HttpHandler {
         int sh = statusHits.get();
 
         if (waf > 0) {
-            scanLog.log("[AI Scanner] WAF accounting: " + waf + " of " + t + " in-scope response(s) were "
+            scanLog.log("WAF accounting: " + waf + " of " + t + " in-scope response(s) were "
                     + "WAF-BLOCKED (403=" + s403.get() + " 406=" + s406.get() + " 429=" + s429.get()
                     + " 503=" + s503.get() + " by status; " + waf + " with a WAF signal)"
                     + (fingerprint.isEmpty() ? "" : "  [fingerprint: " + fingerprint + "]"));
             synchronized (wafSamples) {
-                for (String e : wafSamples) scanLog.log("[AI Scanner]   WAF-blocked: " + e);
+                for (String e : wafSamples) scanLog.log("  WAF-blocked: " + e);
             }
-            scanLog.log("[AI Scanner] NOTE: those responses carried a WAF/edge signal — the WAF, not the app, "
+            scanLog.log("NOTE: those responses carried a WAF/edge signal — the WAF, not the app, "
                     + "dropped them. For the full request/response of each (incl. Burp's own audit payloads), "
                     + "see Burp's Logger filtered on status 403/406/429/503. Injection classes blocked here "
                     + "won't appear as findings even if the app is vulnerable (consider WAF-evasion mode); "
@@ -164,15 +164,15 @@ public final class WafObserver implements HttpHandler {
 
         // No WAF detected. Say so plainly, and explain any block-like statuses as app-origin.
         if (sh == 0) {
-            scanLog.log("[AI Scanner] WAF accounting: no WAF detected (0 block-like responses of " + t + ").");
+            scanLog.log("WAF accounting: no WAF detected (0 block-like responses of " + t + ").");
             return;
         }
-        scanLog.log("[AI Scanner] WAF accounting: no WAF detected. " + sh + " of " + t + " in-scope response(s) "
+        scanLog.log("WAF accounting: no WAF detected. " + sh + " of " + t + " in-scope response(s) "
                 + "returned a block-like status (403=" + s403.get() + " 406=" + s406.get() + " 429=" + s429.get()
                 + " 503=" + s503.get() + ") but NONE carried a WAF/edge signal — these are the APP's own "
                 + "responses (e.g. an access-control or file-type check), not a WAF block.");
         synchronized (appSamples) {
-            for (String e : appSamples) scanLog.log("[AI Scanner]   app-origin block-status: " + e);
+            for (String e : appSamples) scanLog.log("  app-origin block-status: " + e);
         }
     }
 

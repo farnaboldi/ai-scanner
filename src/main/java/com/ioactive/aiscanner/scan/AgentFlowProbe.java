@@ -84,10 +84,10 @@ public final class AgentFlowProbe {
         int hits = 0;
         try {
             String base = findAgentBase(host);
-            if (base == null) { scanLog.debug("[AI Scanner]   agent-flow: no /agents/ surface on " + host + " — skip"); return 0; }
+            if (base == null) { scanLog.debug("  agent-flow: no /agents/ surface on " + host + " — skip"); return 0; }
             String roomsUrl = base + "rooms/";
             String runsUrl  = base + "runs/";
-            scanLog.log("[AI Scanner] agent-flow: found agent API at " + base + " — driving rooms→run→turn.");
+            scanLog.log("agent-flow: found agent API at " + base + " — driving rooms→run→turn.");
 
             // 1) List rooms (authenticated + signed) and bridge into the site map.
             HttpRequestResponse roomsRr = send(withSession, "GET", roomsUrl, null);
@@ -99,16 +99,16 @@ public final class AgentFlowProbe {
                 // unlock, let the LLM plan it from the app's OWN discovered write endpoints + this gate response.
                 codes = unlockViaLlm(host, roomsUrl, withSession);
                 if (codes.isEmpty()) {
-                    scanLog.log("[AI Scanner] agent-flow: agent surface is present but NO conversation rooms are "
+                    scanLog.log("agent-flow: agent surface is present but NO conversation rooms are "
                             + "available to this account, and the LLM-planned unlock did not provision any. Reached "
                             + "and recorded the agent API; deeper turn-fuzzing needs a session that has completed the "
                             + "app's precondition (e.g. onboarding).");
                     return 0;
                 }
-                scanLog.log("[AI Scanner] agent-flow: LLM-planned unlock provisioned " + codes.size() + " room(s).");
+                scanLog.log("agent-flow: LLM-planned unlock provisioned " + codes.size() + " room(s).");
                 bridge(send(withSession, "GET", roomsUrl, null));
             }
-            scanLog.log("[AI Scanner] agent-flow: " + codes.size() + " room(s) available: " + codes);
+            scanLog.log("agent-flow: " + codes.size() + " room(s) available: " + codes);
 
             // 2) Drive a bounded set of rooms for coverage (create run + benign turn + bridge), and run the FULL
             //    LLM-fuzz battery (unicode / prompt-injection / structural) + hybrid two-tier oracle ONCE, on the
@@ -125,7 +125,7 @@ public final class AgentFlowProbe {
 
                 // Benign turn — establishes reach + adds the turns/stream request/response to the site map.
                 String benign = driveTurn(withSession, runsUrl, runId, "What can you help me with in this room?");
-                scanLog.debug("[AI Scanner]   agent-flow[" + code + "] baseline reply: "
+                scanLog.debug("  agent-flow[" + code + "] baseline reply: "
                         + (benign == null ? "(none)" : trim(benign, 160)));
 
                 // Full LLM-fuzz battery on the first drivable room, driving the run→turn flow via a message sender.
@@ -141,10 +141,10 @@ public final class AgentFlowProbe {
                     if (f >= 0) { fuzzed = true; hits += f; }
                 }
             }
-            scanLog.log("[AI Scanner] agent-flow: drove " + driven + " room(s); bridged the agent surface into the "
+            scanLog.log("agent-flow: drove " + driven + " room(s); bridged the agent surface into the "
                     + "site map for the IDOR/BFLA/JWT/chain probes.");
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] agent-flow probe error: " + t);
+            scanLog.debug("agent-flow probe error: " + t);
         }
         return hits;
     }
@@ -157,7 +157,7 @@ public final class AgentFlowProbe {
         try {
             JSONObject data = new JSONObject(rr.response().bodyToString()).optJSONObject("data");
             String id = data == null ? null : data.optString("id", null);
-            if (id == null || id.isBlank()) { scanLog.debug("[AI Scanner]   agent-flow: run create for '" + code
+            if (id == null || id.isBlank()) { scanLog.debug("  agent-flow: run create for '" + code
                     + "' → HTTP " + rr.response().statusCode() + " (no run id)"); return null; }
             return id;
         } catch (JSONException e) { return null; }
@@ -230,7 +230,7 @@ public final class AgentFlowProbe {
                 String code = o.optString("code", o.optString("room_code", ""));
                 if (!code.isBlank() && seen.add(code)) out.add(code);
             }
-        } catch (JSONException e) { scanLog.debug("[AI Scanner]   agent-flow: rooms body not JSON as expected"); }
+        } catch (JSONException e) { scanLog.debug("  agent-flow: rooms body not JSON as expected"); }
         return out;
     }
 
@@ -276,7 +276,7 @@ public final class AgentFlowProbe {
         List<String> none = new ArrayList<>();
         if (engine == null || !engine.isConfigured()) return none;
         String writes = discoveredWrites(host);
-        if (writes.isBlank()) { scanLog.debug("[AI Scanner]   agent-flow: no discovered writes to plan an unlock from"); return none; }
+        if (writes.isBlank()) { scanLog.debug("  agent-flow: no discovered writes to plan an unlock from"); return none; }
         String goal = "An AI-assistant API is present but GATED: GET " + roomsUrl + " returns an EMPTY list, so no "
                 + "conversation rooms/contexts are available to this authenticated account yet — a precondition has "
                 + "not been met (e.g. an onboarding/verification step, or a required object must be created first). "
@@ -285,19 +285,19 @@ public final class AgentFlowProbe {
                 + "onboarding/verification/submit/create steps. Return one JSON object with method,url,body.\n\n"
                 + "Discovered write endpoints on this host:\n" + writes;
         String feedback = null;
-        scanLog.log("[AI Scanner] agent-flow: assistant gated — asking the LLM to plan a generic unlock from the app's own endpoints.");
+        scanLog.log("agent-flow: assistant gated — asking the LLM to plan a generic unlock from the app's own endpoints.");
         for (int i = 0; i < MAX_UNLOCK_STEPS; i++) {
             String observation = "GET " + roomsUrl + " -> 200 {\"data\":[]}  (assistant present but no rooms; account precondition unmet)";
             String rawJson;
             try { rawJson = engine.planNextRequest(goal, observation, feedback); }
-            catch (Throwable t) { scanLog.debug("[AI Scanner]   agent-flow: planNextRequest error: " + t); break; }
+            catch (Throwable t) { scanLog.debug("  agent-flow: planNextRequest error: " + t); break; }
             PlannedRequest p = PlannedRequest.parse(rawJson);
             if (p == null) { feedback = "previous output was not a usable JSON request; return {method,url,body} for a concrete on-host endpoint"; continue; }
             if (!host.equalsIgnoreCase(hostOf(p.url()))) { feedback = "off-host url rejected: " + p.url() + " — stay on " + host; continue; }
             HttpRequestResponse rr = sendReq(withSession, p.toHttpRequest());
             bridge(rr);
             int sc = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
-            scanLog.log("[AI Scanner]   agent-flow unlock step " + (i + 1) + ": " + p.method() + " "
+            scanLog.log("  agent-flow unlock step " + (i + 1) + ": " + p.method() + " "
                     + pathOnly(p.url()) + " -> HTTP " + sc);
             List<String> codes = roomCodes(send(withSession, "GET", roomsUrl, null));
             if (!codes.isEmpty()) return codes;
@@ -341,7 +341,7 @@ public final class AgentFlowProbe {
             req = withSession.apply(req);   // adds Cookie / Authorization: Bearer / X-Signature last
             return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   agent-flow: send " + method + " " + url + " failed: " + t);
+            scanLog.debug("  agent-flow: send " + method + " " + url + " failed: " + t);
             return null;
         }
     }
@@ -353,7 +353,7 @@ public final class AgentFlowProbe {
             req = withSession.apply(req);   // sign LAST — covers final method/path/body
             return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   agent-flow: sendReq failed: " + t);
+            scanLog.debug("  agent-flow: sendReq failed: " + t);
             return null;
         }
     }

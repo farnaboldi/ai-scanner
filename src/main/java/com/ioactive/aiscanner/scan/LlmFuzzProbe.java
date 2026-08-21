@@ -107,7 +107,7 @@ public final class LlmFuzzProbe {
 
     /** Find single-request LLM endpoints in the site map and fuzz each. Returns findings raised. */
     public int probe(String host, UnaryOperator<HttpRequest> withSession) {
-        if (engine == null || !engine.isConfigured()) { scanLog.debug("[AI Scanner]   llm-fuzz: no LLM engine — skip"); return 0; }
+        if (engine == null || !engine.isConfigured()) { scanLog.debug("  llm-fuzz: no LLM engine — skip"); return 0; }
         int hits = 0, done = 0;
         Set<String> seen = new LinkedHashSet<>();
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
@@ -128,7 +128,7 @@ public final class LlmFuzzProbe {
                 hits += Math.max(f, 0);
             } catch (Throwable ignore) { }
         }
-        if (done == 0) scanLog.debug("[AI Scanner]   llm-fuzz: no passively-observed single-request LLM endpoints in site map");
+        if (done == 0) scanLog.debug("  llm-fuzz: no passively-observed single-request LLM endpoints in site map");
         // Active arm: LLM front-ends whose request is built by client JS (fetch/axios with a JSON prompt body) are
         // never captured as a POST, so the passive loop above misses them. Mine the JS for those bodies, synthesize
         // the POST, and let fuzz()'s behavioral confirmation (does it follow "6×7" instructions?) gate false positives.
@@ -180,14 +180,14 @@ public final class LlmFuzzProbe {
             } catch (Throwable ignore) { }
         }
         if (!cands.isEmpty())
-            scanLog.log("[AI Scanner] llm-fuzz: " + cands.size() + " JS-discovered LLM candidate(s) to behaviorally confirm.");
+            scanLog.log("llm-fuzz: " + cands.size() + " JS-discovered LLM candidate(s) to behaviorally confirm.");
         for (String c : cands) {
             if (done >= MAX_ENDPOINTS || tries >= MAX_SYNTH_TRIES) break;
             String[] parts = c.split("\\|", 3);
             String url = parts[0], field = parts[1], sink = parts.length > 2 ? parts[2] : "";
             if (!seen.add("POST " + Net.stripQuery(url))) continue;   // don't re-fuzz an endpoint the passive arm already did
             tries++;
-            scanLog.log("[AI Scanner]   llm-fuzz: confirming JS-discovered candidate POST " + url + " {" + field + "}"
+            scanLog.log("  llm-fuzz: confirming JS-discovered candidate POST " + url + " {" + field + "}"
                     + (sink.isEmpty() ? "" : " [reply→" + sink + " sink]"));
             Function<String, Reply> sender = msg -> sendSynth(withSession, url, field, msg);
             int f = fuzz("chat " + pathOf(url), url, sender);
@@ -243,7 +243,7 @@ public final class LlmFuzzProbe {
             int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   llm-fuzz: sendSynth failed: " + t);
+            scanLog.debug("  llm-fuzz: sendSynth failed: " + t);
             return null;
         }
     }
@@ -274,11 +274,11 @@ public final class LlmFuzzProbe {
         boolean followsInstruction = mathText != null && mathText.replaceAll("[^0-9]", "").contains("42");
         boolean variesAsProse = baseText != null && mathText != null && baseText.length() > 15 && !baseText.equals(mathText);
         if (!(followsInstruction || variesAsProse)) {
-            scanLog.debug("[AI Scanner]   llm-fuzz: " + label + " failed behavioral confirmation — not treated as an LLM"
+            scanLog.debug("  llm-fuzz: " + label + " failed behavioral confirmation — not treated as an LLM"
                     + " (base=" + (baseText == null ? "null" : baseText.length() + "c") + " math=" + (mathText == null ? "null" : "\"" + mathText.replaceAll("\\s+", " ").trim() + "\"") + ")");
             return -1;
         }
-        scanLog.log("[AI Scanner] llm-fuzz: confirmed LLM endpoint " + label + " — firing "
+        scanLog.log("llm-fuzz: confirmed LLM endpoint " + label + " — firing "
                 + LlmFuzzPayloads.all().size() + " payload(s).");
         String baselineReply = baseText != null ? baseText : "";
         String baselineRaw = base != null && base.rawBody() != null ? base.rawBody() : "";  // differentiates input-triggered errors from a chronically-erroring endpoint
@@ -288,7 +288,7 @@ public final class LlmFuzzProbe {
         // Collaborator is off, OOB payloads are skipped (they have no in-band oracle) but the rest still run.
         CollaboratorClient collab = null;
         try { collab = api.collaborator().createClient(); } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   llm-fuzz: Collaborator unavailable — OOB SSRF/code payloads skipped");
+            scanLog.debug("  llm-fuzz: Collaborator unavailable — OOB SSRF/code payloads skipped");
         }
         java.util.Map<String, LlmFuzzPayloads.Payload> tagToPayload = new java.util.LinkedHashMap<>();
         int collabIdx = 0, hits = 0;
@@ -398,7 +398,7 @@ public final class LlmFuzzProbe {
                 }
             }
         } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   llm-fuzz: collaborator poll error: " + t); }
+        catch (Throwable t) { scanLog.debug("  llm-fuzz: collaborator poll error: " + t); }
         return hits;
     }
 
@@ -431,7 +431,7 @@ public final class LlmFuzzProbe {
                 // is what killed the invented-mojibake false positive. Requires a non-trivial exact substring.
                 String evidence = o.optString("evidence", "").trim();
                 if (evidence.length() < 4 || !reply.contains(evidence)) {
-                    scanLog.debug("[AI Scanner]   llm-fuzz: judge cited evidence not verbatim in reply — rejecting "
+                    scanLog.debug("  llm-fuzz: judge cited evidence not verbatim in reply — rejecting "
                             + "as hallucination (" + pl.id() + "): "
                             + (evidence.length() > 60 ? evidence.substring(0, 60) + "…" : evidence));
                     return false;
@@ -454,7 +454,7 @@ public final class LlmFuzzProbe {
             int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   llm-fuzz: sendChat failed: " + t);
+            scanLog.debug("  llm-fuzz: sendChat failed: " + t);
             return null;
         }
     }

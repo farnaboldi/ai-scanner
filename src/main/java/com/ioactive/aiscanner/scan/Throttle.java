@@ -53,7 +53,7 @@ public final class Throttle {
         synchronized (this) {
             if (effective.get() > 1 && slots.tryAcquire()) {   // hold this permit forever → -1 effective concurrency
                 int now = effective.decrementAndGet();
-                if (log != null) log.log("[AI Scanner] throttle: HTTP " + status
+                if (log != null) log.log("throttle: HTTP " + status
                         + " (rate limit) → concurrency reduced to " + now + " + 10s backoff");
             }
         }

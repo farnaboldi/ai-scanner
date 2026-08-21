@@ -119,7 +119,7 @@ public final class NoSqlProbe {
                 String body = req.bodyToString();
                 // TRACE: which JSON targets we actually test + their baseline (so a 0-finding run is explainable
                 // — e.g. shows validate-coupon was tested, its baseline status, and whether it had fields).
-                scanLog.log("[AI Scanner] nosql: testing JSON " + req.method() + " " + req.url()
+                scanLog.log("nosql: testing JSON " + req.method() + " " + req.url()
                         + " (baseline HTTP " + baseStatus + ", " + baseLen + "b) body="
                         + (body != null && body.length() > 120 ? body.substring(0, 120) + "…" : body));
                 // Mutate ANY JSON field's value (string, null, bool) to a Mongo operator object.
@@ -171,7 +171,7 @@ public final class NoSqlProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] nosql probe error: " + t);
+            scanLog.debug("nosql probe error: " + t);
         }
         return false;
     }
@@ -311,7 +311,7 @@ public final class NoSqlProbe {
                     return true;
                 }
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] nosql auth-bypass error: " + t); }
+        } catch (Throwable t) { scanLog.debug("nosql auth-bypass error: " + t); }
         return false;
     }
 

@@ -59,6 +59,14 @@ public final class AuthenticatedExplorer {
     // they add nothing to discovery and kill the authenticated session mid-scan.
     static final Pattern SESSION_RESET = Pattern.compile(
             "(?i).*(logout|log-out|log_off|logoff|signout|sign-out|sign_out|signin|sign-in|/login|login\\.).*");
+    // A CSRF / anti-forgery TOKEN parameter (Django csrfmiddlewaretoken, Rails authenticity_token, .NET
+    // __RequestVerificationToken, Laravel _token, …). Fuzzing it is pointless AND harmful: any mutation invalidates
+    // the token so the server returns 403 before the request reaches any sink — so probes must KEEP it (with its
+    // captured value, to pass the CSRF check) but never treat it as an insertion point. Shared so every probe agrees.
+    public static final Pattern CSRF_PARAM = Pattern.compile(
+            "(?i)(csrf|xsrf|authenticity_?token|__requestverificationtoken|csrfmiddlewaretoken|anti.?forgery|^_token$)");
+    /** True when a parameter name is a CSRF/anti-forgery token that must never be fuzzed (see {@link #CSRF_PARAM}). */
+    public static boolean isCsrfParam(String name) { return name != null && CSRF_PARAM.matcher(name).find(); }
     // Path-like string literals in HTML/JS: SPA route targets, template URLs, endpoints the app
     // references (e.g. 'account-activity.html', 'bank/transfer-funds.html', '/bank/...'). This is how
     // we reach authenticated pages the crawler misses and fragment-routed views don't expose as <a href>.
@@ -122,7 +130,7 @@ public final class AuthenticatedExplorer {
             HttpRequestResponse rr = fetchFollowingRedirects(norm);
             int st = statusOf(rr);
             if (rr == null || rr.response() == null) {
-                scanLog.log("[AI Scanner]   explore: FAILED " + norm);
+                scanLog.log("  explore: FAILED " + norm);
                 continue;
             }
             api.siteMap().add(rr);
@@ -141,7 +149,7 @@ public final class AuthenticatedExplorer {
                 String setc = respSetCookie(rr);
                 if (!setc.isBlank()) extra += "  [Set-Cookie: " + trunc(setc, 80) + "]";
             }
-            scanLog.log("[AI Scanner]   explore: HTTP " + st + "  " + shown + (js ? "  [script]" : "") + extra);
+            scanLog.log("  explore: HTTP " + st + "  " + shown + (js ? "  [script]" : "") + extra);
 
             // Expand from BOTH HTML and JS: HTML gives href/src/action; every body (HTML or JS) is
             // also scanned for path-like string literals — that's how we reach fragment-routed views
@@ -181,7 +189,7 @@ public final class AuthenticatedExplorer {
             }
         }
 
-        scanLog.log("[AI Scanner] authenticated explore: fetched " + fetches + " resource(s) ("
+        scanLog.log("authenticated explore: fetched " + fetches + " resource(s) ("
                 + scripts + " script(s)) → site map.");
         return fetches;
     }
@@ -309,12 +317,12 @@ public final class AuthenticatedExplorer {
             if (rr != null && rr.response() != null) {
                 api.siteMap().add(rr);
                 formsExercised++;
-                scanLog.log("[AI Scanner]   exercised POST form → " + stripFragment(actUrl)
+                scanLog.log("  exercised POST form → " + stripFragment(actUrl)
                         + " (" + fields + " field(s), HTTP " + rr.response().statusCode() + ") → site map/audit");
                 // GENERIC debug: the cookie this POST used to reach its status — lets a later probe on the same
                 // endpoint be compared (same cookie but different status ⇒ session/jar drift). No app-specific paths.
                 String usedCookie = rr.request() != null ? rr.request().headerValue("Cookie") : null;
-                if (usedCookie != null) scanLog.debug("[AI Scanner]     exercise cookie @ " + stripFragment(actUrl)
+                if (usedCookie != null) scanLog.debug("    exercise cookie @ " + stripFragment(actUrl)
                         + " = " + trunc(usedCookie, 60));
             }
         }
@@ -443,9 +451,9 @@ public final class AuthenticatedExplorer {
                 for (String d : parseAmdDeps(body)) if (!modSeen.contains(d)) modQ.add(d);
                 fetchServerPaths(host, url, body, pathSeen, 0);
             }
-            scanLog.log("[AI Scanner] AMD module graph: fetched " + fetched + " module(s), "
+            scanLog.log("AMD module graph: fetched " + fetched + " module(s), "
                     + pathSeen.size() + " server path(s) → site map.");
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] AMD resolver error: " + t); }
+        } catch (Throwable t) { scanLog.debug("AMD resolver error: " + t); }
     }
 
     /** Fetch server-path/route string literals found in a body (recurse one extra level so a fetched menu's
@@ -471,7 +479,7 @@ public final class AuthenticatedExplorer {
                 if (st < 200 || st >= 400) continue;
                 api.siteMap().add(rr);
                 String fu = rr.request().url().toLowerCase();
-                scanLog.debug("[AI Scanner]   amd server-path: " + st + " " + rr.request().url());
+                scanLog.debug("  amd server-path: " + st + " " + rr.request().url());
                 fetchServerPaths(host, rr.request().url(), rr.response().bodyToString(), seen, depth + 1);
             }
         }

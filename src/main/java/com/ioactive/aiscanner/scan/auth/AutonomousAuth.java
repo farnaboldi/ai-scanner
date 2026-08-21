@@ -58,6 +58,11 @@ public final class AutonomousAuth {
     private static final Pattern A_LINK      = Pattern.compile("(?is)<a\\b[^>]*\\bhref\\s*=\\s*['\"]?([^'\" >]+)['\"]?[^>]*>(.*?)</a>");
     private static final Pattern REGISTER    = Pattern.compile("(?i)regist|sign.?up|new.?user|create.?account|create.?an?.?account");
     private static final Pattern USER_FIELD  = Pattern.compile("(?i).*(user|email|login|usuario|account|name).*|^log$");   // ^log$ = WordPress's username field
+    // A field that specifically denotes a LOGIN HANDLE (username/login/account) — distinct from the email address
+    // AND from descriptive name fields (first/last/display/company). USER_FIELD is deliberately broad (it matches
+    // any "…name…"), so it can't tell a signup's real username apart from firstName/companyName; this tighter
+    // pattern can. Used to decide whether an email-having register form ALSO has a plain-handle username to keep.
+    private static final Pattern LOGIN_HANDLE = Pattern.compile("(?i)(user_?name|user_?id|\\buser\\b|\\blogin\\b|account|uname|usuario|\\bhandle\\b|nick(name)?)");
     private static final Pattern SEC_SELECT  = Pattern.compile("(?i).*(security|seclev|difficulty|level|mode).*");
     private static final Pattern LOW_OPTION  = Pattern.compile("(?i)^(low|easy|insecure|none|off|no|disabled?)$");
     private static final Pattern RESET_BTN   = Pattern.compile("(?i)(create|reset|initiali[sz]e|setup|install).{0,25}(database|db|data|schema|table|app)");
@@ -87,9 +92,9 @@ public final class AutonomousAuth {
         String bearer = arg("aiscanner.bearer", "AISCANNER_BEARER");
         String signKey = arg("aiscanner.signingKey", "AISCANNER_SIGNING_KEY");
         if (cookie == null && bearer == null) return false;
-        if (cookie != null) { session.set(cookie); scanLog.log("[AI Scanner] manual session: cookie imported (" + cookie.length() + " chars)."); }
-        if (bearer != null) { session.setBearer(bearer); scanLog.log("[AI Scanner] manual session: bearer imported."); }
-        if (signKey != null) { session.setSigningKey(signKey); scanLog.log("[AI Scanner] manual session: request-signing key imported."); }
+        if (cookie != null) { session.set(cookie); scanLog.log("manual session: cookie imported (" + cookie.length() + " chars)."); }
+        if (bearer != null) { session.setBearer(bearer); scanLog.log("manual session: bearer imported."); }
+        if (signKey != null) { session.setSigningKey(signKey); scanLog.log("manual session: request-signing key imported."); }
         return session.authenticated();
     }
 
@@ -102,16 +107,28 @@ public final class AutonomousAuth {
     public boolean registerThenLogin() {
         AuthSession s = new AuthSession(api, host);
         String[] found = findRegistrationForm(s);        // {formBlock, pageUrl}
-        if (found == null) { scanLog.debug("[AI Scanner] register: no registration form on the surface."); return false; }
+        if (found == null) { scanLog.debug("register: no registration form on the surface."); return false; }
         String form = found[0], pageUrl = found[1];
         scanLog.phase("Registering an account (generic — no default creds worked)");
 
-        String user = arg("aiscanner.reg.user", "AISCANNER_REG_USER"); if (user == null) user = "aiscbot";
-        String pass = arg("aiscanner.reg.pass", "AISCANNER_REG_PASS"); if (pass == null) pass = "aiscpass";
-        // If the register form has an EMAIL field, apps validate the format — use an email-format username.
-        // The SAME value flows to login (buildBody puts `user` into the login's user/email field too), so
-        // register and login stay consistent. Non-email forms (e.g. WebGoat's username) keep the plain name.
-        if (hasEmailField(form) && !user.contains("@")) user = user + "@example.com";
+        // UNIQUE handle per run: a fixed "aiscbot" collides on re-scans (and parallel targets) — the signup then
+        // fails "username already taken", yields no sessionid, and the whole authenticated pass silently degrades to
+        // unauthenticated. A short nanoTime suffix makes every registration a fresh account.
+        String user = arg("aiscanner.reg.user", "AISCANNER_REG_USER");
+        if (user == null) user = "aiscbot" + Long.toHexString(System.nanoTime() & 0xffffffL);
+        // Strong, high-entropy, and DELIBERATELY dissimilar to the username: Django's default validators reject a
+        // password that's too short, too common, all-numeric, OR too similar to the username. The old "aiscpass"
+        // (8 lowercase, shares the "aisc" prefix with "aiscbot") got rejected as too-similar → registration silently
+        // failed → no user → the form-login could never obtain a sessionid. Mixed-case + digits + symbol, no "aisc".
+        String pass = arg("aiscanner.reg.pass", "AISCANNER_REG_PASS"); if (pass == null) pass = "Vq7!kZ9#xR2m";
+        // If the register form has an EMAIL field, apps validate the format — use an email-format identity, BUT
+        // only when the email IS the login identity (no separate handle field). When the form ALSO carries a
+        // distinct login-handle field (username/login/account — e.g. NodeGoat's userName alongside email), keep
+        // `user` a PLAIN handle: many apps validate the username as alphanumeric and REJECT an email-shaped one,
+        // silently re-rendering the signup so no session is ever established (NodeGoat: userName=…@example.com →
+        // form bounces → whole authenticated pass runs unauthenticated). The email field still gets a valid
+        // address via emailFor(user) either way, so register+login stay consistent in both shapes.
+        if (hasEmailField(form) && !hasSeparateLoginField(form) && !user.contains("@")) user = user + "@example.com";
         String action = resolveAction(form, pageUrl);
 
         HttpRequestResponse resp = null;
@@ -125,7 +142,7 @@ public final class AutonomousAuth {
                 String np = fitLength(pass, range[0], range[1]);
                 if (nu.equals(user) && np.equals(pass)) break;         // can't improve → stop
                 user = nu; pass = np;
-                scanLog.log("[AI Scanner] register: form requires " + range[0] + "-" + range[1]
+                scanLog.log("register: form requires " + range[0] + "-" + range[1]
                         + " chars → retrying as " + user + "/" + pass);
                 continue;
             }
@@ -137,12 +154,12 @@ public final class AutonomousAuth {
         // entry (the raw seed may 404 for a logged-in user), so record it as the landing.
         if (verifyAuthenticated(s)) {
             s.publishTo(session, urlOf(resp, seedUrl), pageUrl, user, pass);
-            scanLog.log("[AI Scanner] registered + authenticated as " + user + " (auto-login on signup).");
+            scanLog.log("registered + authenticated as " + user + " (auto-login on signup).");
             return true;
         }
         boolean ok = loginWith(s, user, pass);
-        if (ok) scanLog.log("[AI Scanner] registered + authenticated as " + user + " (generic register-then-login).");
-        else scanLog.log("[AI Scanner] register: could not authenticate after signup.");
+        if (ok) scanLog.log("registered + authenticated as " + user + " (generic register-then-login).");
+        else scanLog.log("register: could not authenticate after signup.");
         return ok;
     }
 
@@ -192,7 +209,7 @@ public final class AutonomousAuth {
         List<DisposableMailbox> boxes;
         try { boxes = DisposableMailbox.mintAll(api); } catch (Throwable t) { boxes = java.util.Collections.emptyList(); }
         for (DisposableMailbox box : boxes) {
-            scanLog.log("[AI Scanner] API auth: trying disposable mailbox provider '" + box.providerName() + "' (" + box.address() + ")");
+            scanLog.log("API auth: trying disposable mailbox provider '" + box.providerName() + "' (" + box.address() + ")");
             if (attemptApiRegister(loginCandidates, box.address(), box)) return true;
             if (session.authenticated()) return true;   // captured mid-attempt (e.g. signup returned a token)
             // One working provider is enough: the signup/login PATH permutation is mailbox-independent, so only
@@ -201,7 +218,7 @@ public final class AutonomousAuth {
             if (!needMailboxFallback) break;
         }
         if (attemptApiRegister(loginCandidates, null, null)) return true;   // no-verify apps: throwaway @example.com
-        scanLog.debug("[AI Scanner] API auth: no JSON login endpoint returned a token.");
+        scanLog.debug("API auth: no JSON login endpoint returned a token.");
         return false;
     }
 
@@ -263,7 +280,7 @@ public final class AutonomousAuth {
         for (String[] dc : com.ioactive.aiscanner.menu.AiContextMenuProvider.DEFAULT_CREDS) if (credKeys.add(dc[0] + " " + dc[1])) creds.add(dc);
         if (creds.isEmpty()) return false;
         if (sawPasswordGrant)
-            scanLog.log("[AI Scanner] OAuth2 password-grant form found (client_id + client_secret disclosed in page) — driving it autonomously.");
+            scanLog.log("OAuth2 password-grant form found (client_id + client_secret disclosed in page) — driving it autonomously.");
 
         for (String turl : tokenUrls) {
             if (!turl.startsWith("http://") && !turl.startsWith("https://")) continue;   // never httpRequestFromUrl a non-URL
@@ -280,7 +297,7 @@ public final class AutonomousAuth {
                     String tok = new JSONObject(body).optString("access_token", "");
                     if (!tok.isBlank()) {
                         session.setBearer(tok);
-                        scanLog.log("[AI Scanner] OAuth2 password-grant SUCCESS @ " + turl + " (user '" + c[0]
+                        scanLog.log("OAuth2 password-grant SUCCESS @ " + turl + " (user '" + c[0]
                                 + "') → access_token adopted as bearer.");
                         return true;
                     }
@@ -309,12 +326,12 @@ public final class AutonomousAuth {
         // renders the app AUTHENTICATED. Generic (no app-specific paths/fields).
         if (formLoginProvidedCreds(email, pass)) return true;
         if (loginCandidates == null || loginCandidates.isEmpty()) {
-            scanLog.log("[AI Scanner] API auth: operator credentials set but no login endpoint discovered.");
+            scanLog.log("API auth: operator credentials set but no login endpoint discovered.");
             return false;
         }
         String login = "{\"email\":\"" + esc(email) + "\",\"username\":\"" + esc(email)
                 + "\",\"password\":\"" + esc(pass) + "\"}";
-        scanLog.log("[AI Scanner] API auth: trying operator-supplied credentials (" + email + ") on "
+        scanLog.log("API auth: trying operator-supplied credentials (" + email + ") on "
                 + loginCandidates.size() + " login endpoint(s).");
         Set<String> tried = new LinkedHashSet<>();
         for (HttpRequest cand : loginCandidates) {
@@ -329,7 +346,7 @@ public final class AutonomousAuth {
         // superset body can't produce (e.g. an ASP.NET page-method wanting {data:'{credentials:{@username,…}}'}).
         // Have the model read the app's OWN login JS and construct the exact request(s). Generic — no per-app rule.
         if (llmLoginFromJs(loginCandidates)) return true;
-        scanLog.log("[AI Scanner] API auth: operator-supplied credentials did not authenticate (bad creds, MFA, or WAF).");
+        scanLog.log("API auth: operator-supplied credentials did not authenticate (bad creds, MFA, or WAF).");
         return false;
     }
 
@@ -346,7 +363,7 @@ public final class AutonomousAuth {
         String pass = arg("aiscanner.loginPassword", "AISCANNER_LOGIN_PASSWORD");
         if (user == null || pass == null) return false;
         String clientCode = gatherLoginClientCode(loginCandidates);
-        if (clientCode == null || clientCode.length() < 40) { scanLog.debug("[AI Scanner] LLM-login: no login client code to read."); return false; }
+        if (clientCode == null || clientCode.length() < 40) { scanLog.debug("LLM-login: no login client code to read."); return false; }
         java.util.LinkedHashSet<String> eps = new java.util.LinkedHashSet<>();
         if (loginCandidates != null) for (HttpRequest c : loginCandidates) { try { if (eps.size() < 12) eps.add(c.url()); } catch (Throwable ignore) {} }
         String system = "You reverse-engineer a web app's client-side login code and output the EXACT HTTP request(s) "
@@ -359,10 +376,10 @@ public final class AutonomousAuth {
         String userPrompt = "BASE URL: " + baseOrigin(seedUrl) + "\nDiscovered login endpoints: " + eps
             + "\n\nAPP LOGIN CLIENT CODE (login page HTML + its JavaScript):\n" + clientCode;
         String out;
-        try { out = engine.chat(system, userPrompt, "auth: llm-login"); } catch (Throwable t) { scanLog.debug("[AI Scanner] LLM-login chat error: " + t); return false; }
+        try { out = engine.chat(system, userPrompt, "auth: llm-login"); } catch (Throwable t) { scanLog.debug("LLM-login chat error: " + t); return false; }
         org.json.JSONArray steps = parseLoginSteps(out);
-        if (steps == null || steps.length() == 0) { scanLog.debug("[AI Scanner] LLM-login: model returned no usable steps."); return false; }
-        scanLog.log("[AI Scanner] LLM-assisted login: model produced " + steps.length() + " request(s) from the login JS.");
+        if (steps == null || steps.length() == 0) { scanLog.debug("LLM-login: model returned no usable steps."); return false; }
+        scanLog.log("LLM-assisted login: model produced " + steps.length() + " request(s) from the login JS.");
         AuthSession s = new AuthSession(api, host);
         String landing = seedUrl;
         for (int i = 0; i < steps.length(); i++) {
@@ -375,7 +392,7 @@ public final class AutonomousAuth {
             try {
                 HttpRequestResponse r = ct.toLowerCase().contains("json") ? s.postJson(url, body) : s.postForm(url, body);
                 int code = r != null && r.response() != null ? r.response().statusCode() : -1;
-                scanLog.debug("[AI Scanner]   LLM-login step " + (i + 1) + "/" + steps.length() + " " + url + " → HTTP " + code);
+                scanLog.debug("  LLM-login step " + (i + 1) + "/" + steps.length() + " " + url + " → HTTP " + code);
                 String rb = bodyOf(r);
                 Matcher jm = JWT.matcher(rb == null ? "" : rb);
                 if (jm.find()) { session.setBearer(jm.group()); captureSigningKey(rb); }
@@ -395,11 +412,11 @@ public final class AutonomousAuth {
         // verifyAuthenticated against it false-negatives — the auth cookie is the reliable signal here.)
         boolean authCookie = session.has() && AUTH_COOKIE.matcher(session.cookieHeader()).find();
         if (authCookie || session.hasBearer() || verifyAuthenticated(s)) {
-            scanLog.log("[AI Scanner] LLM-assisted login SUCCEEDED — authenticated session captured"
+            scanLog.log("LLM-assisted login SUCCEEDED — authenticated session captured"
                 + (session.has() ? " [cookie]" : "") + (session.hasBearer() ? " [bearer]" : "") + ".");
             return true;
         }
-        scanLog.log("[AI Scanner] LLM-assisted login did not authenticate (creds/2FA/shape).");
+        scanLog.log("LLM-assisted login did not authenticate (creds/2FA/shape).");
         return false;
     }
 
@@ -496,7 +513,7 @@ public final class AutonomousAuth {
                 if (verifyAuthenticated(s)) {
                     s.publishTo(session, urlOf(gr, origin + p), origin + p, email, pass);
                     session.setOwnIdentity(email);   // record our own identity so the audit won't fuzz/mutate its own account
-                    scanLog.log("[AI Scanner] operator creds: FORM login OK at " + p + " (" + f[0] + "/" + f[1]
+                    scanLog.log("operator creds: FORM login OK at " + p + " (" + f[0] + "/" + f[1]
                             + ") — session captured; Burp's crawl will render the app authenticated.");
                     return true;
                 }
@@ -529,7 +546,7 @@ public final class AutonomousAuth {
         // lenient JSON login endpoints ignore the extra fields, and the form-encoded fallback tries each id too.
         String login = "{\"username\":\"" + tag + "\",\"user\":\"" + tag + "\",\"login\":\"" + tag
                 + "\",\"name\":\"" + tag + "\",\"email\":\"" + email + "\",\"password\":\"" + pass + "\"}";
-        if (box != null) scanLog.log("[AI Scanner] API sign-up using disposable mailbox " + email);
+        if (box != null) scanLog.log("API sign-up using disposable mailbox " + email);
 
         Set<String> tried = new LinkedHashSet<>();
         for (HttpRequest cand : loginCandidates) {
@@ -557,7 +574,7 @@ public final class AutonomousAuth {
                     int sc0 = sr != null && sr.response() != null ? sr.response().statusCode() : -1;
                     if (sc0 != 404 && sc0 != -1) {
                         String sb0 = bodyOf(sr);
-                        scanLog.log("[AI Scanner] signup " + signupUrl + " → HTTP " + sc0 + " | "
+                        scanLog.log("signup " + signupUrl + " → HTTP " + sc0 + " | "
                                 + (sb0 == null ? "" : sb0.substring(0, Math.min(160, sb0.length())).replaceAll("\\s+", " ")));
                     }
                     // Structural failure → mark dead so no candidate/provider ever re-POSTs it. 405/501 = wrong
@@ -577,7 +594,7 @@ public final class AutonomousAuth {
                         if ((filled == null || filled.equals(signup)) && engine != null)   // fallback to the model
                             filled = forceIdentity(engine.fillRegistration(signup, rbody, email, pass), email, pass);
                         if (filled == null || filled.isBlank() || filled.equals(signup)) break;
-                        scanLog.log("[AI Scanner] sign-up: completed required fields from the app's validation errors, retrying…");
+                        scanLog.log("sign-up: completed required fields from the app's validation errors, retrying…");
                         signup = filled;
                         sr = registerSend(signupUrl, signup);
                     }
@@ -638,7 +655,7 @@ public final class AutonomousAuth {
             session.setBearer(jm.group());
             captureSigningKey(body);
             s.publishTo(session, seedUrl, null, null, null);                    // carry any auth cookies too
-            scanLog.log("[AI Scanner] API auth: registered + logged in via " + loginUrl
+            scanLog.log("API auth: registered + logged in via " + loginUrl
                     + " (signup " + signupUrl + ") → JWT bearer captured."
                     + (session.hasSigningKey() ? " [+ request-signing key]" : ""));
             return true;
@@ -662,10 +679,10 @@ public final class AutonomousAuth {
                 // cookie (AUTH_COOKIE) OR reaching authenticated content.
                 boolean authCookie = session.has() && AUTH_COOKIE.matcher(session.cookieHeader()).find();
                 if (authCookie || verifyAuthenticated(s)) {
-                    scanLog.log("[AI Scanner] API auth: registered + logged in via " + loginUrl + " → authenticated session captured.");
+                    scanLog.log("API auth: registered + logged in via " + loginUrl + " → authenticated session captured.");
                     return true;
                 }
-                scanLog.debug("[AI Scanner]   " + loginUrl + " returned JSON+cookie but no auth cookie and not authenticated"
+                scanLog.debug("  " + loginUrl + " returned JSON+cookie but no auth cookie and not authenticated"
                         + " content — a session-tracking cookie, not a login; continuing to the real login.");
             }
         }
@@ -679,7 +696,7 @@ public final class AutonomousAuth {
         if (code == 404 || code == 405 || code == 501 || code <= 0 || code == 403 || code == 429) {
             deadLoginUrls.add(loginUrl);
             String why = (code == 403 || code == 429) ? "blocked (WAF/rate-limit) — stopping to avoid hammering" : "not a login handler";
-            scanLog.debug("[AI Scanner]   login " + loginUrl + " → HTTP " + code + " — " + why + "; skipping further attempts.");
+            scanLog.debug("  login " + loginUrl + " → HTTP " + code + " — " + why + "; skipping further attempts.");
             return false;
         }
         // FORM-ENCODED login fallback: Spring Security formLogin and classic server apps take
@@ -714,18 +731,18 @@ public final class AutonomousAuth {
                     if (fc >= 200 && fc < 400 && !backOnLogin && !s.cookieHeader().isBlank() && verifyAuthenticated(s)) {
                         s.publishTo(session, seedUrl, null, null, null);
                         if (session.has()) {
-                            scanLog.log("[AI Scanner] API auth: logged in via " + loginUrl
+                            scanLog.log("API auth: logged in via " + loginUrl
                                     + " (form-encoded) → authenticated session captured.");
                             return true;
                         }
                     } else if (fc >= 200 && fc < 400 && !s.cookieHeader().isBlank()) {
-                        scanLog.debug("[AI Scanner]   " + loginUrl + " returned a cookie but did NOT reach authenticated "
+                        scanLog.debug("  " + loginUrl + " returned a cookie but did NOT reach authenticated "
                                 + "content (SSO/federation redirect?) — not accepted; trying the real login.");
                     }
                 }
             }
         } catch (Throwable ignore) { }
-        scanLog.log("[AI Scanner] login " + loginUrl + " → HTTP " + code + " (no token/cookie) | "
+        scanLog.log("login " + loginUrl + " → HTTP " + code + " (no token/cookie) | "
                 + (body == null ? "" : body.substring(0, Math.min(140, body.length())).replaceAll("\\s+", " ")));
         return false;
     }
@@ -738,18 +755,18 @@ public final class AutonomousAuth {
         String value = engine != null ? engine.extractVerificationCode(mail) : regexVerification(mail);
         if (value == null || value.isBlank()) return false;
         if (value.startsWith("http")) {
-            scanLog.log("[AI Scanner] sign-up: confirming account via emailed link…");
+            scanLog.log("sign-up: confirming account via emailed link…");
             s.get(value);
             return true;
         }
-        scanLog.log("[AI Scanner] sign-up: submitting emailed verification code " + value + " …");
+        scanLog.log("sign-up: submitting emailed verification code " + value + " …");
         for (String vurl : verifySiblings(signupUrl)) {
             for (String field : new String[]{ "otp", "code", "token", "verificationCode", "verification_code", "pin" }) {
                 HttpRequestResponse r = s.postJson(vurl, "{\"email\":\"" + email + "\",\"" + field + "\":\"" + value + "\"}");
                 int code = r != null && r.response() != null ? r.response().statusCode() : -1;
                 if (code == 404 || code == -1) continue;                    // wrong endpoint/field — skip quietly
                 String vb = bodyOf(r);
-                scanLog.log("[AI Scanner]   verify " + vurl + " {" + field + "} → HTTP " + code + " | "
+                scanLog.log("  verify " + vurl + " {" + field + "} → HTTP " + code + " | "
                         + (vb == null ? "" : vb.substring(0, Math.min(120, vb.length())).replaceAll("\\s+", " ")));
                 if (code < 400) {
                     // OTP-first flow: the verify response ITSELF returns the session (a JWT/access token or a
@@ -760,11 +777,11 @@ public final class AutonomousAuth {
                         session.setBearer(jm.group());
                         captureSigningKey(vb);
                         s.publishTo(session, seedUrl, null, null, null);
-                        scanLog.log("[AI Scanner] sign-up: email verified → JWT captured from verify response — authenticated."
+                        scanLog.log("sign-up: email verified → JWT captured from verify response — authenticated."
                                 + (session.hasSigningKey() ? " [+ request-signing key]" : ""));
                     } else if (!s.cookieHeader().isBlank()) {
                         s.publishTo(session, seedUrl, null, null, null);
-                        if (session.has()) scanLog.log("[AI Scanner] sign-up: email verified → session cookie captured — authenticated.");
+                        if (session.has()) scanLog.log("sign-up: email verified → session cookie captured — authenticated.");
                     }
                     return true;
                 }
@@ -1037,7 +1054,8 @@ public final class AutonomousAuth {
         if (lf == null) return false;
         String form = lf[0], pageUrl = lf[1];
         String action = resolveAction(form, pageUrl);
-        HttpRequestResponse resp = s.postForm(action, buildBody(form, user, pass, /*forLogin*/true, null));
+        String loginBody = buildBody(form, user, pass, /*forLogin*/true, null);
+        HttpRequestResponse resp = s.postForm(action, loginBody);
         if (!verifyAuthenticated(s)) return false;
         s.publishTo(session, urlOf(resp, pageUrl), pageUrl, user, pass);   // login redirect's final url = real entry
         return true;
@@ -1059,7 +1077,7 @@ public final class AutonomousAuth {
             String action = resolveAction(form, urlOf(rr, url));
             s.postForm(action, buildBody(form, null, null, false, null));   // reset button included by buildBody
             inited++;
-            scanLog.log("[AI Scanner] posture: submitted create/reset-data form via " + action);
+            scanLog.log("posture: submitted create/reset-data form via " + action);
         }
         if (inited > 0) s.publishTo(session, session.landingUrl(), null, null, null);
         return inited;
@@ -1108,7 +1126,7 @@ public final class AutonomousAuth {
         String action = resolveAction(form, urlOf(rr, pageUrl));
         s.postForm(action, buildBody(form, null, null, false, new String[]{selectName, value}));
         s.publishTo(session, session.landingUrl(), null, null, null);
-        scanLog.log("[AI Scanner] posture: set '" + selectName + "'=" + value + " via " + action);
+        scanLog.log("posture: set '" + selectName + "'=" + value + " via " + action);
         return true;
     }
 
@@ -1209,13 +1227,32 @@ public final class AutonomousAuth {
         for (int attempt = 0; attempt < 3; attempt++) {
             HttpRequestResponse rr = s.get(seedUrl);
             if (rr != null && rr.response() != null) {
+                int st = rr.response().statusCode();
                 String url = urlOf(rr, seedUrl).toLowerCase();
                 String b = bodyOf(rr);
                 boolean onLogin = url.matches("(?i).*(login|signin|sign-in).*") || PW_INPUT.matcher(b).find();
+                // A 3xx whose Location points at a login/auth path = still UNauthenticated (the app bounced us).
+                String loc = rr.response().hasHeader("Location") ? rr.response().headerValue("Location") : null;
+                if (st >= 300 && st < 400 && loc != null
+                        && loc.toLowerCase().matches("(?i).*(login|signin|sign-in).*")) onLogin = true;
                 boolean logout = LOGOUT.matcher(b).find();
-                if (!onLogin && (logout || !s.cookieHeader().isBlank())) return true;
+                // Require a REAL session cookie. A CSRF/anti-forgery token (csrftoken, XSRF-TOKEN, _token…) is set even
+                // when logged OUT, so it must NOT count as a session — treating any cookie as one was a false positive
+                // that "authenticated" the scan with only csrftoken (no sessionid), leaving every protected page
+                // bouncing to login and every authed POST 403'ing.
+                if (!onLogin && (logout || hasRealSessionCookie(s))) return true;
             }
             try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
+        return false;
+    }
+
+    /** True when the jar holds a cookie that ISN'T a CSRF/anti-forgery token — i.e. a genuine session cookie. */
+    private boolean hasRealSessionCookie(AuthSession s) {
+        for (String kv : s.cookieHeader().split(";")) {
+            int eq = kv.indexOf('=');
+            String name = (eq > 0 ? kv.substring(0, eq) : kv).trim();
+            if (!name.isEmpty() && !com.ioactive.aiscanner.scan.AuthenticatedExplorer.isCsrfParam(name)) return true;
         }
         return false;
     }
@@ -1329,6 +1366,26 @@ public final class AutonomousAuth {
             String name = lower(attr(tag, "name"));
             if ("email".equals(type)) return true;
             if (name != null && (name.contains("email") || name.contains("mail"))) return true;
+        }
+        return false;
+    }
+
+    /** True if the form carries a non-email login-handle field (username/login/account) that is separate from the
+     *  email address. When present alongside an email field, the handle must stay a PLAIN value (not email-shaped)
+     *  — see the call site in {@link #registerThenLogin}. Skips email/password/hidden inputs and email-named fields,
+     *  and uses {@link #LOGIN_HANDLE} (not the broad USER_FIELD) so firstName/lastName/companyName don't count. */
+    private static boolean hasSeparateLoginField(String form) {
+        Matcher m = TAG.matcher(form);
+        while (m.find()) {
+            if (!"input".equalsIgnoreCase(m.group(1))) continue;
+            String tag = m.group();
+            String type = lower(attr(tag, "type"));
+            String name = attr(tag, "name");
+            if (name == null || name.isBlank()) continue;
+            if ("email".equals(type) || "password".equals(type) || "hidden".equals(type)) continue;
+            String nlow = name.toLowerCase();
+            if (nlow.contains("email") || nlow.contains("mail")) continue;
+            if (LOGIN_HANDLE.matcher(name).find()) return true;
         }
         return false;
     }

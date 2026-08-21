@@ -111,7 +111,7 @@ public final class PrivilegeParityProbe {
                 hits++;
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] privilege-parity probe error: " + t);
+            scanLog.debug("privilege-parity probe error: " + t);
         }
         return hits;
     }

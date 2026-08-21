@@ -92,7 +92,7 @@ public final class CommandInjectionProbe {
                 if (confirm(req, p.name(), p.name() + " (" + p.type() + ")", timeBased)) { any = true; break; }
             }
             return any;
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] cmdi probe error: " + t); return false; }
+        } catch (Throwable t) { scanLog.debug("cmdi probe error: " + t); return false; }
     }
 
     /** Run the eval (always) + time-based (when enabled) oracles on one param of one request. */
@@ -139,7 +139,7 @@ public final class CommandInjectionProbe {
                     }
                 }
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] cmdi confirm error: " + t); }
+        } catch (Throwable t) { scanLog.debug("cmdi confirm error: " + t); }
         return false;
     }
 
@@ -167,7 +167,7 @@ public final class CommandInjectionProbe {
             HttpRequest req = HttpRequest.httpRequestFromUrl(abs).withMethod(method);
             for (String p : allParams) req = req.withAddedParameters(HttpParameter.urlParameter(p, seed(p)));
             return req;
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] cmdi synth error for " + h.path + ": " + t); return null; }
+        } catch (Throwable t) { scanLog.debug("cmdi synth error for " + h.path + ": " + t); return null; }
     }
 
     /** A benign baseline value for a param — a resolvable host for command sinks, else a harmless "1". */

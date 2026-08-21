@@ -80,11 +80,11 @@ public final class CoarseSourceAnalyzer implements SourceAnalyzer {
         try {
             root = Paths.get(repoPath).toRealPath();     // resolves symlinks so the escape-guard below is sound
         } catch (Exception e) {
-            scanLog.debug("[AI Scanner] SAST: repo path unreadable (" + repoPath + "): " + e);
+            scanLog.debug("SAST: repo path unreadable (" + repoPath + "): " + e);
             return SourceFindings.empty();
         }
         if (!Files.isDirectory(root)) {
-            scanLog.debug("[AI Scanner] SAST: not a directory: " + root);
+            scanLog.debug("SAST: not a directory: " + root);
             return SourceFindings.empty();
         }
 
@@ -97,23 +97,23 @@ public final class CoarseSourceAnalyzer implements SourceAnalyzer {
         }
 
         if (snips.isEmpty()) {
-            scanLog.debug("[AI Scanner] SAST: no route/sink signals found under " + root + " — no hints.");
+            scanLog.debug("SAST: no route/sink signals found under " + root + " — no hints.");
             return SourceFindings.empty();
         }
-        scanLog.log("[AI Scanner] SAST: scanned " + files[0] + " file(s), " + snips.size()
+        scanLog.log("SAST: scanned " + files[0] + " file(s), " + snips.size()
                 + " route/sink signal(s) → querying the model…");
 
         String skills = SkillLibrary.promptExcerpt(root, 3500);
-        if (!skills.isBlank()) scanLog.debug("[AI Scanner] SAST: injected stack skill guidance (" + skills.length() + " chars).");
+        if (!skills.isBlank()) scanLog.debug("SAST: injected stack skill guidance (" + skills.length() + " chars).");
         String reply;
         try {
             reply = engine.chat(SkillLibrary.augment(systemPrompt(), skills), userPrompt(host, snips), "sast: coarse");
         } catch (Exception e) {
-            scanLog.debug("[AI Scanner] SAST: model call failed: " + e);
+            scanLog.debug("SAST: model call failed: " + e);
             return SourceFindings.empty();
         }
         List<StaticHint> hints = StaticHint.parseArray(reply);
-        if (hints.isEmpty()) scanLog.debug("[AI Scanner] SAST: model returned no usable directives.");
+        if (hints.isEmpty()) scanLog.debug("SAST: model returned no usable directives.");
         return new SourceFindings(hints);
     }
 

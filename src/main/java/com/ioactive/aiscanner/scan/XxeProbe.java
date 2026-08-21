@@ -52,10 +52,10 @@ public final class XxeProbe {
                 boolean xml = (ct != null && ct.toLowerCase().contains("xml"))
                         || (body != null && body.trim().startsWith("<"));
                 if (xml) { xmlEndpoints.putIfAbsent(m + " " + Net.stripQuery(req.url()), req); continue; }
-                scanLog.debug("[AI Scanner]   xxe-scan skip " + m + " " + Net.stripQuery(req.url()) + " ct=[" + ct + "]");
+                scanLog.debug("  xxe-scan skip " + m + " " + Net.stripQuery(req.url()) + " ct=[" + ct + "]");
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] XXE probe collect error: " + t); }
-        scanLog.log("[AI Scanner] XXE probe: " + writeReqs + " write-request(s) in site map, "
+        } catch (Throwable t) { scanLog.debug("XXE probe collect error: " + t); }
+        scanLog.log("XXE probe: " + writeReqs + " write-request(s) in site map, "
                 + xmlEndpoints.size() + " XML-bodied.");
         if (xmlEndpoints.isEmpty()) return 0;
 
@@ -63,7 +63,7 @@ public final class XxeProbe {
         try {
             client = api.collaborator().createClient();
         } catch (Throwable t) {
-            scanLog.log("[AI Scanner] XXE probe: Burp Collaborator unavailable — skipping OOB XXE ("
+            scanLog.log("XXE probe: Burp Collaborator unavailable — skipping OOB XXE ("
                     + xmlEndpoints.size() + " XML endpoint(s) not tested for blind XXE).");
             return 0;
         }
@@ -87,9 +87,9 @@ public final class XxeProbe {
                 HttpRequestResponse injRr = api.http().sendRequest(inj, RequestOptions.requestOptions().withResponseTimeout(12000L));
                 tagToInj.put(tag, injRr);                                // keep the payload request as attachable evidence
                 testedUrls.add(url);
-            } catch (Throwable t) { scanLog.log("[AI Scanner] XXE probe send error: " + t); }
+            } catch (Throwable t) { scanLog.log("XXE probe send error: " + t); }
         }
-        scanLog.log("[AI Scanner] XXE probe: sent OOB payloads to " + testedUrls.size()
+        scanLog.log("XXE probe: sent OOB payloads to " + testedUrls.size()
                 + " XML endpoint(s); polling Collaborator…");
 
         // poll for interactions — the server-side fetch needs a network round trip
@@ -115,9 +115,9 @@ public final class XxeProbe {
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] XXE probe poll error: " + t); }
+        } catch (Throwable t) { scanLog.debug("XXE probe poll error: " + t); }
 
-        if (hits == 0) scanLog.log("[AI Scanner] XXE probe: no Collaborator interaction (no blind XXE, or "
+        if (hits == 0) scanLog.log("XXE probe: no Collaborator interaction (no blind XXE, or "
                 + "target has no egress to the Collaborator server).");
         return hits;
     }

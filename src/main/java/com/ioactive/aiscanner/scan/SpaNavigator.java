@@ -64,7 +64,7 @@ public final class SpaNavigator {
         // deep protocol becomes readable below. Deterministic + generic: it only follows refs the app itself emits.
         fetchOnDemandJs(host, origin);
         String appJs = gatherDataCallJs(host);
-        if (appJs.length() < 80) { scanLog.debug("[AI Scanner] SPA-nav: no client data-call JS in the site map — nothing to drive."); return 0; }
+        if (appJs.length() < 80) { scanLog.debug("SPA-nav: no client data-call JS in the site map — nothing to drive."); return 0; }
         // Vocabulary from the FULL data-call JS corpus (every fetched module), NOT the truncated call-site context —
         // otherwise a rich module that got crowded out of the 38k budget (e.g. the interface-load file) takes its
         // exact op names with it and the model keeps guessing. The corpus scan guarantees the real names are present.
@@ -76,7 +76,7 @@ public final class SpaNavigator {
         for (int round = 0; round < MAX_ROUNDS && reached < MAX_TOTAL; round++) {
             String out;
             try { out = engine.chat(SYSTEM, buildUser(origin, appJs, vocab, observed, saturatedOps(opCount)), "spa-nav: plan"); }
-            catch (Throwable t) { scanLog.debug("[AI Scanner] SPA-nav chat error: " + t); break; }
+            catch (Throwable t) { scanLog.debug("SPA-nav chat error: " + t); break; }
             List<Req> reqs = parseReqs(out);
             if (reqs.isEmpty()) break;
             boolean anyNew = false;
@@ -84,12 +84,12 @@ public final class SpaNavigator {
                 if (reached >= MAX_TOTAL) break;
                 String url = absolutize(origin, r.url);
                 if (url == null || !sameHost(url, host)) continue;
-                if (isDestructive(r)) { scanLog.debug("[AI Scanner] SPA-nav skip (state-changing): " + r.method + " " + url); continue; }
+                if (isDestructive(r)) { scanLog.debug("SPA-nav skip (state-changing): " + r.method + " " + url); continue; }
                 // OPERATION saturation: a dispatcher op already reached SATURATE× (same url+selector, different ids)
                 // adds no audit surface — the id is one fuzzable param, tested once. Stop burning budget re-enumerating
                 // it; force the model toward NEW operation types + descending into each module's grid/search.
                 String op = opSignature(url, r.body);
-                if (opCount.getOrDefault(op, 0) >= SATURATE) { scanLog.debug("[AI Scanner] SPA-nav skip saturated op: " + op); continue; }
+                if (opCount.getOrDefault(op, 0) >= SATURATE) { scanLog.debug("SPA-nav skip saturated op: " + op); continue; }
                 String sig = up(r.method) + " " + url + " " + Integer.toHexString((r.body == null ? "" : r.body).hashCode());
                 if (!tried.add(sig)) continue;
                 HttpRequestResponse rr = execRepair(r.method, url, r.contentType, r.body);
@@ -103,13 +103,13 @@ public final class SpaNavigator {
                     reached++;
                     opCount.merge(op, 1, Integer::sum);
                 }
-                scanLog.debug("[AI Scanner]   SPA-nav " + up(r.method) + " " + url.replaceAll("^https?://[^/]+", "")
+                scanLog.debug("  SPA-nav " + up(r.method) + " " + url.replaceAll("^https?://[^/]+", "")
                         + (r.body != null && !r.body.isEmpty() ? " body=" + clip(r.body, 160) : "")
                         + " -> HTTP " + rr.response().statusCode());
             }
             if (!anyNew) break;
         }
-        if (reached > 0) scanLog.log("[AI Scanner] SPA navigator: reached " + reached
+        if (reached > 0) scanLog.log("SPA navigator: reached " + reached
                 + " authenticated data endpoint(s) the static crawl missed → added to the audit surface for probing.");
         return reached;
     }
@@ -233,11 +233,11 @@ public final class SpaNavigator {
                     if (fetchJs(abs) != null) llm++;
                 }
             }
-            if (det + llm > 0) scanLog.log("[AI Scanner] SPA-nav: pulled " + (det + llm)
+            if (det + llm > 0) scanLog.log("SPA-nav: pulled " + (det + llm)
                     + " on-demand JS module(s) into the site map" + (llm > 0 ? " (" + llm + " via LLM-inferred computed paths)" : "")
                     + " — exposing the grid/interface-load protocol.");
-            else scanLog.debug("[AI Scanner] SPA-nav: no new on-demand JS modules to fetch.");
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] SPA-nav on-demand JS fetch error: " + t); }
+            else scanLog.debug("SPA-nav: no new on-demand JS modules to fetch.");
+        } catch (Throwable t) { scanLog.debug("SPA-nav on-demand JS fetch error: " + t); }
     }
 
     /** GET a .js url (authenticated), add to site map if it's a real script (not an HTML 200-fallback); return body. */
@@ -392,7 +392,7 @@ public final class SpaNavigator {
         for (String variant : stringifiedVariants(body)) {
             HttpRequestResponse rr2 = exec(method, url, ct, variant);
             if (rr2 != null && rr2.response() != null && rr2.response().statusCode() < 400) {
-                scanLog.debug("[AI Scanner]   SPA-nav shape-repair: nested payload field stringified → HTTP "
+                scanLog.debug("  SPA-nav shape-repair: nested payload field stringified → HTTP "
                         + rr2.response().statusCode());
                 return rr2;
             }
@@ -505,7 +505,7 @@ public final class SpaNavigator {
                 }
             }
         }
-        if (list.isEmpty()) scanLog.debug("[AI Scanner]   SPA-nav: no parseable request objects in model output (" + clip(t.trim(), 140) + ")");
+        if (list.isEmpty()) scanLog.debug("  SPA-nav: no parseable request objects in model output (" + clip(t.trim(), 140) + ")");
         return list;
     }
 

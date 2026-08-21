@@ -132,7 +132,7 @@ public final class InsecureDeserializationProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] insecure-deserialization probe error: " + t);
+            scanLog.debug("insecure-deserialization probe error: " + t);
         }
         return hits;
     }
@@ -188,14 +188,14 @@ public final class InsecureDeserializationProbe {
     private Oob confirmOob(String url, String cookieName) {
         CollaboratorClient client;
         try { client = api.collaborator().createClient(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner] deser OOB: Collaborator unavailable."); return null; }
+        catch (Throwable t) { scanLog.debug("deser OOB: Collaborator unavailable."); return null; }
         try {
             CollaboratorPayload payload = client.generatePayload();
             String domain = payload.toString();
             byte[] gadget = urldnsGadget(domain);
-            if (gadget == null) { scanLog.debug("[AI Scanner] deser OOB: URLDNS build failed (needs --add-opens java.base/java.net)."); return null; }
+            if (gadget == null) { scanLog.debug("deser OOB: URLDNS build failed (needs --add-opens java.base/java.net)."); return null; }
             HttpRequestResponse rr = getWithCookie(url, cookieName, Base64.getEncoder().encodeToString(gadget));
-            scanLog.log("[AI Scanner] deser OOB: sent URLDNS gadget (" + domain + ") — polling Collaborator…");
+            scanLog.log("deser OOB: sent URLDNS gadget (" + domain + ") — polling Collaborator…");
             for (int round = 0; round < 6; round++) {
                 Thread.sleep(2500);
                 List<Interaction> its = client.getAllInteractions();
@@ -203,7 +203,7 @@ public final class InsecureDeserializationProbe {
             }
             return new Oob(false, domain, null, rr);
         } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
-        catch (Throwable t) { scanLog.debug("[AI Scanner] deser OOB error: " + t); return null; }
+        catch (Throwable t) { scanLog.debug("deser OOB error: " + t); return null; }
     }
 
     /** Build a URLDNS serialized gadget: a HashMap keyed by a URL whose cached hashCode is reset to -1, so on the

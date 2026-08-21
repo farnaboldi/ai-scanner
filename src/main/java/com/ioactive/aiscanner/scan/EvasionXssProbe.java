@@ -44,7 +44,7 @@ public final class EvasionXssProbe {
                         p.name() + " (" + p.type() + ")")) return true;
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] evasion-XSS probe error: " + t);
+            scanLog.debug("evasion-XSS probe error: " + t);
         }
         return false;
     }

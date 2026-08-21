@@ -71,19 +71,19 @@ final class VerboseErrorProbe {
                 if (!leaks.containsKey(key) && StackTraceOracle.hasStackTrace(rr)) leaks.put(key, rr);
                 if (PAGE_METHOD.matcher(pathOf(key)).find() || isJsonApi(key, rr)) fuzzTargets.add(key);
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner]   verbose-error site-map scan error: " + t); }
+        } catch (Throwable t) { scanLog.debug("  verbose-error site-map scan error: " + t); }
 
         // (2) active: POST a malformed body ({} → missing required fields) to page-method + rest/JSON-API endpoints
         //     not already flagged, skipping clearly state-changing verbs (non-destructive). Fire on the strong
         //     oracle, re-confirmed. `{}` trips the framework's model-binding / parameter-validation error path.
         long restCount = fuzzTargets.stream().filter(u -> REST_API_PATH.matcher(pathOf(u)).find()).count();
-        scanLog.log("[AI Scanner] verbose-error probe: " + fuzzTargets.size() + " malformed-body target(s) ("
+        scanLog.log("verbose-error probe: " + fuzzTargets.size() + " malformed-body target(s) ("
                 + restCount + " rest/API-path) + " + leaks.size() + " already-leaking from passive scan.");
         int sent = 0;
         for (String url : fuzzTargets) {
             if (sent >= MAX_ACTIVE) break;
             if (leaks.containsKey(url)) continue;
-            if (UNSAFE_PATH.matcher(pathOf(url)).find()) { scanLog.debug("[AI Scanner]   verbose-error: skip state-changing endpoint " + url); continue; }
+            if (UNSAFE_PATH.matcher(pathOf(url)).find()) { scanLog.debug("  verbose-error: skip state-changing endpoint " + url); continue; }
             sent++;
             try {
                 HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
@@ -99,7 +99,7 @@ final class VerboseErrorProbe {
         }
 
         if (leaks.isEmpty()) {
-            scanLog.log("[AI Scanner] verbose-error probe: no stack-trace disclosure found.");
+            scanLog.log("verbose-error probe: no stack-trace disclosure found.");
             return 0;
         }
         // Rank leaking endpoints by disclosure severity (a DB-schema/SQL leak reveals far more than a bare framework
@@ -111,7 +111,7 @@ final class VerboseErrorProbe {
         String primary = endpoints.get(0);
         // Systemic class — one issue per host. If SamlProbe already claimed it, just note the extra endpoints.
         if (!scanLog.firstForHost("Stack trace disclosure", primary)) {
-            scanLog.log("[AI Scanner] verbose-error probe: stack-trace disclosure already reported for this host; "
+            scanLog.log("verbose-error probe: stack-trace disclosure already reported for this host; "
                     + "also affected: " + preview(endpoints));
             return 0;
         }
@@ -143,7 +143,7 @@ final class VerboseErrorProbe {
         }
         scanLog.found("Stack trace disclosure", primary, detail, evidence.toArray(new HttpRequestResponse[0]));
         scanLog.incFinding();
-        scanLog.log("[AI Scanner] verbose-error probe: stack-trace disclosure @ " + endpoints.size() + " endpoint(s)"
+        scanLog.log("verbose-error probe: stack-trace disclosure @ " + endpoints.size() + " endpoint(s)"
                 + (anyDb ? " (incl. DB-schema leak)" : "") + "; " + evidence.size() + " evidence artifact(s) attached.");
         return 1;
     }

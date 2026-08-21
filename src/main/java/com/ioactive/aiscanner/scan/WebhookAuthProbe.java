@@ -62,8 +62,8 @@ public final class WebhookAuthProbe {
         int hits = 0;
         try {
             Set<String> candidates = discoverCandidates(host);
-            if (candidates.isEmpty()) { scanLog.debug("[AI Scanner]   webhook-auth: no webhook/callback candidates"); return 0; }
-            scanLog.log("[AI Scanner] webhook-auth probe: testing " + candidates.size()
+            if (candidates.isEmpty()) { scanLog.debug("  webhook-auth: no webhook/callback candidates"); return 0; }
+            scanLog.log("webhook-auth probe: testing " + candidates.size()
                     + " webhook/callback candidate(s) for signature fail-open.");
             Set<String> fired = new LinkedHashSet<>();
             for (String url : candidates) {
@@ -87,7 +87,7 @@ public final class WebhookAuthProbe {
                 hits++;
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] webhook-auth probe error: " + t);
+            scanLog.debug("webhook-auth probe error: " + t);
         }
         return hits;
     }

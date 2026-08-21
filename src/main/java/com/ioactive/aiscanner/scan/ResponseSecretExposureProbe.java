@@ -127,7 +127,7 @@ public final class ResponseSecretExposureProbe {
                 }
             }
         } catch (Throwable e) {
-            scanLog.debug("[AI Scanner] response-secret probe error: " + e);
+            scanLog.debug("response-secret probe error: " + e);
         }
         return hits;
     }

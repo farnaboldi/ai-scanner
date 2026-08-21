@@ -173,6 +173,7 @@ public final class BlindSqliProbe {
             for (ParsedHttpParameter p : req.parameters()) {
                 if (System.currentTimeMillis() > deadlineMs) return false;
                 if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;
+                if (AuthenticatedExplorer.isCsrfParam(p.name())) continue;   // mutating a CSRF token → 403, never a sink
                 String orig = p.value() == null ? "" : p.value();
                 if (runChannels(req, v -> inject(req, p, v),
                         p.name() + " (" + p.type() + ")", orig, seeds(orig), baseMs)) return true;
@@ -234,7 +235,7 @@ public final class BlindSqliProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] blind-sqli probe error: " + t);
+            scanLog.debug("blind-sqli probe error: " + t);
         }
         return false;
     }
@@ -318,13 +319,13 @@ public final class BlindSqliProbe {
             HttpRequestResponse tRr = send(tReq);
             long dt = (System.nanoTime() - s0) / 1_000_000;
             String tStatus = (tRr != null && tRr.response() != null) ? "HTTP " + tRr.response().statusCode() : "timeout";
-            scanLog.debug("[AI Scanner] blind-sqli time-test @ " + tUrl + "  " + label
+            scanLog.debug("blind-sqli time-test @ " + tUrl + "  " + label
                     + " +" + dt + "ms (" + tStatus + ") payload=«" + (orig + payload).replace("\n"," ") + "» body=" + tBody);
             if (dt > baseMs + TIME_THRESHOLD_MS) {
                 long c0 = System.nanoTime();                   // confirm it's the payload, not a fluke
                 HttpRequestResponse tr = send(build.apply(orig + payload));   // capture the delayed response as evidence
                 long dt2 = (System.nanoTime() - c0) / 1_000_000;
-                scanLog.debug("[AI Scanner] blind-sqli time-test CONFIRM @ " + tUrl + "  " + label + " +" + dt2 + "ms");
+                scanLog.debug("blind-sqli time-test CONFIRM @ " + tUrl + "  " + label + " +" + dt2 + "ms");
                 if (dt2 > baseMs + TIME_THRESHOLD_MS) {
                     recordSqli("SQL injection (blind)", pathOnly(req.url()), "time-based " + label + " +" + dt
                             + "ms (the injected sleep delayed the response — attached)" + prov(req.url()), tr);
@@ -596,11 +597,11 @@ public final class BlindSqliProbe {
                     ? " → HTTP " + rr.response().statusCode() + " " + rr.response().bodyToString()
                             .replace("\n"," ").replace("\r","").substring(0, Math.min(200, rr.response().bodyToString().length()))
                     : " → (no response / timeout)";
-            scanLog.debug("[AI Scanner] blind-sqli: slow/failed send (" + n + "/" + HANG_TRIP + ", " + ms + "ms) @ "
+            scanLog.debug("blind-sqli: slow/failed send (" + n + "/" + HANG_TRIP + ", " + ms + "ms) @ "
                     + req.url().split("\\?")[0] + "  " + req.method() + " body: " + bodySnip + respSnip);
             if (n >= HANG_TRIP && !targetHanging) {
                 targetHanging = true;
-                scanLog.log("[AI Scanner] blind-SQLi: target is stalling responses (" + n + " slow/failed of "
+                scanLog.log("blind-SQLi: target is stalling responses (" + n + " slow/failed of "
                         + sends.get() + " sends) → skipping remaining blind-SQLi (fragile/broken target, NOT a scanner stall).");
             }
             return rr;   // may be null; caller handles

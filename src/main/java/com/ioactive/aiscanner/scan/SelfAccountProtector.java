@@ -49,7 +49,7 @@ public final class SelfAccountProtector implements HttpHandler {
             for (SessionStore session : sessions) {
                 if (session.mutatesOwnAccount(req.method(), req.pathWithoutQuery())) {
                     int n = neutralized.incrementAndGet();
-                    if (n <= 12) scanLog.debug("[AI Scanner]   self-account protector: neutralized " + req.method()
+                    if (n <= 12) scanLog.debug("  self-account protector: neutralized " + req.method()
                             + " " + req.pathWithoutQuery() + " → GET (protects our own login)");
                     return RequestToBeSentAction.continueWith(req.withMethod("GET").withBody(""));
                 }

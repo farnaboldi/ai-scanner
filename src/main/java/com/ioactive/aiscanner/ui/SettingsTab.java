@@ -46,6 +46,15 @@ public final class SettingsTab {
     private final JTextField delayField = new JTextField(6);
     // Read-only parallel probe slice: N blind-SQLi units at once (adaptive throttle backs off on 429). 1 = sequential.
     private final JTextField concurrencyField = new JTextField(6);
+    // Crawl & Discovery reach + Timeouts — coverage/latency knobs (backed by Tuning / LLM-transport system props).
+    private final JTextField crawlDepthField     = new JTextField(6);
+    private final JTextField crawlPagesField      = new JTextField(6);
+    private final JTextField discRoundsField      = new JTextField(6);
+    private final JTextField maxSourcesField      = new JTextField(6);
+    private final JTextField maxCandidatesField   = new JTextField(6);
+    private final JTextField crawlWaitField       = new JTextField(6);
+    private final JTextField llmRespTimeoutField  = new JTextField(6);
+    private final JTextField llmHardDeadlineField = new JTextField(6);
     // Which SAST analyzer runs when a scan has a source repo associated (mirrors -Daiscanner.sastMode). A named
     // mode, not a boolean — so it's a dropdown, and leaves room for future modes beyond coarse/agentic.
     private final JComboBox<String> sastModeCombo = new JComboBox<>(new String[]{"coarse", "agentic"});
@@ -179,6 +188,14 @@ public final class SettingsTab {
         payloadsField.setText(String.valueOf(s.payloadsPerRound));
         delayField.setText(String.valueOf(s.delayMs));
         concurrencyField.setText(String.valueOf(Integer.getInteger("aiscanner.concurrency", 3)));
+        crawlDepthField.setText(String.valueOf(com.ioactive.aiscanner.scan.Tuning.crawlDepth()));
+        crawlPagesField.setText(String.valueOf(com.ioactive.aiscanner.scan.Tuning.crawlPages()));
+        discRoundsField.setText(String.valueOf(com.ioactive.aiscanner.scan.EndpointDiscovery.discoveryRoundsPublic()));
+        maxSourcesField.setText(String.valueOf(com.ioactive.aiscanner.scan.Tuning.maxSources()));
+        maxCandidatesField.setText(String.valueOf(com.ioactive.aiscanner.scan.Tuning.maxCandidates()));
+        crawlWaitField.setText(String.valueOf(com.ioactive.aiscanner.scan.Tuning.crawlWaitSec()));
+        llmRespTimeoutField.setText(String.valueOf(Long.getLong("aiscanner.llmResponseTimeoutMs", 120000L)));
+        llmHardDeadlineField.setText(String.valueOf(Long.getLong("aiscanner.llmHardDeadlineMs", 180000L)));
 
         ButtonGroup providerGroup = new ButtonGroup();
         providerGroup.add(burpAiRadio);
@@ -257,6 +274,28 @@ public final class SettingsTab {
                 System.setProperty("aiscanner.sastMode", String.valueOf(sastModeCombo.getSelectedItem())));
         row(g, y++, new JLabel("Source analysis mode:"), sastModeCombo);
 
+        // Crawl & Discovery reach — how deep/wide the scanner explores (esp. the authenticated surface). Too-low
+        // values under-cover multi-page apps (vuln pages behind category hubs). All read at scan time via Tuning.
+        header(g, y++, "Crawl & Discovery reach");
+        crawlDepthField.setToolTipText("Max link-clicks deep the self-crawl follows from the landing page (default 3).");
+        crawlPagesField.setToolTipText("Max pages the self-crawl fetches — raise it if labs sit behind many category pages (default 60).");
+        discRoundsField.setToolTipText("LLM discovery rounds unioned per host (default 3).");
+        row(g, y++, new JLabel("Crawl depth (link-clicks):"), crawlDepthField);
+        row(g, y++, new JLabel("Crawl breadth (max pages):"), crawlPagesField);
+        row(g, y++, new JLabel("Discovery rounds (LLM):"), discRoundsField);
+        row(g, y++, new JLabel("Max sources mined:"), maxSourcesField);
+        row(g, y++, new JLabel("Max candidate endpoints:"), maxCandidatesField);
+
+        // Timeouts — the deadlines that bound exploration latency. crawl-wait is the native-crawl settle cap; the
+        // two LLM ones bound each model call (response-timeout is Montoya's; hard-deadline abandons a stalled call).
+        header(g, y++, "Timeouts");
+        crawlWaitField.setToolTipText("Max seconds to wait for Burp's native crawl to stabilise (default 240).");
+        llmRespTimeoutField.setToolTipText("Per-LLM-call response timeout in ms (default 120000).");
+        llmHardDeadlineField.setToolTipText("Hard client-side deadline per LLM call in ms — abandons a stalled call (default 180000).");
+        row(g, y++, new JLabel("Crawl-wait (s):"), crawlWaitField);
+        row(g, y++, new JLabel("LLM response timeout (ms):"), llmRespTimeoutField);
+        row(g, y++, new JLabel("LLM hard-deadline (ms):"), llmHardDeadlineField);
+
         // Auto-save: settings persist as soon as you change them — no Save button. Text fields commit on Enter or
         // when focus leaves them (so a partial half-typed value isn't saved mid-keystroke); toggles/combos/radios
         // commit immediately. onSave() persists to Burp's extension prefs (survives restart) + re-applies the engine.
@@ -331,7 +370,9 @@ public final class SettingsTab {
             @Override public void focusLost(java.awt.event.FocusEvent e) { onSave(); }
         };
         for (JTextField f : new JTextField[]{urlField, modelField, keyField, tempField, maxTokField, timeoutField,
-                roundsField, payloadsField, delayField, concurrencyField}) {
+                roundsField, payloadsField, delayField, concurrencyField,
+                crawlDepthField, crawlPagesField, discRoundsField, maxSourcesField, maxCandidatesField,
+                crawlWaitField, llmRespTimeoutField, llmHardDeadlineField}) {
             f.addActionListener(e -> onSave());   // Enter commits
             f.addFocusListener(onBlur);           // leaving the field commits
         }
@@ -350,6 +391,15 @@ public final class SettingsTab {
         s.payloadsPerRound = parseI(payloadsField.getText(), s.payloadsPerRound);
         s.delayMs = parseI(delayField.getText(), s.delayMs);
         System.setProperty("aiscanner.concurrency", String.valueOf(Math.max(1, parseI(concurrencyField.getText(), 3))));
+        // Crawl & Discovery reach + Timeouts → system props Tuning / MontoyaLlmHttp read at scan time.
+        System.setProperty("aiscanner.crawlDepth",           String.valueOf(parseI(crawlDepthField.getText(), 3)));
+        System.setProperty("aiscanner.crawlPages",           String.valueOf(parseI(crawlPagesField.getText(), 60)));
+        System.setProperty("aiscanner.discoveryRounds",      String.valueOf(parseI(discRoundsField.getText(), 3)));
+        System.setProperty("aiscanner.maxSources",           String.valueOf(parseI(maxSourcesField.getText(), 40)));
+        System.setProperty("aiscanner.maxCandidates",        String.valueOf(parseI(maxCandidatesField.getText(), 200)));
+        System.setProperty("aiscanner.crawlWaitSec",         String.valueOf(parseI(crawlWaitField.getText(), 240)));
+        System.setProperty("aiscanner.llmResponseTimeoutMs", String.valueOf(parseI(llmRespTimeoutField.getText(), 120000)));
+        System.setProperty("aiscanner.llmHardDeadlineMs",    String.valueOf(parseI(llmHardDeadlineField.getText(), 180000)));
         System.setProperty("aiscanner.sastMode", String.valueOf(sastModeCombo.getSelectedItem()));
         LogLevel.set(LogLevel.parse(String.valueOf(logLevelCombo.getSelectedItem())));   // apply verbosity immediately
         ext.applyEngineConfig(configFromFields());

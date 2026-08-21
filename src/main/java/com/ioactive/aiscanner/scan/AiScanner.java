@@ -106,13 +106,13 @@ public final class AiScanner {
         if (com.ioactive.aiscanner.engine.MontoyaAiEngine.creditsExhausted()
                 && !"false".equalsIgnoreCase(System.getProperty("aiscanner.haltOnCreditExhaustion", "true"))) {
             if (creditHaltLogged.compareAndSet(false, true))
-                scanLog.log("[AI Scanner] halting scan — Burp AI credits exhausted (see the credit-exhaustion notice above). "
+                scanLog.log("halting scan — Burp AI credits exhausted (see the credit-exhaustion notice above). "
                         + "The partial report of what was already found is written. Top up Burp AI or use a local LLM to continue.");
             return true;
         }
         if (stopRequested) {
             if (stopLogged.compareAndSet(false, true))
-                scanLog.log("[AI Scanner] scan stopped by user (Stop button). Writing the partial report of what was already found.");
+                scanLog.log("scan stopped by user (Stop button). Writing the partial report of what was already found.");
             return true;
         }
         return (cancelled != null && cancelled.getAsBoolean()) || Thread.currentThread().isInterrupted();
@@ -177,7 +177,7 @@ public final class AiScanner {
                 scanLog.phase("Re-authenticating (" + why + ")");
                 reauth.run();
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] re-auth skipped: " + t); }
+        } catch (Throwable t) { scanLog.debug("re-auth skipped: " + t); }
     }
 
     /** Wall-clock budget for a single slow probe phase (blind-SQLi time payloads sleep ~5s each), so one phase
@@ -202,7 +202,7 @@ public final class AiScanner {
         try {
             Audit audit = newAudit();
             if (audit == null) {   // Community edition: no native audit — our own HTTP probes carry detection
-                scanLog.log("[AI Scanner] Burp Community edition: native active audit unavailable — " + label
+                scanLog.log("Burp Community edition: native active audit unavailable — " + label
                         + " is covered by the extension's own HTTP probes + local-LLM discovery instead.");
                 return null;
             }
@@ -213,14 +213,14 @@ public final class AiScanner {
             }
             if (added == 0) {
                 audit.delete();
-                scanLog.log("[AI Scanner] nothing to audit (" + label + "): no app parameters found.");
+                scanLog.log("nothing to audit (" + label + "): no app parameters found.");
                 return null;
             }
-            scanLog.log("[AI Scanner] submitted " + added + " request(s) to Burp active audit ("
+            scanLog.log("submitted " + added + " request(s) to Burp active audit ("
                     + label + ") — watch the Dashboard task for findings.");
             return audit;
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] scanRequests error: " + t);
+            scanLog.log("scanRequests error: " + t);
             return null;
         }
     }
@@ -234,7 +234,7 @@ public final class AiScanner {
     public Audit scanDiscovered(String host) {
         if (cancelled()) return null;                    // extension unloaded before we started
         if (!aiPreflight()) {                            // REQUIRED AI backend (local LLM) down → abort, don't degrade
-            scanLog.log("[AI Scanner] scan aborted by preflight (required AI backend unusable).");
+            scanLog.log("scan aborted by preflight (required AI backend unusable).");
             return null;
         }
         // In Pro, Burp's native audit will test every target we submit — so defer Burp-covered classes (SQLi/XSS/…)
@@ -272,10 +272,10 @@ public final class AiScanner {
             addTarget(targets, seen, rr.request());
             for (HttpRequest f : deriveForms(rr)) addTarget(targets, seen, f);
         }
-        if (spaSkipped > 0) scanLog.log("[AI Scanner] SPA client-side-routing catch-all detected — excluded "
+        if (spaSkipped > 0) scanLog.log("SPA client-side-routing catch-all detected — excluded "
                 + spaSkipped + " phantom endpoint(s) that only echo the app shell (real API endpoints still come "
                 + "from the embedded-browser crawl + JS-mining discovery).");
-        if (xorigin > 0) scanLog.log("[AI Scanner] ingested " + xorigin + " same-site cross-origin request(s) the "
+        if (xorigin > 0) scanLog.log("ingested " + xorigin + " same-site cross-origin request(s) the "
                 + "embedded browser observed the SPA make (sibling API origin) — auditing them too.");
 
         // Source analysis (SAST): if a repo is associated with this host, run a coarse LLM pass that emits
@@ -288,19 +288,19 @@ public final class AiScanner {
         // SAST-assisted or plain black-box (-Daiscanner.sastMode=agentic follows the child-process boundary).
         boolean agentic = "agentic".equalsIgnoreCase(System.getProperty("aiscanner.sastMode", "coarse"));
         if (repoPath != null && !repoPath.isBlank()) {
-            scanLog.log("[AI Scanner] source repo associated with " + host + ": " + repoPath
+            scanLog.log("source repo associated with " + host + ": " + repoPath
                     + "  → SAST-assisted scan (mode=" + (agentic ? "agentic" : "coarse") + ")");
             try {
                 // Local path → use it; git/GitHub URL → fetch it over HTTP (no git binary, no subprocess).
                 String localRepo = RepoFetcher.ensureLocal(repoPath, scanLog);
                 if (localRepo == null) {
-                    scanLog.log("[AI Scanner] source could not be resolved to a local checkout — SAST skipped (black-box).");
+                    scanLog.log("source could not be resolved to a local checkout — SAST skipped (black-box).");
                 } else {
                     // DETERMINISTIC route/GraphQL-schema harvest — runs WITH OR WITHOUT an LLM, so a repo adds
                     // coverage even in no-AI mode. Steering only; discovery live-probes and the oracles decide.
                     SourceFindings harvested = RouteHarvester.harvest(localRepo);
                     if (!harvested.isEmpty())
-                        scanLog.log("[AI Scanner] SAST(routes): " + harvested.size() + " route/GraphQL directive(s) harvested from source.");
+                        scanLog.log("SAST(routes): " + harvested.size() + " route/GraphQL directive(s) harvested from source.");
                     // Optional LLM pass (taint-aware sinks) layered on top when an engine is configured.
                     SourceFindings llm = SourceFindings.empty();
                     AiEngine sastEng = engine != null ? engine.get() : null;
@@ -310,18 +310,18 @@ public final class AiScanner {
                                 ? new AgenticSourceAnalyzer(sastEng, scanLog)
                                 : new CoarseSourceAnalyzer(sastEng, scanLog);
                         llm = analyzer.analyze(host, localRepo);
-                        scanLog.log("[AI Scanner] source analysis: " + llm.size() + " LLM hint(s) from " + localRepo);
+                        scanLog.log("source analysis: " + llm.size() + " LLM hint(s) from " + localRepo);
                     } else {
-                        scanLog.log("[AI Scanner] LLM engine not configured — using the deterministic route/GraphQL harvest only.");
+                        scanLog.log("LLM engine not configured — using the deterministic route/GraphQL harvest only.");
                     }
                     hints0 = SourceFindings.combine(llm, harvested);
-                    scanLog.log("[AI Scanner] source analysis total: " + hints0.size() + " directive(s).");
+                    scanLog.log("source analysis total: " + hints0.size() + " directive(s).");
                 }
             } catch (Throwable t) {
-                scanLog.debug("[AI Scanner] source analysis skipped: " + t);
+                scanLog.debug("source analysis skipped: " + t);
             }
         } else {
-            scanLog.log("[AI Scanner] no source repo associated with " + host + " — black-box scan.");
+            scanLog.log("no source repo associated with " + host + " — black-box scan.");
         }
         final SourceFindings hints = hints0;   // effectively-final snapshot the data-driven attack lambdas capture
 
@@ -351,7 +351,7 @@ public final class AiScanner {
         for (HttpRequestResponse rr : disc.lastKeptResponses()) {
             try { api.siteMap().add(rr); bridged++; } catch (Exception ignore) { }
         }
-        if (bridged > 0) scanLog.log("[AI Scanner] bridged " + bridged
+        if (bridged > 0) scanLog.log("bridged " + bridged
                 + " discovered endpoint(s) into the site map for IDOR/BFLA/chain probes.");
 
         // ABSTRACT authenticated SPA navigation. A static crawl never executes the app's JS, so a JS-driven app's
@@ -373,7 +373,7 @@ public final class AiScanner {
                     // (injectable) filter/column surface is probed, instead of collapsing to one.
                     if (rr != null && rr.request() != null && addTarget(targets, seen, rr.request(), responseSchemaSig(rr))) navTargets++;
                 }
-                scanLog.log("[AI Scanner] SPA navigator: " + navTargets + " data endpoint(s) registered as audit targets.");
+                scanLog.log("SPA navigator: " + navTargets + " data endpoint(s) registered as audit targets.");
             }
         }
 
@@ -386,29 +386,29 @@ public final class AiScanner {
             for (HttpRequest f : deriveForms(rr)) addTarget(targets, seen, f);
             discPages++;
         }
-        if (discPages > 0) scanLog.log("[AI Scanner] surfaced " + discPages
+        if (discPages > 0) scanLog.log("surfaced " + discPages
                 + " AI-discovered page(s) into the site map + form targets.");
 
         // TRACE: the exact audit surface the targets-iterating probes (BlindSqli/NoSql/BodyMutator) will
         // cover — so we can SEE whether e.g. validate-coupon{coupon_code} made it in, not infer it.
-        scanLog.log("[AI Scanner] audit surface: " + targets.size() + " target(s) —");
+        scanLog.log("audit surface: " + targets.size() + " target(s) —");
         for (HttpRequest t : targets) {
             String body = t.bodyToString();
             String shape = (body != null && !body.isBlank() && body.length() < 200) ? " body=" + body
                     : " " + paramSummary(t);
-            scanLog.log("[AI Scanner]   • " + t.method() + " " + Net.stripQuery(t.url()) + shape);
+            scanLog.log("  • " + t.method() + " " + Net.stripQuery(t.url()) + shape);
         }
 
         // DISCOVERY-ONLY: dump the reachable attack surface and STOP before the (slow) probes + Burp audit.
         // Turns the "did the crawl reach the target forms?" question into a ~1-2 min run instead of a full
         // 20-30 min audit — the fast inner loop for tuning discovery/coverage. -Daiscanner.discoveryOnly=true.
         if (Boolean.getBoolean("aiscanner.discoveryOnly")) {
-            scanLog.log("[AI Scanner] discovery-only mode: reached " + targets.size()
+            scanLog.log("discovery-only mode: reached " + targets.size()
                     + " target(s) above; skipping probes + active audit.");
             return null;
         }
 
-        if (cancelled()) { scanLog.log("[AI Scanner] scan cancelled (extension unloaded)."); return null; }
+        if (cancelled()) { scanLog.log("scan cancelled (extension unloaded)."); return null; }
 
         // Agent-flow probe: reach an LLM-agent action surface (chat that drives privileged tools) by driving its
         // stateful rooms→run→turn flow, which endpoint mining alone can't (the run_id only exists at runtime).
@@ -427,12 +427,12 @@ public final class AiScanner {
             AiEngine agentEng = engine != null ? engine.get() : null;   // used only to plan a generic unlock when gated
             AgentFlowProbe afp = new AgentFlowProbe(api, scanLog, agentEng);
             int hits = afp.probe(host, this::withSession);
-            scanLog.log("[AI Scanner] agent-flow probe: " + hits + " LLM-agent finding(s).");
+            scanLog.log("agent-flow probe: " + hits + " LLM-agent finding(s).");
             // Feed the agent write requests it reached into the audit surface — so the targets-iterating probes
             // below AND the final Burp active audit fuzz the agent endpoints too (not just the site-map readers).
             int added = 0;
             for (HttpRequestResponse rr : afp.reached()) if (addTarget(targets, seen, rr.request())) added++;
-            if (added > 0) scanLog.log("[AI Scanner] agent-flow: added " + added + " reached agent request(s) to the audit surface.");
+            if (added > 0) scanLog.log("agent-flow: added " + added + " reached agent request(s) to the audit surface.");
         });
 
         // LLM-fuzz probe: fire the adversarial battery (unicode / prompt-injection / structural) at any single-
@@ -442,7 +442,7 @@ public final class AiScanner {
         attackActions.put("llmfuzz", () -> {
             AiEngine fuzzEng = engine != null ? engine.get() : null;
             int hits = new LlmFuzzProbe(api, scanLog, fuzzEng).probe(host, this::withSession);
-            scanLog.log("[AI Scanner] llm-fuzz probe: " + hits + " finding(s).");
+            scanLog.log("llm-fuzz probe: " + hits + " finding(s).");
         });
 
         // FAST, high-signal findings FIRST — CSRF + open-redirect are deterministic, cheap, and independent of
@@ -451,13 +451,13 @@ public final class AiScanner {
         // derived form POSTs directly, so it doesn't wait for the audit to push them into the site map.
         attackActions.put("csrf", () -> {
             int hits = new CsrfProbe(api, scanLog).probe(host, this::withSession, targets);
-            scanLog.log("[AI Scanner] CSRF probe: " + hits + " state-changing form(s) accept a forged cross-site request.");
+            scanLog.log("CSRF probe: " + hits + " state-changing form(s) accept a forged cross-site request.");
         });
         attackActions.put("redirect", () -> {
             OpenRedirectProbe orp = new OpenRedirectProbe(api, scanLog);
             int hits = 0;
             for (HttpRequest t : targets) if (orp.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] open-redirect probe: " + hits + " endpoint(s) redirect to an attacker host.");
+            scanLog.log("open-redirect probe: " + hits + " endpoint(s) redirect to an attacker host.");
         });
         attackActions.put("oauth", () -> {
             // OAuth authorization-server logic (redirect_uri validation → auth-code/token leak). Drives the
@@ -536,7 +536,7 @@ public final class AiScanner {
                 } catch (InterruptedException ie) { pool.shutdownNow(); Thread.currentThread().interrupt(); }
             }
             int sqliN = bsp.emitCollapsed();   // emit now: 1 systemic finding if it's a shared-sink flood, else each
-            scanLog.log("[AI Scanner] blind-SQLi probe: " + hits.get() + " endpoint(s) injectable ("
+            scanLog.log("blind-SQLi probe: " + hits.get() + " endpoint(s) injectable ("
                     + minedPaths.size() + " parameterless page(s) mined; concurrency=" + concurrency
                     + (sqliN > 5 ? "; " + sqliN + " hits collapsed to 1 systemic SQLi (shared sink)" : "") + ").");
         });
@@ -554,7 +554,7 @@ public final class AiScanner {
                 EvasionXssProbe xss = new EvasionXssProbe(api, scanLog);
                 int eh = 0;
                 for (HttpRequest t : targets) if (xss.probe(withSession(t))) eh++;
-                scanLog.log("[AI Scanner] evasion-XSS probe: " + eh + " endpoint(s) reflect an obfuscated tag past the WAF.");
+                scanLog.log("evasion-XSS probe: " + eh + " endpoint(s) reflect an obfuscated tag past the WAF.");
             }
             // Deterministic reflected-XSS with CONTEXT-AWARE breakout: catches sinks Burp leaves at INFO (a
             // reflection landing in an HTML comment / <script> block). Zero-FP (unique marker into an executable
@@ -562,7 +562,7 @@ public final class AiScanner {
             ReflectedXssProbe rxss = new ReflectedXssProbe(api, scanLog);
             int hits = 0;
             for (HttpRequest t : targets) if (rxss.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] reflected-XSS probe: " + hits + " endpoint(s) with a breakout-confirmed reflected XSS.");
+            scanLog.log("reflected-XSS probe: " + hits + " endpoint(s) with a breakout-confirmed reflected XSS.");
         });
 
         // (reflected-XSS — WAF-evasion + context-aware breakout — is folded into the "rxss" action above.)
@@ -574,7 +574,7 @@ public final class AiScanner {
             PathReflectionProbe prp = new PathReflectionProbe(api, scanLog);
             int hits = 0;
             for (HttpRequest t : targets) if (prp.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] path-reflection probe: " + hits + " endpoint(s) path-traversable.");
+            scanLog.log("path-reflection probe: " + hits + " endpoint(s) path-traversable.");
         });
 
         // Deterministic NoSQL oracle over the discovered surface (generic; Burp's NoSQL coverage is weak).
@@ -586,7 +586,7 @@ public final class AiScanner {
             if (session != null) nosql.setKnownUser(session.loginUser());   // valid user → clean auth-bypass check
             int hits = 0;
             for (HttpRequest t : targets) if (nosql.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] NoSQL probe: " + hits + " endpoint(s) look NoSQL-injectable.");
+            scanLog.log("NoSQL probe: " + hits + " endpoint(s) look NoSQL-injectable.");
         });
 
         // OS command injection + server-side eval (SSJS/RCE). Deterministic (time-based sleep; arithmetic
@@ -599,7 +599,7 @@ public final class AiScanner {
             String base = targets.isEmpty() ? null : originOf(targets.get(0).url());
             int hits = cmdi.probeHints(host, this::withSession, base);
             for (HttpRequest t : targets) if (cmdi.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] command/eval probe: " + hits + " injectable point(s).");
+            scanLog.log("command/eval probe: " + hits + " injectable point(s).");
         });
 
         // create->consume chain: replay a record an injection bypass leaked into sibling write endpoints
@@ -610,7 +610,7 @@ public final class AiScanner {
             ssti.setSourceHints(hints);
             int hits = 0;
             for (HttpRequest t : targets) if (ssti.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] SSTI probe: " + hits + " endpoint(s) with server-side template injection.");
+            scanLog.log("SSTI probe: " + hits + " endpoint(s) with server-side template injection.");
         });
         attackActions.put("chain", () -> {
             if (!injectionLeaks.isEmpty())
@@ -628,7 +628,7 @@ public final class AiScanner {
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
             int hits = new FileServePathProbe(api, scanLog).probe(host, cookie, bearer);
-            scanLog.log("[AI Scanner] file-serve probe: " + hits + " sensitive file(s) exfiltrated via bypass.");
+            scanLog.log("file-serve probe: " + hits + " sensitive file(s) exfiltrated via bypass.");
         });
 
         // Generic IDOR probe: re-request id-bearing GET paths with a neighboring id (cross-tenant access).
@@ -642,7 +642,7 @@ public final class AiScanner {
             idor.setSourceHints(hints);   // SAST: widen enumeration on source-flagged object-refs + tag provenance
             int hits = idor.probe(host, cookie, bearer, cookieB, bearerB, identityB);
             boolean twoId = session != null && session.hasSecondIdentity();
-            scanLog.log("[AI Scanner] IDOR probe: " + hits + " id-bearing GET(s) returned another tenant's record"
+            scanLog.log("IDOR probe: " + hits + " id-bearing GET(s) returned another tenant's record"
                     + (twoId ? " (two-identity cross-user differential enabled)." : "."));
         });
 
@@ -656,7 +656,7 @@ public final class AiScanner {
             String bearerB = session != null ? session.bearerB() : "";
             String base = !targets.isEmpty() ? originOf(targets.get(0).url()) : siteMapOrigin(host);
             int hits = new BolaWriteProbe(api, scanLog).probe(host, hints, base, targets, cookie, bearer, cookieB, bearerB);
-            scanLog.log("[AI Scanner] BOLA write probe: " + hits + " endpoint(s) allowed a confirmed cross-user write (CWE-639)"
+            scanLog.log("BOLA write probe: " + hits + " endpoint(s) allowed a confirmed cross-user write (CWE-639)"
                     + (session != null && session.hasSecondIdentity() ? " (second-identity witness enabled)." : "."));
         });
 
@@ -667,7 +667,7 @@ public final class AiScanner {
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
             int hits = new MassAssignProbe(api, scanLog).probe(host, discoverAuthRequests(host), cookie, bearer);
-            scanLog.log("[AI Scanner] Mass-assignment probe: " + hits + " privilege-escalation-on-registration confirmed (CWE-915).");
+            scanLog.log("Mass-assignment probe: " + hits + " privilege-escalation-on-registration confirmed (CWE-915).");
         });
 
         // Generic BFLA probe: role-segment substitution (…/user/… -> …/admin/…) then a non-destructive
@@ -677,7 +677,7 @@ public final class AiScanner {
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
             int hits = new BflaProbe(api, scanLog).probe(host, cookie, bearer);
-            scanLog.log("[AI Scanner] BFLA probe: " + hits + " admin-tier function(s) reachable by a non-privileged user.");
+            scanLog.log("BFLA probe: " + hits + " admin-tier function(s) reachable by a non-privileged user.");
         });
 
         // JWT implementation analysis: harvest tokens the app used, decode them, and run deterministic
@@ -686,7 +686,7 @@ public final class AiScanner {
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
             int hits = new JwtAnalysisProbe(api, scanLog).probe(host, cookie, bearer);
-            scanLog.log("[AI Scanner] JWT analysis probe: " + hits + " JWT implementation issue(s).");
+            scanLog.log("JWT analysis probe: " + hits + " JWT implementation issue(s).");
         });
 
         // Unauthenticated-access probe: re-send each authenticated 2xx-JSON endpoint with the credential
@@ -694,7 +694,7 @@ public final class AiScanner {
         // so it sees the discovered endpoints via the bridge above.
         attackActions.put("unauth", () -> {
             int hits = new UnauthAccessProbe(api, scanLog).probe(host);
-            scanLog.log("[AI Scanner] unauth-access probe: " + hits + " protected endpoint(s) served data with no credential.");
+            scanLog.log("unauth-access probe: " + hits + " protected endpoint(s) served data with no credential.");
         });
 
         // Webhook signature fail-open: inbound provider webhooks (payments/KYC/banking) must verify an HMAC
@@ -703,7 +703,7 @@ public final class AiScanner {
         // (2xx, not a signature rejection) proves verification isn't enforced. Generic; non-destructive ({} body).
         attackActions.put("webhook", () -> {
             int hits = new WebhookAuthProbe(api, scanLog).probe(host);
-            scanLog.log("[AI Scanner] webhook-auth probe: " + hits + " webhook(s) accept an invalid/absent signature.");
+            scanLog.log("webhook-auth probe: " + hits + " webhook(s) accept an invalid/absent signature.");
         });
 
         // Privilege-parity (broken function-level authz): a privileged resource reachable through an ungated
@@ -713,7 +713,7 @@ public final class AiScanner {
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
             int hits = new PrivilegeParityProbe(api, scanLog).probe(host, cookie, bearer);
-            scanLog.log("[AI Scanner] privilege-parity probe: " + hits + " privileged resource(s) reachable via an ungated sibling.");
+            scanLog.log("privilege-parity probe: " + hits + " privileged resource(s) reachable via an ungated sibling.");
         });
 
         // (CSRF probe ran early — see the fast-findings block above.)
@@ -722,7 +722,7 @@ public final class AiScanner {
         // Reads the site map, so it sees the discovered endpoints via the bridge above.
         attackActions.put("secrets", () -> {
             int hits = new ResponseSecretExposureProbe(api, scanLog).probe(host);
-            scanLog.log("[AI Scanner] response-secret probe: " + hits + " response(s) disclosed a challenge answer.");
+            scanLog.log("response-secret probe: " + hits + " response(s) disclosed a challenge answer.");
         });
 
         // GraphQL: Burp DETECTS a /graphql endpoint but won't fuzz resolver ARGS without a valid query carrying
@@ -731,7 +731,7 @@ public final class AiScanner {
         // (e.g. a getCommandResult(command) shell resolver) that our REST-only surface was blind to.
         attackActions.put("graphql", () -> {
             int hits = new GraphqlProbe(api, scanLog).probe(host);
-            scanLog.log("[AI Scanner] graphql probe: done (" + hits + " finding(s)).");
+            scanLog.log("graphql probe: done (" + hits + " finding(s)).");
         });
 
         // Insecure deserialization: DETECT a serialized-object cookie (Java/.NET/pickle/PHP), then VALIDATE it
@@ -739,7 +739,7 @@ public final class AiScanner {
         // only on the corrupt blob, it deserializes attacker data (CWE-502). Fires only on that dynamic delta.
         attackActions.put("deser", () -> {
             int hits = new InsecureDeserializationProbe(api, scanLog).probe(host, targets);
-            scanLog.log("[AI Scanner] insecure-deserialization probe: " + hits + " endpoint(s) proven to deserialize a client-supplied object.");
+            scanLog.log("insecure-deserialization probe: " + hits + " endpoint(s) proven to deserialize a client-supplied object.");
         });
 
         // Out-of-band (blind) XXE via Burp Collaborator: inject an external-entity payload into XML endpoints
@@ -747,7 +747,7 @@ public final class AiScanner {
         // no in-band oracle (constant response). Zero-FP: the callback is caused only by the server parsing us.
         attackActions.put("xxe", () -> {
             int hits = new XxeProbe(api, scanLog).probe(host);
-            scanLog.log("[AI Scanner] XXE probe: " + hits + " endpoint(s) resolved an out-of-band external entity.");
+            scanLog.log("XXE probe: " + hits + " endpoint(s) resolved an out-of-band external entity.");
         });
 
         // SAML SSO probe: reconstruct the SAML surface (SP metadata, ACS, SP-initiated endpoint) from the site
@@ -760,7 +760,7 @@ public final class AiScanner {
         // RelayState/ReturnUrl open redirect. Runs once per host (discovers its own surface). No-op if no SAML.
         attackActions.put("saml", () -> {
             int hits = new SamlProbe(api, scanLog).probe(host, this::withSession);
-            scanLog.log("[AI Scanner] SAML probe: " + hits + " SAML SSO finding(s).");
+            scanLog.log("SAML probe: " + hits + " SAML SSO finding(s).");
         });
 
         // Verbose-error / stack-trace disclosure probe: generic, host-wide. Passively scans the site map for strong
@@ -769,7 +769,7 @@ public final class AiScanner {
         // customErrors-Off class Burp misses (it never sends the malformed page-method call). Zero-FP, non-destructive.
         attackActions.put("verberr", () -> {
             int hits = new VerboseErrorProbe(api, scanLog).probe(host, this::withSession);
-            scanLog.log("[AI Scanner] verbose-error probe: " + hits + " host-wide disclosure finding(s).");
+            scanLog.log("verbose-error probe: " + hits + " host-wide disclosure finding(s).");
         });
 
         // NOTE: CORS misconfiguration is intentionally NOT a custom probe — Burp's native passive scanner
@@ -782,7 +782,7 @@ public final class AiScanner {
             lfi.setSourceHints(hints);   // SAST: tag provenance when a source path/LFI sink matches
             int hits = 0;
             for (HttpRequest t : targets) if (lfi.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] path-traversal probe: " + hits + " endpoint(s) leaked an OS file.");
+            scanLog.log("path-traversal probe: " + hits + " endpoint(s) leaked an OS file.");
         });
 
         // OAST SSRF confirmation (Burp Collaborator) — DRIVEN BY THE SAST SSRF HINTS so it tests endpoints the
@@ -793,7 +793,7 @@ public final class AiScanner {
             ssrf.setSourceHints(hints);
             String base = targets.isEmpty() ? null : originOf(targets.get(0).url());
             int hits = ssrf.probe(base, targets, this::withSession);
-            scanLog.log("[AI Scanner] SSRF probe: " + hits + " endpoint(s) made an out-of-band request (SSRF).");
+            scanLog.log("SSRF probe: " + hits + " endpoint(s) made an out-of-band request (SSRF).");
         });
 
         // OAST Log4Shell / JNDI confirmation (Burp Collaborator). Sprays ${jndi:ldap://<collab>} into the headers
@@ -804,7 +804,7 @@ public final class AiScanner {
             // Header-only probe: hit the host root even when discovery found no auditable param (targets empty).
             String base = !targets.isEmpty() ? originOf(targets.get(0).url()) : siteMapOrigin(host);
             int hits = log4j.probe(base, targets, this::withSession);
-            scanLog.log("[AI Scanner] Log4Shell probe: " + hits + " endpoint(s) resolved a ${jndi:…} out-of-band (Log4Shell RCE).");
+            scanLog.log("Log4Shell probe: " + hits + " endpoint(s) resolved a ${jndi:…} out-of-band (Log4Shell RCE).");
         });
 
         // (Open-redirect probe ran early — see the fast-findings block above.)
@@ -815,7 +815,7 @@ public final class AiScanner {
             RestrictionBypassProbe rb = new RestrictionBypassProbe(api, scanLog);
             int hits = 0;
             for (HttpRequest t : targets) if (rb.probe(withSession(t))) hits++;
-            scanLog.log("[AI Scanner] restriction-bypass probe: " + hits + " form(s) accepted a restricted submission.");
+            scanLog.log("restriction-bypass probe: " + hits + " form(s) accepted a restricted submission.");
         });
 
         // Cross-Site WebSocket Hijacking: replay each observed WS upgrade with a foreign Origin — a still-successful
@@ -823,7 +823,7 @@ public final class AiScanner {
         // handshakes the crawl opened (WsObservations + proxy history), so no HTTP target list is needed.
         attackActions.put("cswsh", () -> {
             int hits = new WebSocketCswshProbe(api, scanLog).probe(this::withSession);
-            scanLog.log("[AI Scanner] WebSocket CSWSH probe: " + hits + " socket(s) upgrade cross-origin with ambient cookies.");
+            scanLog.log("WebSocket CSWSH probe: " + hits + " socket(s) upgrade cross-origin with ambient cookies.");
         });
 
         // ③ Agentic multi-step flow-engine — the LLM plans the next request from each response (targeting only),
@@ -835,14 +835,14 @@ public final class AiScanner {
                 FlowEngine fe = new FlowEngine(eng, scanLog, this::withSession, this::sendAndMeasure);
                 if (!hints.isEmpty()) fe.setSourceHintText(hints.hintText(8));   // SAST leads → planner targets them first
                 int hits = fe.run(host, targets);
-                scanLog.log("[AI Scanner] flow-engine: " + hits + " finding(s) from multi-step chains.");
+                scanLog.log("flow-engine: " + hits + " finding(s) from multi-step chains.");
                 // Bridge LLM-reached 2xx endpoints into the site map + targets so the Burp active audit fuzzes them too.
                 int added = 0;
                 for (HttpRequestResponse rr : fe.reachedResponses()) {
                     try { api.siteMap().add(rr); } catch (Exception ignore) { }
                     if (addTarget(targets, seen, rr.request())) added++;
                 }
-                if (added > 0) scanLog.log("[AI Scanner] flow-engine: added " + added
+                if (added > 0) scanLog.log("flow-engine: added " + added
                         + " LLM-reached endpoint(s) to the audit surface (site map + Burp active audit).");
             }
         });
@@ -853,14 +853,14 @@ public final class AiScanner {
         {
             java.util.Set<String> keys = new java.util.HashSet<>();
             for (com.ioactive.aiscanner.scan.ScanPhases.Phase ph : com.ioactive.aiscanner.scan.ScanPhases.attackModules()) keys.add(ph.key);
-            for (String k : attackActions.keySet()) if (!keys.contains(k)) scanLog.log("[AI Scanner] WARN: attack action '" + k + "' has no ScanPhases entry (drift).");
-            for (String k : keys) if (!attackActions.containsKey(k)) scanLog.log("[AI Scanner] WARN: ScanPhases module '" + k + "' has no bound action (drift).");
+            for (String k : attackActions.keySet()) if (!keys.contains(k)) scanLog.log("WARN: attack action '" + k + "' has no ScanPhases entry (drift).");
+            for (String k : keys) if (!attackActions.containsKey(k)) scanLog.log("WARN: ScanPhases module '" + k + "' has no bound action (drift).");
         }
         // Mint the SECOND identity B here — the auth flow has definitely settled by now (unlike a fixed point in the
         // crawl orchestration, which can race the async login), and this is the single chokepoint before every
         // access-control probe reads session.cookieHeaderB()/bearerB(). Best-effort + idempotent.
         if (secondIdentityMinter != null && session != null && session.authenticated() && !session.hasSecondIdentity()) {
-            try { secondIdentityMinter.run(); } catch (Throwable t) { scanLog.debug("[AI Scanner] second-identity minter: " + t); }
+            try { secondIdentityMinter.run(); } catch (Throwable t) { scanLog.debug("second-identity minter: " + t); }
         }
         for (com.ioactive.aiscanner.scan.ScanPhases.Phase ph : com.ioactive.aiscanner.scan.ScanPhases.attackModules()) {
             if (cancelled()) return null;
@@ -870,11 +870,11 @@ public final class AiScanner {
                 scanLog.phase(ph);   // registry-sourced title + module filter + step count (throws PhaseSkipped/ScanStopped)
                 action.run();
             } catch (Throwable t) {
-                scanLog.debug("[AI Scanner] " + ph.key + " probe skipped: " + t);
+                scanLog.debug("" + ph.key + " probe skipped: " + t);
             }
         }
 
-        scanLog.log("[AI Scanner] discovery done: " + targets.size()
+        scanLog.log("discovery done: " + targets.size()
                 + " parameterized request(s) for " + host + " — submitting to Burp active audit…");
 
         // User hit Stop during the probe battery (each probe swallowed the phase() ScanStopped) → don't now submit
@@ -911,7 +911,7 @@ public final class AiScanner {
             }
             bsp.emitCollapsed();   // flush collected auth-page SQLi (else they'd be recorded but never emitted)
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] auth-page blind-SQLi pass skipped: " + t);
+            scanLog.debug("auth-page blind-SQLi pass skipped: " + t);
         }
 
         // Auth-page NoSQL AUTH-BYPASS ($ne/$gt Mongo operator injection in the JSON login body) — the HEADLINE
@@ -930,11 +930,11 @@ public final class AiScanner {
                 if (!"POST".equalsIgnoreCase(req.method())) continue;
                 if (!AUTH_PAGE.matcher(Net.stripQuery(req.url())).find()) continue;
                 if (!nseen.add(Net.stripQuery(req.url()))) continue;
-                scanLog.log("[AI Scanner]   auth-page NoSQL: testing " + req.method() + " " + Net.stripQuery(req.url()));
+                scanLog.log("  auth-page NoSQL: testing " + req.method() + " " + Net.stripQuery(req.url()));
                 try { nsp.probe(req); } catch (Throwable ignore) { }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] auth-page NoSQL pass skipped: " + t);
+            scanLog.debug("auth-page NoSQL pass skipped: " + t);
         }
 
         Set<String> seen = new HashSet<>();
@@ -961,15 +961,15 @@ public final class AiScanner {
                 if (ranges.isEmpty()) continue;
                 audit.addRequest(r, ranges);
                 added++;
-                scanLog.log("[AI Scanner]   audit (auth page, separate) @ " + r.method() + " "
+                scanLog.log("  audit (auth page, separate) @ " + r.method() + " "
                         + Net.stripQuery(r.url()) + " → " + paramSummary(r));
             }
             if (added == 0) { audit.delete(); return null; }
-            scanLog.log("[AI Scanner] submitted " + added + " login/signin request(s) to a SEPARATE audit "
+            scanLog.log("submitted " + added + " login/signin request(s) to a SEPARATE audit "
                     + "(runs last; may end the session, which no longer matters).");
             return audit;
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] auth-page audit error: " + t);
+            scanLog.log("auth-page audit error: " + t);
             return null;
         }
     }
@@ -986,7 +986,7 @@ public final class AiScanner {
         scanLog.setBurpNativeAudit(true);   // Burp owns every class; AiTriage counts its native issues (= "native" half)
         Audit audit = newAudit();
         if (audit == null) {                // Community edition has no native active audit → nothing to baseline
-            scanLog.log("[AI Scanner] native baseline: Burp Community has no active audit — baseline is 0 by definition.");
+            scanLog.log("native baseline: Burp Community has no active audit — baseline is 0 by definition.");
             return null;
         }
         Set<String> seen = new HashSet<>();
@@ -1006,7 +1006,7 @@ public final class AiScanner {
             if (ranges.isEmpty()) continue;
             try { audit.addRequest(req, ranges); added++; } catch (Throwable ignore) { }
         }
-        scanLog.log("[AI Scanner] native baseline: submitted " + added + " crawled request(s) to Burp's built-in "
+        scanLog.log("native baseline: submitted " + added + " crawled request(s) to Burp's built-in "
                 + "active audit (no auth, no discovery, no probes — pure Burp).");
         if (added == 0) { try { audit.delete(); } catch (Throwable ignore) { } return null; }
         return audit;
@@ -1027,11 +1027,29 @@ public final class AiScanner {
     public void summarize(Audit audit, String host, boolean finalPhase) {
         try {
             if (audit == null) {
+                // No NATIVE-auditable parameters — but deterministic PROBES (SSTI/XSS/SQLi/JWT/…) may still have
+                // confirmed findings. On the FINAL phase print the full end-of-scan banner + benchmark tally anyway,
+                // so a probe-only result is unmistakably COMPLETE and SCORED. Ending silently here (the old behavior)
+                // printed no SCAN COMPLETE / BENCHMARK SCORE line, so a finished probe-only scan looked unfinished or
+                // hung (e.g. sstipy: 2 findings, "no auditable parameters", then no banner → indistinguishable from a
+                // terminal stall). Burp's PASSIVE findings are already logged in real time by AiTriage.
+                if (finalPhase) {
+                    String authWith = session == null ? "no"
+                            : session.hasBearer() ? "yes (bearer token)"
+                            : session.has() ? "yes (session cookie)" : "no";
+                    scanLog.phase("Idle — scan complete");
+                    scanLog.log("===================== SCAN COMPLETE (" + host + ") =====================");
+                    scanLog.log("(no native-auditable parameters — the score below is deterministic-probe findings only)");
+                    logBenchmarkTally();   // copy-pasteable, matches the harness metric() exactly
+                    scanLog.log("authenticated: " + authWith + "   |   audit requests: 0 (no native audit)   |   errors: 0");
+                    scanLog.log("==========================================================================");
+                    emitManualNextSteps();
+                    logAiUsage();
+                    writeReport();
+                    return;
+                }
                 scanLog.phase("Idle — scan complete (nothing to audit)");
-                scanLog.log("[AI Scanner] === scan complete for " + host + ": no auditable parameters ===");
-                // NOTE: Burp's PASSIVE findings (missing HSTS/CSP, version disclosure, cookie flags) are already
-                // logged in real time — and captured to the report — by AiTriage's audit-issue handler as Burp
-                // files them during the crawl. No separate harvest here (that double-logged them).
+                scanLog.log("=== scan complete for " + host + ": no auditable parameters ===");
                 logAiUsage();
                 writeReport();
                 return;   // exit is triggered ONCE by the caller after ALL audits (see crawlAndScan)
@@ -1077,7 +1095,7 @@ public final class AiScanner {
                     // slow audit run to TRUE completion instead of being cut by a quiet-timeout or the
                     // deadline while still scanning (which truncated findings).
                     if (started && sm.toLowerCase().matches("(?s).*(finish|complete|abandon|cancel).*")) {
-                        scanLog.log("[AI Scanner] audit finished (Burp status: " + trunc(sm, 60) + ")");
+                        scanLog.log("audit finished (Burp status: " + trunc(sm, 60) + ")");
                         break;
                     }
                     if (c == lastReq && ic == lastIss) {
@@ -1085,11 +1103,11 @@ public final class AiScanner {
                     } else {
                         stable = 0; lastReq = c; lastIss = ic;
                     }
-                    scanLog.log("[AI Scanner] auditing… requests: " + c + ", findings: " + scanLog.findingCount()
+                    scanLog.log("auditing… requests: " + c + ", findings: " + scanLog.findingCount()
                             + ", quiet: " + stable + "m"
                             + (sm.isBlank() ? "" : "  [" + trunc(sm, 80) + "]"));
                 } catch (Throwable t) {
-                    scanLog.debug("[AI Scanner] audit monitor tick error (continuing): " + t);
+                    scanLog.debug("audit monitor tick error (continuing): " + t);
                 }
             }
 
@@ -1107,7 +1125,7 @@ public final class AiScanner {
             // Intermediate audit (the main authenticated audit): concise one-liner only. The full banner +
             // site-map dump + report are emitted once, by the FINAL (auth-page) summarize, so they don't double.
             if (!finalPhase) {
-                scanLog.log("[AI Scanner] main audit complete: " + scanLog.findingCount() + " confirmed finding(s), "
+                scanLog.log("main audit complete: " + scanLog.findingCount() + " confirmed finding(s), "
                         + audit.requestCount() + " request(s), " + audit.errorCount() + " error(s).");
                 logAiUsage();
                 writeReport();
@@ -1119,22 +1137,22 @@ public final class AiScanner {
                     : session.has() ? "yes (session cookie)"
                     : "no";
             scanLog.phase("Idle — scan complete");
-            scanLog.log("[AI Scanner] ===================== SCAN COMPLETE (" + host + ") =====================");
+            scanLog.log("===================== SCAN COMPLETE (" + host + ") =====================");
             logBenchmarkTally();   // copy-pasteable, matches the harness metric() exactly (no report file needed)
-            scanLog.log("[AI Scanner] authenticated: " + authWith
+            scanLog.log("authenticated: " + authWith
                     + "   |   audit requests: " + audit.requestCount() + "   |   errors: " + audit.errorCount());
             if (!issues.isEmpty()) {
-                scanLog.log("[AI Scanner] issues: " + issues.size()
+                scanLog.log("issues: " + issues.size()
                         + "  →  HIGH: " + high + " | MEDIUM: " + medium + " | LOW: " + low + " | INFO: " + info);
             } else {
                 // audit.issues() is unsupported on this Burp build — report the live count instead of a
                 // misleading "0". The findings themselves were logged above as they were confirmed.
-                scanLog.log("[AI Scanner] confirmed findings (reported live above): " + scanLog.findingCount()
+                scanLog.log("confirmed findings (reported live above): " + scanLog.findingCount()
                         + "   (per-audit severity tally unavailable on this Burp build)");
             }
             // (No per-finding recap here — each finding was already logged ONCE, in real time, by AiTriage.
             // Re-listing them added duplicate lines to the log AND the report; the count tally above suffices.)
-            scanLog.log("[AI Scanner] ==========================================================================");
+            scanLog.log("==========================================================================");
             emitManualNextSteps();   // analyst hand-off: what the scanner does NOT auto-confirm → test by hand
             // DIAGNOSTIC: are our own AI issues actually in the site map (Target→Issues)? audit.issues()
             // above only lists the active-audit TASK's issues; our probe/flow findings are added via
@@ -1142,10 +1160,10 @@ public final class AiScanner {
             try {
                 List<AuditIssue> sm = api.siteMap().issues();
                 long ai = sm.stream().filter(i -> i.name() != null && i.name().startsWith("AI:")).count();
-                scanLog.log("[AI Scanner] site-map issues: " + sm.size() + " total, " + ai + " AI-raised");
+                scanLog.log("site-map issues: " + sm.size() + " total, " + ai + " AI-raised");
                 sm.stream().filter(i -> i.name() != null && i.name().startsWith("AI:")).limit(10)
-                        .forEach(i -> scanLog.log("[AI Scanner]    AI issue in site map: " + i.name() + " @ " + i.baseUrl()));
-            } catch (Throwable t) { scanLog.log("[AI Scanner] site-map issue query failed: " + t); }
+                        .forEach(i -> scanLog.log("   AI issue in site map: " + i.name() + " @ " + i.baseUrl()));
+            } catch (Throwable t) { scanLog.log("site-map issue query failed: " + t); }
             logAiUsage();    // estimated Burp AI credit burn for this scan (Burp AI is paid — keep it visible)
             writeReport();   // machine-readable findings for the benchmark harness (-Daiscanner.report / AISCANNER_REPORT)
             // NOTE: exitOnComplete is NOT triggered here — summarize() runs once PER audit (main + login), and
@@ -1155,8 +1173,8 @@ public final class AiScanner {
             // Interrupt = extension unloaded / thread cancelled — do NOT exit Burp on this path.
             Thread.currentThread().interrupt();
         } catch (Throwable t) {
-            scanLog.log("[AI Scanner] summary failed (visible so it's not silent): " + t);
-            api.logging().logToError("[AI Scanner] summary failed: " + t);
+            scanLog.log("summary failed (visible so it's not silent): " + t);
+            scanLog.log("summary failed: " + t);
         }
     }
 
@@ -1177,12 +1195,12 @@ public final class AiScanner {
     public void exitIfRequested() {
         if (!selfExitAllowed) return;    // parallel unit: launchParallel owns the central shutdown after ALL join
         if (!exitOnComplete()) return;   // default: never triggers — normal GUI use is unaffected
-        scanLog.log("[AI Scanner] exitOnComplete set — requesting a clean Burp shutdown so the CLI run can return.");
+        scanLog.log("exitOnComplete set — requesting a clean Burp shutdown so the CLI run can return.");
         try { Thread.sleep(1500L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }  // let the final log/report flush
         try {
             api.burpSuite().shutdown();
         } catch (Throwable t) {
-            scanLog.log("[AI Scanner] burpSuite().shutdown() unavailable (" + t + ") — leaving Burp running; close it manually.");
+            scanLog.log("burpSuite().shutdown() unavailable (" + t + ") — leaving Burp running; close it manually.");
         }
     }
 
@@ -1203,40 +1221,40 @@ public final class AiScanner {
             if (!e.isConfigured()) {
                 if (required) {
                     if (exitOnComplete()) {   // headless/Docker: fail fast
-                        scanLog.log("[AI Scanner] !! " + e.name() + " is NOT configured (base URL/key missing) — ABORTING (headless). "
+                        scanLog.log("!! " + e.name() + " is NOT configured (base URL/key missing) — ABORTING (headless). "
                                 + "The local LLM was selected but has no endpoint; set -Daiscanner.baseUrl / AISCANNER_BASE_URL.");
                         return aiUsable = false;
                     }
-                    scanLog.log("[AI Scanner] !! " + e.name() + " is NOT configured (base URL/key missing) — continuing "
+                    scanLog.log("!! " + e.name() + " is NOT configured (base URL/key missing) — continuing "
                             + "WITHOUT AI: deterministic probes + auth + native audit still run; LLM discovery/triage skipped.");
                     return aiUsable = true;
                 }
-                scanLog.log("[AI Scanner] AI preflight → engine=" + e.name() + " not configured — targeting/triage will degrade. "
+                scanLog.log("AI preflight → engine=" + e.name() + " not configured — targeting/triage will degrade. "
                         + "For Burp AI: turn on Settings → AI, reload this extension, and approve its AI-access prompt. "
                         + "Or use a local LLM (AI Scanner Settings) — no Burp AI needed.");
                 return aiUsable = true;
             }
             boolean reachable = e.testConnection();
-            scanLog.log("[AI Scanner] AI preflight → engine=" + e.name() + ", reachable=" + reachable);
+            scanLog.log("AI preflight → engine=" + e.name() + ", reachable=" + reachable);
             if (!reachable && required) {
                 String err = e.lastError();
                 String tail = (err == null || err.isEmpty() ? "" : " (" + err + ")");
                 if (exitOnComplete()) {   // headless/Docker: fail fast — a silently AI-less report is worse than none
-                    scanLog.log("[AI Scanner] !! " + e.name() + " endpoint did NOT answer the health check" + tail
+                    scanLog.log("!! " + e.name() + " endpoint did NOT answer the health check" + tail
                             + " — ABORTING (headless): the local LLM was selected but is down. Fix the endpoint or use -Daiscanner.provider=BURP_AI.");
                     return aiUsable = false;
                 }
                 // interactive: degrade, don't abort — the deterministic layer (auth, identity sweep, probes,
                 // exercise-writes, native audit) still delivers findings without the LLM.
-                scanLog.log("[AI Scanner] !! " + e.name() + " endpoint did NOT answer the health check" + tail
+                scanLog.log("!! " + e.name() + " endpoint did NOT answer the health check" + tail
                         + " — continuing WITHOUT AI: deterministic probes + auth + native audit still run; LLM-assisted discovery/triage is skipped.");
                 return aiUsable = true;
             }
             if (!reachable)
-                scanLog.log("[AI Scanner] !! AI backend not reachable — continuing; targeting/triage will degrade.");
+                scanLog.log("!! AI backend not reachable — continuing; targeting/triage will degrade.");
             return aiUsable = true;
         } catch (Throwable t) {
-            scanLog.log("[AI Scanner] AI preflight error (continuing): " + t);
+            scanLog.log("AI preflight error (continuing): " + t);
             return aiUsable = true;   // a preflight bug must never block a run
         }
     }
@@ -1248,12 +1266,12 @@ public final class AiScanner {
             if (calls <= 0) return;   // LOCAL_LLM run (or no AI calls) — nothing to bill
             // NOTE: no token estimate — chars/4 was unreliable, so we report only the EXACT call count. Real credit
             // cost comes from Burp's balance (below), which lags its cache.
-            scanLog.log("[AI Scanner] ===== Burp AI usage this scan: " + calls + " call(s) =====");
+            scanLog.log("===== Burp AI usage this scan: " + calls + " call(s) =====");
             // REAL credits: start (snapshotted on the first call) vs end (Burp's last-synced balance).
             String start = com.ioactive.aiscanner.engine.MontoyaAiEngine.scanStartCredits();
             String end = com.ioactive.aiscanner.engine.MontoyaAiEngine.readCreditBalance();
             if (start != null)
-                scanLog.log("[AI Scanner] Burp AI credits available (start of scan): "
+                scanLog.log("Burp AI credits available (start of scan): "
                         + com.ioactive.aiscanner.engine.MontoyaAiEngine.displayBalance(start));
             if (end != null) {
                 // Burp's cached balance (WorkspaceConfig.json) only refreshes on sync/exit, so end==start is the
@@ -1269,7 +1287,7 @@ public final class AiScanner {
                         note = "  |  spent this scan: NOT yet reflected — Burp's cached balance lags (refreshes on "
                              + "sync/exit); " + calls + " billed call(s) this scan (see above)";
                 } catch (NumberFormatException e) { note = ""; }
-                scanLog.log("[AI Scanner] Burp AI credits available (end of scan): "
+                scanLog.log("Burp AI credits available (end of scan): "
                         + com.ioactive.aiscanner.engine.MontoyaAiEngine.displayBalance(end) + note);
             }
         } catch (Throwable ignore) { }
@@ -1308,7 +1326,7 @@ public final class AiScanner {
             };
             for (String m : manual) out.add("    - " + m);
 
-            for (String line : out) scanLog.log("[AI Scanner] " + line);
+            for (String line : out) scanLog.log("" + line);
 
             String path = reportPathBase();
             if (path != null && !path.isBlank()) {
@@ -1316,7 +1334,7 @@ public final class AiScanner {
                 try { java.nio.file.Files.write(java.nio.file.Path.of(mp), out); } catch (Throwable ignore) { }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] manual-next-steps emit failed: " + t);
+            scanLog.debug("manual-next-steps emit failed: " + t);
         }
     }
 
@@ -1341,7 +1359,7 @@ public final class AiScanner {
                 else if (t.startsWith("HIGH ") || t.startsWith("MED ")) nat.add(t);
             }
             int total = det.size() + nat.size();
-            scanLog.log("[AI Scanner] ===== BENCHMARK SCORE (VULNERABILITY + HIGH + MED) = " + total
+            scanLog.log("===== BENCHMARK SCORE (VULNERABILITY + HIGH + MED) = " + total
                     + "   →   deterministic-oracle: " + det.size() + " | native-Burp-audit: " + nat.size()
                     + "   |   time: " + scanLog.scanElapsed() + " (" + scanLog.scanElapsedSeconds() + "s) =====");
             // Breakdown by CRITICALITY + CATEGORY (over the scored findings) — so the benchmark compares not just a
@@ -1355,25 +1373,25 @@ public final class AiScanner {
                 bySev.merge(sev, 1, Integer::sum);
                 byCat.merge(cat, 1, Integer::sum);
             }
-            scanLog.log("[AI Scanner]   by criticality:  HIGH: " + bySev.get("HIGH") + " | MEDIUM: " + bySev.get("MEDIUM")
+            scanLog.log("  by criticality:  HIGH: " + bySev.get("HIGH") + " | MEDIUM: " + bySev.get("MEDIUM")
                     + " | LOW: " + bySev.get("LOW") + " | INFO: " + bySev.get("INFO"));
             // …and split by SOURCE (deterministic probes vs Burp-native), the exact rows the benchmark table uses.
             int[] ds = sevCounts(det), ns = sevCounts(nat);
-            scanLog.log("[AI Scanner]   by criticality — deterministic:  HIGH: " + ds[0] + " | MEDIUM: " + ds[1] + " | LOW: " + ds[2]);
-            scanLog.log("[AI Scanner]   by criticality — native:         HIGH: " + ns[0] + " | MEDIUM: " + ns[1] + " | LOW: " + ns[2]);
+            scanLog.log("  by criticality — deterministic:  HIGH: " + ds[0] + " | MEDIUM: " + ds[1] + " | LOW: " + ds[2]);
+            scanLog.log("  by criticality — native:         HIGH: " + ns[0] + " | MEDIUM: " + ns[1] + " | LOW: " + ns[2]);
             StringBuilder cats = new StringBuilder();
             for (java.util.Map.Entry<String,Integer> e : byCat.entrySet())
                 cats.append(cats.length() > 0 ? " | " : "").append(e.getKey()).append(": ").append(e.getValue());
-            scanLog.log("[AI Scanner]   by category (" + byCat.size() + " classes):  " + cats);
+            scanLog.log("  by category (" + byCat.size() + " classes):  " + cats);
             int i = 1;
-            scanLog.log("[AI Scanner]   -- deterministic-oracle (" + det.size() + ") — our probes, repeatable --");
-            for (String c : det) scanLog.log("[AI Scanner]   " + (i++) + ". [" + sevOf(c) + "] " + (c.length() > 175 ? c.substring(0, 175) + "…" : c));
-            scanLog.log("[AI Scanner]   -- native-Burp-audit (" + nat.size() + ") — Burp FIRM/CERTAIN, variable --");
-            for (String c : nat) scanLog.log("[AI Scanner]   " + (i++) + ". [" + sevOf(c) + "] " + (c.length() > 175 ? c.substring(0, 175) + "…" : c));
+            scanLog.log("  -- deterministic-oracle (" + det.size() + ") — our probes, repeatable --");
+            for (String c : det) scanLog.log("  " + (i++) + ". [" + sevOf(c) + "] " + (c.length() > 175 ? c.substring(0, 175) + "…" : c));
+            scanLog.log("  -- native-Burp-audit (" + nat.size() + ") — Burp FIRM/CERTAIN, variable --");
+            for (String c : nat) scanLog.log("  " + (i++) + ". [" + sevOf(c) + "] " + (c.length() > 175 ? c.substring(0, 175) + "…" : c));
             String llm = com.ioactive.aiscanner.engine.LlmTiming.summary();
-            if (llm != null) scanLog.log("[AI Scanner]   " + llm + "  (LLM wait is part of the total time above)");
-            scanLog.log("[AI Scanner] ===== END BENCHMARK SCORE (" + total + " = " + det.size() + " det + " + nat.size() + " native) =====");
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] benchmark tally failed: " + t); }
+            if (llm != null) scanLog.log("  " + llm + "  (LLM wait is part of the total time above)");
+            scanLog.log("===== END BENCHMARK SCORE (" + total + " = " + det.size() + " det + " + nat.size() + " native) =====");
+        } catch (Throwable t) { scanLog.debug("benchmark tally failed: " + t); }
     }
 
     /** [HIGH, MEDIUM, LOW] counts for a list of report lines (INFO folded out — never scored). */
@@ -1466,9 +1484,9 @@ public final class AiScanner {
             java.util.List<String> out = new java.util.ArrayList<>(reportSummaryHeader());
             out.addAll(scanLog.findingsReport());
             java.nio.file.Files.write(java.nio.file.Path.of(path), out);
-            scanLog.log("[AI Scanner] findings report written → " + path);
+            scanLog.log("findings report written → " + path);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] report write failed: " + t);
+            scanLog.debug("report write failed: " + t);
         }
     }
 
@@ -1504,9 +1522,9 @@ public final class AiScanner {
             out.add("# findings_total=0  deterministic=0  native=0");
             out.add("# severity  HIGH=0  MEDIUM=0  LOW=0  INFO=0");
             java.nio.file.Files.write(java.nio.file.Path.of(path), out);
-            scanLog.log("[AI Scanner] skip report written → " + path);
+            scanLog.log("skip report written → " + path);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] skip report write failed: " + t);
+            scanLog.debug("skip report write failed: " + t);
         }
     }
 
@@ -1542,7 +1560,7 @@ public final class AiScanner {
     private boolean mutatesOwnAccount(HttpRequest req) {
         try {
             if (session != null && session.mutatesOwnAccount(req.method(), pathOf(req))) {
-                scanLog.debug("[AI Scanner]   skip (would mutate our OWN account — keeps the session alive): "
+                scanLog.debug("  skip (would mutate our OWN account — keeps the session alive): "
                         + req.method() + " " + pathOf(req));
                 return true;
             }
@@ -1554,14 +1572,14 @@ public final class AiScanner {
         if (audit == null) return false;   // Community edition — no native audit
         if (STATIC.matcher(pathOf(req)).matches()) return false;
         if (NOISE.matcher(req.url()).matches()) {
-            scanLog.debug("[AI Scanner]   skip audit (transport/handshake noise): " + Net.stripQuery(req.url()));
+            scanLog.debug("  skip audit (transport/handshake noise): " + Net.stripQuery(req.url()));
             return false;
         }
         // Never audit login/signin/logout: Burp firing payloads at them = login attempts that
         // invalidate our authenticated session mid-audit, making every /bank/* request bounce to
         // login. Those pages add no injection value (creds/cleartext already covered separately).
         if (AuthenticatedExplorer.SESSION_RESET.matcher(Net.stripQuery(req.url())).matches()) {
-            scanLog.debug("[AI Scanner]   skip audit (auth page, would drop session): " + Net.stripQuery(req.url()));
+            scanLog.debug("  skip audit (auth page, would drop session): " + Net.stripQuery(req.url()));
             return false;
         }
         if (mutatesOwnAccount(req)) return false;
@@ -1587,7 +1605,7 @@ public final class AiScanner {
         if (ranges.isEmpty()) return false;
         audit.addRequest(finalReq, ranges);
         scanLog.addInsertionPoints(paramCount + extra);
-        scanLog.log("[AI Scanner]   audit @ " + finalReq.method() + " " + Net.stripQuery(finalReq.url())
+        scanLog.log("  audit @ " + finalReq.method() + " " + Net.stripQuery(finalReq.url())
                 + " → " + paramSummary(finalReq)
                 + (extra > 0 ? " [+" + extra + " AI insertion point(s)]" : "")
                 + " (" + (paramCount + extra) + " point(s))");
@@ -1619,7 +1637,7 @@ public final class AiScanner {
             if (overlapsAny(ranges, start, end)) continue;
             ranges.add(Range.range(start, end));
             added++;
-            scanLog.log("[AI Scanner]     + AI insertion point: " + trunc(v, 60));
+            scanLog.log("    + AI insertion point: " + trunc(v, 60));
         }
         return added;
     }
@@ -1689,18 +1707,18 @@ public final class AiScanner {
         // it as a target would send attack payloads to a third party (scope violation + guaranteed false positive:
         // an external service's response varies by its own params, which fools differential oracles). Skip anything
         // Burp says is out of scope. Generic — respects whatever scope the operator/launcher set.
-        try { if (!api.scope().isInScope(req.url())) { scanLog.debug("[AI Scanner]   skip out-of-scope: " + Net.stripQuery(req.url())); return false; } }
+        try { if (!api.scope().isInScope(req.url())) { scanLog.debug("  skip out-of-scope: " + Net.stripQuery(req.url())); return false; } }
         catch (Throwable ignore) { }
         // Parallel isolation: Burp scope is ADDITIVE across concurrent scans, so isInScope() alone lets the OTHER
         // target's requests in. Keep every audit target on THIS scan's own authority (no-op in single-target runs).
-        if (!inScanHost(req.url())) { scanLog.debug("[AI Scanner]   skip other-target host: " + Net.stripQuery(req.url())); return false; }
+        if (!inScanHost(req.url())) { scanLog.debug("  skip other-target host: " + Net.stripQuery(req.url())); return false; }
         // NEVER put login/logout/signin in the probe surface: a probe fuzzing them submits credentials / hits the
         // logout, which INVALIDATES our authenticated session mid-battery — every authenticated endpoint tested
         // afterwards then bounces to login (302) and its sink is missed (observed: reflected-XSS on Zero Bank's
         // /bank/* went from 5→0 in a full run because a prior probe fuzzed /signin.html and logged us out). Login
         // SQLi / weak-creds are covered separately by the auth phase + auditAuthPages() (run in isolation, after).
         if (AuthenticatedExplorer.SESSION_RESET.matcher(Net.stripQuery(req.url())).matches()) {
-            scanLog.debug("[AI Scanner]   skip auth page (would drop session if fuzzed): " + Net.stripQuery(req.url()));
+            scanLog.debug("  skip auth page (would drop session if fuzzed): " + Net.stripQuery(req.url()));
             return false;
         }
         if (mutatesOwnAccount(req)) return false;
@@ -1724,7 +1742,7 @@ public final class AiScanner {
         if (seen.add(key.toString())) {
             targets.add(req);
             scanLog.scanned(req.url(), paramSummary(req));
-            scanLog.log("[AI Scanner]   found params @ " + req.method() + " " + Net.stripQuery(req.url())
+            scanLog.log("  found params @ " + req.method() + " " + Net.stripQuery(req.url())
                     + " → " + paramSummary(req));
             return true;
         }
@@ -1781,7 +1799,7 @@ public final class AiScanner {
                 if (addTarget(targets, seen, req)) added++;
             } catch (Throwable ignore) { }
         }
-        if (added > 0) scanLog.log("[AI Scanner] SAST: synthesized " + added
+        if (added > 0) scanLog.log("SAST: synthesized " + added
                 + " concrete hint-target(s) (route+param+baseline) into the audit surface.");
     }
 
@@ -2041,7 +2059,11 @@ public final class AiScanner {
         List<ParsedHttpParameter> out = new ArrayList<>();
         if (!req.hasParameters()) return out;
         for (ParsedHttpParameter p : req.parameters()) {
-            if (p.type() == HttpParameterType.URL || p.type() == HttpParameterType.BODY) out.add(p);
+            if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;
+            // Never fuzz a CSRF/anti-forgery token — mutating it just 403s before the sink, and starves every OTHER
+            // param on the form. Keep it in the request (its value validates the POST); it's simply not an insertion point.
+            if (AuthenticatedExplorer.isCsrfParam(p.name())) continue;
+            out.add(p);
         }
         return out;
     }

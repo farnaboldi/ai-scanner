@@ -100,15 +100,15 @@ public final class ChainReplayProbe {
                 }
                 if (hitRecord == null) continue;
                 probed++;
-                scanLog.log("[AI Scanner]   chain: sink CONSUMES leaked record -> POST "
+                scanLog.log("  chain: sink CONSUMES leaked record -> POST "
                         + sink.pathWithoutQuery() + " (probing)");
                 probeSink(sessionizer.apply(sink.withHeader("Content-Type", "application/json").withBody(hitRecord)));
             }
             if (probed > 0)
-                scanLog.log("[AI Scanner] create->consume chain: " + probed + " sibling write sink(s) consumed a leaked record and were probed.");
+                scanLog.log("create->consume chain: " + probed + " sibling write sink(s) consumed a leaked record and were probed.");
             return probed;
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] chain-replay probe error: " + t);
+            scanLog.debug("chain-replay probe error: " + t);
             return 0;
         }
     }

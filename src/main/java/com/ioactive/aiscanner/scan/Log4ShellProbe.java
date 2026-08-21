@@ -56,7 +56,7 @@ public final class Log4ShellProbe {
     public int probe(String baseUrl, List<HttpRequest> targets, UnaryOperator<HttpRequest> withSession) {
         CollaboratorClient collab;
         try { collab = api.collaborator().createClient(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   log4shell: Collaborator unavailable — JNDI OAST skipped"); return 0; }
+        catch (Throwable t) { scanLog.debug("  log4shell: Collaborator unavailable — JNDI OAST skipped"); return 0; }
 
         Map<String, String[]> tagToPoint = new LinkedHashMap<>();          // tag -> {url, point-label}
         Map<String, HttpRequestResponse> tagToRr = new LinkedHashMap<>();  // tag -> the request that carried the payload
@@ -83,7 +83,7 @@ public final class Log4ShellProbe {
         }
 
         if (tagToPoint.isEmpty()) return 0;
-        scanLog.debug("[AI Scanner]   log4shell: fired " + tagToPoint.size() + " JNDI payload(s); polling Collaborator…");
+        scanLog.debug("  log4shell: fired " + tagToPoint.size() + " JNDI payload(s); polling Collaborator…");
         return poll(collab, tagToPoint, tagToRr);
     }
 
@@ -139,8 +139,12 @@ public final class Log4ShellProbe {
     private int poll(CollaboratorClient collab, Map<String, String[]> tagToPoint, Map<String, HttpRequestResponse> tagToRr) {
         int hits = 0;
         Set<String> fired = new LinkedHashSet<>();
+        // Poll window: a JNDI DNS lookup usually fires within seconds, but a slow/async logger, a container DNS
+        // round-trip, or an LDAP-only (no-DNS) sink can lag — 15s was too tight (christophetd log4shell fired the
+        // lookup but the interaction hadn't been retrieved yet). Default ~50s, overridable.
+        int rounds = Integer.getInteger("aiscanner.log4shellPollRounds", 20);
         try {
-            for (int round = 0; round < 6; round++) {           // ~15s — a JNDI DNS lookup fires near-immediately
+            for (int round = 0; round < rounds; round++) {
                 Thread.sleep(2500);
                 List<Interaction> interactions;
                 try { interactions = collab.getAllInteractions(); } catch (Throwable t) { break; }
@@ -159,7 +163,7 @@ public final class Log4ShellProbe {
                 }
             }
         } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   log4shell: poll error: " + t); }
+        catch (Throwable t) { scanLog.debug("  log4shell: poll error: " + t); }
         return hits;
     }
 }
