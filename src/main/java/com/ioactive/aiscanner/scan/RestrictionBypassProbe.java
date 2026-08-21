@@ -91,7 +91,7 @@ public final class RestrictionBypassProbe {
                         "renamed indexed field names (server validated by exact name)", req.url())) return true;
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] restriction-bypass probe error: " + t);
+            scanLog.debug("restriction-bypass probe error: " + t);
         }
         return false;
     }

@@ -114,7 +114,7 @@ public final class UnauthAccessProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] unauth-access probe error: " + t);
+            scanLog.debug("unauth-access probe error: " + t);
         }
         return hits;
     }

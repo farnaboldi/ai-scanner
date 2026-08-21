@@ -79,7 +79,7 @@ public final class CsrfProbe {
             }
             hits = emitCsrf(host, whyBy, evBy);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] CSRF probe error: " + t);
+            scanLog.debug("CSRF probe error: " + t);
         }
         return hits;
     }
@@ -157,7 +157,7 @@ public final class CsrfProbe {
         }
 
         HttpRequestResponse forgedRr = send(forged);
-        scanLog.debug("[AI Scanner] CSRF candidate POST " + key + " → forged HTTP " + status(forgedRr)
+        scanLog.debug("CSRF candidate POST " + key + " → forged HTTP " + status(forgedRr)
                 + (forgedRr != null && forgedRr.response() != null && forgedRr.response().hasHeader("Location")
                         ? " loc=" + forgedRr.response().headerValue("Location") : "")
                 + " accepted=" + forgedAccepted(forgedRr));

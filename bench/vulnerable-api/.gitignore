@@ -1,8 +1,0 @@
-.idea
-.vagrant
-.vscode
-.mypy_cache
-venv/
-vAPI.log
-__pycache__
-.coverage

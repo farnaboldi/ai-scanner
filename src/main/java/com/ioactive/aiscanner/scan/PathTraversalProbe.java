@@ -82,7 +82,7 @@ public final class PathTraversalProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] path-traversal probe error: " + t);
+            scanLog.debug("path-traversal probe error: " + t);
         }
         return false;
     }

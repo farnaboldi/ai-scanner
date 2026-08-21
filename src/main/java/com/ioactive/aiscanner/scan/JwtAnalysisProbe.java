@@ -100,9 +100,9 @@ public final class JwtAnalysisProbe {
                     }
                 } catch (Exception ignore) { }
             }
-            scanLog.log("[AI Scanner] JWT analysis: " + tokens.size() + " distinct token(s) ("
+            scanLog.log("JWT analysis: " + tokens.size() + " distinct token(s) ("
                     + bearerTokens.size() + " used as bearer), " + carriers.size() + " authed carrier request(s) on " + host + ".");
-            if (tokens.isEmpty()) { scanLog.debug("[AI Scanner]   jwt: no JWTs in site map — skip"); return 0; }
+            if (tokens.isEmpty()) { scanLog.debug("  jwt: no JWTs in site map — skip"); return 0; }
 
             Set<String> firedNone = new LinkedHashSet<>();
             for (String tok : tokens) {
@@ -112,9 +112,9 @@ public final class JwtAnalysisProbe {
                 try {
                     hdr = new JSONObject(new String(b64url(parts[0]), StandardCharsets.UTF_8));
                     pl  = new JSONObject(new String(b64url(parts[1]), StandardCharsets.UTF_8));
-                } catch (Exception e) { scanLog.debug("[AI Scanner]   jwt: undecodable token skipped"); continue; }
+                } catch (Exception e) { scanLog.debug("  jwt: undecodable token skipped"); continue; }
                 String alg = hdr.optString("alg", "?");
-                scanLog.debug("[AI Scanner]   jwt: alg=" + alg + " hdr=" + hdr + " claims=" + pl.keySet());
+                scanLog.debug("  jwt: alg=" + alg + " hdr=" + hdr + " claims=" + pl.keySet());
                 HttpRequestResponse ev = evidence.get(tok);   // the request/response this token was observed in
 
                 // Is this an AUTH/SESSION token (where exp/lifetime/PII actually matter), or an ephemeral,
@@ -175,12 +175,12 @@ public final class JwtAnalysisProbe {
                               + "server does not verify the signature, so any token can be forged (CWE-347).",
                                 carrier)) hits++;
                     } else {
-                        scanLog.debug("[AI Scanner]   jwt: alg:none replay rejected (good) on " + carrier.request().url());
+                        scanLog.debug("  jwt: alg:none replay rejected (good) on " + carrier.request().url());
                     }
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] JWT analysis error: " + t);
+            scanLog.debug("JWT analysis error: " + t);
         }
         return hits;
     }
@@ -200,7 +200,7 @@ public final class JwtAnalysisProbe {
             // the endpoint is simply public and proves nothing about signature checking.
             return sf >= 200 && sf < 300 && (sn == 401 || sn == 403);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   jwt: alg:none test error: " + t);
+            scanLog.debug("  jwt: alg:none test error: " + t);
             return false;
         }
     }

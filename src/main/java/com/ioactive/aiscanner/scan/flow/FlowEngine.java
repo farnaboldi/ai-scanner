@@ -104,7 +104,7 @@ public final class FlowEngine {
                             + (act == null ? 0 : act.status()) + ") — do not reuse it";
                     if (++plateau >= MAX_PLATEAU) break; else continue;
                 }
-                scanLog.debug("[AI Scanner]   flow step " + step + ": " + p.method() + " " + p.url()
+                scanLog.debug("  flow step " + step + ": " + p.method() + " " + p.url()
                         + (p.intent().isBlank() ? "" : " (" + p.intent() + ")") + " -> HTTP " + act.status());
 
                 if (act.ok2xx() && act.rr() != null && act.rr().response() != null) reached.add(act.rr());  // COVERAGE

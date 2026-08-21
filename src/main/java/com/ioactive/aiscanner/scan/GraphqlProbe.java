@@ -51,7 +51,8 @@ public final class GraphqlProbe {
     // Minimal introspection: query/mutation type names + each field's name and its arguments' (unwrapped) types.
     private static final String INTROSPECTION =
             "query{__schema{queryType{name} mutationType{name} types{name kind "
-          + "fields{name args{name type{kind name ofType{kind name ofType{kind name ofType{kind name}}}}}}}}}";
+          + "fields{name type{kind name ofType{kind name ofType{kind name}}} "
+          + "args{name type{kind name ofType{kind name ofType{kind name ofType{kind name}}}}}}}}}";
 
     public GraphqlProbe(MontoyaApi api, ScanLog scanLog) {
         this.api = api;
@@ -61,6 +62,7 @@ public final class GraphqlProbe {
     private static final class Resolver {
         final String name;
         final List<String> stringArgs = new ArrayList<>();
+        boolean returnsObject;   // return type unwraps to OBJECT/INTERFACE/UNION → the query MUST select a subfield
         Resolver(String name) { this.name = name; }
     }
 
@@ -68,13 +70,13 @@ public final class GraphqlProbe {
     public int probe(String host) {
         try {
             String url = findEndpoint(host);
-            if (url == null) { scanLog.debug("[AI Scanner]   graphql: no GraphQL endpoint on " + host); return 0; }
-            scanLog.log("[AI Scanner] ── GraphQL probe @ " + url);
+            if (url == null) { scanLog.debug("  graphql: no GraphQL endpoint on " + host); return 0; }
+            scanLog.log("── GraphQL probe @ " + url);
 
             HttpRequestResponse intro = send(url, new JSONObject().put("query", INTROSPECTION).toString());
             JSONObject schema = schemaOf(intro);
             if (schema == null) {
-                scanLog.log("[AI Scanner] graphql probe: endpoint present but introspection disabled — no schema to drive resolver tests.");
+                scanLog.log("graphql probe: endpoint present but introspection disabled — no schema to drive resolver tests.");
                 return 0;
             }
             int hits = 0;
@@ -97,8 +99,8 @@ public final class GraphqlProbe {
                 // (2a) error-based SQLi on the resolver arg: a single quote that breaks the SQL string surfaces a DB
                 //      error the balanced quote ('') does not → the value reaches a SQL sink unescaped (CWE-89).
                 //      Zero-FP differential (a non-SQL error, e.g. a missing required arg, errors on BOTH → no finding).
-                HttpRequestResponse sqlBad = sendResolver(url, r.name, arg, "aisc'");
-                if (sqlError(sqlBad) && !sqlError(sendResolver(url, r.name, arg, "aisc''"))) {
+                HttpRequestResponse sqlBad = sendResolver(url, r.name, arg, "aisc'", r.returnsObject);
+                if (sqlError(sqlBad) && !sqlError(sendResolver(url, r.name, arg, "aisc''", r.returnsObject))) {
                     scanLog.found("GraphQL SQL injection", url,
                             "Resolver '" + r.name + "(" + arg + ")' reaches a SQL sink: a single quote in the argument "
                           + "surfaced a database error that the balanced quote ('') did not, so the value is concatenated "
@@ -107,7 +109,7 @@ public final class GraphqlProbe {
                     hits++;
                 }
                 String nonce = "AISC" + Long.toHexString(System.nanoTime()).toUpperCase();
-                HttpRequestResponse rr = sendResolver(url, r.name, arg, "echo " + nonce);
+                HttpRequestResponse rr = sendResolver(url, r.name, arg, "echo " + nonce, r.returnsObject);
                 String reply = resolverValue(rr, r.name);
                 if (reply == null) continue;
                 String t = reply.trim();
@@ -128,10 +130,10 @@ public final class GraphqlProbe {
             // force) + DoS (CWE-770). Non-destructive (benign __typename); zero-FP (N results for ONE request).
             hits += amplificationTest(url);
 
-            scanLog.log("[AI Scanner] graphql probe: " + hits + " finding(s) over " + tested + " resolver(s) with a string arg.");
+            scanLog.log("graphql probe: " + hits + " finding(s) over " + tested + " resolver(s) with a string arg.");
             return hits;
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   graphql probe error: " + t);
+            scanLog.debug("  graphql probe error: " + t);
             return 0;
         }
     }
@@ -195,6 +197,7 @@ public final class GraphqlProbe {
                     JSONObject fld = fields.optJSONObject(f);
                     if (fld == null) continue;
                     Resolver r = new Resolver(fld.optString("name"));
+                    r.returnsObject = isObjectKind(fld.optJSONObject("type"));
                     JSONArray args = fld.optJSONArray("args");
                     for (int a = 0; args != null && a < args.length(); a++) {
                         JSONObject arg = args.optJSONObject(a);
@@ -218,10 +221,25 @@ public final class GraphqlProbe {
         return null;
     }
 
+    /** True if a field's return type unwraps (past NON_NULL/LIST) to an OBJECT/INTERFACE/UNION — such a field
+     *  REQUIRES a subfield selection, so the probe query must add one; scalars/enums must NOT have one. */
+    private static boolean isObjectKind(JSONObject type) {
+        for (int hop = 0; hop < 8 && type != null; hop++) {
+            String kind = type.optString("kind", "");
+            if ("OBJECT".equals(kind) || "INTERFACE".equals(kind) || "UNION".equals(kind)) return true;
+            if ("SCALAR".equals(kind) || "ENUM".equals(kind)) return false;
+            type = type.optJSONObject("ofType");   // unwrap NON_NULL / LIST
+        }
+        return false;
+    }
+
     // ---- resolver invocation ----
-    private HttpRequestResponse sendResolver(String url, String resolver, String arg, String value) {
+    private HttpRequestResponse sendResolver(String url, String resolver, String arg, String value, boolean selectSubfield) {
         JSONObject q = new JSONObject();
-        q.put("query", "query($v:String!){" + resolver + "(" + arg + ":$v)}");
+        // Object/list resolvers REQUIRE a subfield selection — without it the query is INVALID (a validation error,
+        // HTTP 400) and never reaches the resolver, so no injection sink is exercised. Scalars must NOT have one.
+        String sel = selectSubfield ? "{__typename}" : "";
+        q.put("query", "query($v:String!){" + resolver + "(" + arg + ":$v)" + sel + "}");
         q.put("variables", new JSONObject().put("v", value));
         return send(url, q.toString());
     }

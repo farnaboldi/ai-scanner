@@ -42,14 +42,14 @@ public final class AiTriage implements AuditIssueHandler {
             // later confidence upgrade (TENTATIVE→FIRM) can still be reported as a real finding.
             if (issue.severity() == AuditIssueSeverity.INFORMATION
                     || issue.confidence() == AuditIssueConfidence.TENTATIVE) {
-                scanLog.log("[AI Scanner]  ·  " + line);
+                scanLog.log(" ·  " + line);
                 return;
             }
             // Cross-channel dedup: if OUR probes (or another native issue) already reported this flaw-family at
             // this endpoint, don't double-count it under Burp's label (sqli-labs Less-11 was counted 3× — our
             // error-based + the LLM tier + this native HIGH). Shared claim with ScanLog.found().
             if (!scanLog.claimFinding(issue.name(), issue.baseUrl())) return;
-            scanLog.log("[AI Scanner] >>> " + line);            // real vuln → prominent + counted + in report
+            scanLog.log(">>> " + line);            // real vuln → prominent + counted + in report
             scanLog.incFinding();
         } catch (Throwable t) {
             // best-effort; never disrupt Burp's issue flow

@@ -65,7 +65,7 @@ public final class FileServePathProbe {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] file-serve probe error: " + t);
+            scanLog.debug("file-serve probe error: " + t);
         }
         return hits;
     }

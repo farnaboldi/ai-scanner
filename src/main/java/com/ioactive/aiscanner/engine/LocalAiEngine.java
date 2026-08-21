@@ -60,12 +60,12 @@ public final class LocalAiEngine extends PromptAiEngine {
         try {
             String r = chat("", "reply with the single word OK");
             if (r == null || r.isBlank()) {
-                logger.accept("[AI Scanner] LLM health check: empty reply (lastError=" + lastError() + ")");
+                logger.accept("LLM health check: empty reply (lastError=" + lastError() + ")");
                 return false;
             }
             return true;
         } catch (Throwable t) {
-            logger.accept("[AI Scanner] LLM health check FAILED: " + t);
+            logger.accept("LLM health check FAILED: " + t);
             return false;
         }
     }
@@ -102,7 +102,7 @@ public final class LocalAiEngine extends PromptAiEngine {
             if (LogLevel.trace()) {   // TRACE: dump the OUTGOING prompt body (deepest detail)
                 String u = (userPrompt == null ? "" : userPrompt).replaceAll("\\s+", " ").trim();
                 if (u.length() > 300) u = u.substring(0, 300) + "…";
-                logger.accept("[AI Scanner] LLM → " + u);
+                logger.accept("LLM → " + u);
             }
             long t0 = System.currentTimeMillis();
             String raw;
@@ -131,7 +131,7 @@ public final class LocalAiEngine extends PromptAiEngine {
             // Targeted per-call DEBUG (metadata only — NOT the request/response bodies, which are noise): seed +
             // sizes, so an empty/degenerate reply (the "round 2 parsed 0" mystery) is visible as resp=0 (transport
             // returned nothing) vs resp=NNN content=0 (a real reply we failed to parse). On with -Daiscanner.debug.
-            if (LogLevel.debug()) logger.accept("[AI Scanner] llm-call "
+            if (LogLevel.debug()) logger.accept("llm-call "
                     + (label == null || label.isBlank() ? "" : "<" + label + "> ") + "seed=" + seed
                     + " req=" + (userPrompt == null ? 0 : userPrompt.length()) + "ch"
                     + " -> resp=" + (raw == null ? 0 : raw.length()) + "ch content=" + content.length() + "ch"
@@ -139,14 +139,14 @@ public final class LocalAiEngine extends PromptAiEngine {
             if (LogLevel.trace()) {   // TRACE: dump the full response body (so a parse-to-0 reply can be read)
                 String c = content.replaceAll("\\s+", " ").trim();
                 if (c.length() > 800) c = c.substring(0, 800) + "…";
-                logger.accept("[AI Scanner] LLM ← " + c);
+                logger.accept("LLM ← " + c);
             }
             return content;
         } catch (Exception e) {
             setLastError(e.getClass().getSimpleName()
                     + (e.getMessage() == null ? "" : ": " + e.getMessage())
                     + "  (URL: " + cfg.chatCompletionsUrl() + ")");
-            logger.accept("[AI Scanner] LLM call failed: " + lastError());
+            logger.accept("LLM call failed: " + lastError());
             return "";
         }
     }

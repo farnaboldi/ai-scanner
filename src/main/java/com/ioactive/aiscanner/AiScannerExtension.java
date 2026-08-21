@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 629;
+    public static final int BUILD = 661;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -94,20 +94,20 @@ public class AiScannerExtension implements BurpExtension {
         // Surface the AI Scanner's OWN findings (probes + flow-engine + auth) as Burp AuditIssues so they
         // appear on the dashboard / site-map issues, not only in our log. Scope-gated to hosts we scan.
         scanLog.setIssueSink(this::raiseAiIssue);
-        scanLog.log("[AI Scanner] build " + BUILD + " loaded.");
+        scanLog.log("build " + BUILD + " loaded.");
 
         loadSettings();
         applyLaunchOverrides();          // -Daiscanner.baseUrl/-Daiscanner.model/-Daiscanner.apiKey (or AISCANNER_* env)
         // -Daiscanner.sourceRepo (or AISCANNER_SOURCE_REPO): a LOCAL repo path to drive SAST-assisted testing
         // for every autoscan target (the launcher clones a URL and passes a path). null → black-box only.
         launchSourceRepo = launchArg("aiscanner.sourceRepo", "AISCANNER_SOURCE_REPO");
-        if (launchSourceRepo != null) scanLog.log("[AI Scanner] source repo (launch): " + launchSourceRepo);
+        if (launchSourceRepo != null) scanLog.log("source repo (launch): " + launchSourceRepo);
         // Unified log level (INFO/DEBUG/TRACE) — the ONE knob for verbosity, selectable from Settings and the CLI
         // (-Daiscanner.logLevel / AISCANNER_LOG_LEVEL). CLI wins over the persisted setting; nothing else feeds it.
         String cli = launchArg("aiscanner.logLevel", "AISCANNER_LOG_LEVEL");
         if (cli != null && !cli.isBlank()) LogLevel.set(LogLevel.parse(cli));
         else if (logLevelSetting != null)  LogLevel.set(logLevelSetting);
-        scanLog.log("[AI Scanner] log level: " + LogLevel.current());
+        scanLog.log("log level: " + LogLevel.current());
 
         api.extension().setName(EXT_NAME);
         // Scanner-wide session self-preservation: neutralize any phase's state-changing request to OUR OWN account
@@ -123,7 +123,7 @@ public class AiScannerExtension implements BurpExtension {
         // wait. Wired before the headless guard so the stop-check is always live (the button lives in the UI).
         scanLog.setStopCheck(scanner::stopRequested);
         scanLog.setStopHandler(() -> {
-            scanLog.log("[AI Scanner] Stop requested by user — cancelling the current scan…");
+            scanLog.log("Stop requested by user — cancelling the current scan…");
             scanner.requestStop();
             for (Thread t : Thread.getAllStackTraces().keySet()) {
                 String n = t.getName();
@@ -258,7 +258,7 @@ public class AiScannerExtension implements BurpExtension {
             final boolean batch = targets.length > 1;
             String parFlag = launchArg("aiscanner.parallel", "AISCANNER_PARALLEL");
             final boolean parallel = batch && parFlag != null && !"false".equalsIgnoreCase(parFlag) && !"0".equals(parFlag);
-            scanLog.log("[AI Scanner] auto-scan requested for [" + String.join(",", targets) + "] — starting in ~5s…");
+            scanLog.log("auto-scan requested for [" + String.join(",", targets) + "] — starting in ~5s…");
             new Thread(() -> {
                 try { Thread.sleep(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
                 if (parallel) {
@@ -283,7 +283,7 @@ public class AiScannerExtension implements BurpExtension {
                     String url = normalizeTarget(targets[i]);
                     if (url == null) continue;
                     if (batch) {
-                        scanLog.log("[AI Scanner] ===== BATCH target " + (i + 1) + "/" + targets.length + ": " + url + " =====");
+                        scanLog.log("===== BATCH target " + (i + 1) + "/" + targets.length + ": " + url + " =====");
                         session.reset();          // no cookie/bearer/login bleed between different hosts
                         scanLog.clearFindings();  // each target's report holds only its own findings
                     }
@@ -296,13 +296,13 @@ public class AiScannerExtension implements BurpExtension {
                         session.set(seedCookie);
                         session.setLandingUrl(seedLanding != null && !seedLanding.isBlank() ? seedLanding : url);
                         seedCookieJar(seedCookie, url);
-                        scanLog.log("[AI Scanner] pre-seeded authenticated session from launch cookie — login skipped (names: "
+                        scanLog.log("pre-seeded authenticated session from launch cookie — login skipped (names: "
                                 + seedCookie.replaceAll("=[^;]*", "=…") + ")");
                     }
                     try { menuProvider.startScanAndWait(url); done++; }
-                    catch (Throwable t) { scanLog.log("[AI Scanner] target failed (" + url + "): " + t + " — continuing."); }
+                    catch (Throwable t) { scanLog.log("target failed (" + url + "): " + t + " — continuing."); }
                 }
-                if (batch) scanLog.log("[AI Scanner] ===== BATCH complete: " + done + "/" + targets.length + " target(s) scanned =====");
+                if (batch) scanLog.log("===== BATCH complete: " + done + "/" + targets.length + " target(s) scanned =====");
             }, "aiscanner-autoscan").start();
         }
     }
@@ -364,18 +364,18 @@ public class AiScannerExtension implements BurpExtension {
             pthreads.add(new Thread(() -> {
                 ScanLog.TARGET_TAG.set("[" + tag + "] ");   // every line this scan's thread-lineage emits is tagged
                 try { pmp.startScanAndWait(url); }
-                catch (Throwable ex) { plog.log("[AI Scanner] target failed (" + url + "): " + ex); }
+                catch (Throwable ex) { plog.log("target failed (" + url + "): " + ex); }
             }, "ais-par-" + tag));
         }
         for (Thread th : pthreads) th.start();
         if (!wantExit) {
             // Chat / fire-and-forget: threads run in the background; return immediately so Burp stays interactive.
-            scanLog.log("[AI Scanner] ===== launched " + pthreads.size() + " new scan(s) — total concurrent shown in the status bar =====");
+            scanLog.log("===== launched " + pthreads.size() + " new scan(s) — total concurrent shown in the status bar =====");
             return;
         }
         for (Thread th : pthreads) { try { th.join(); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; } }
-        scanLog.log("[AI Scanner] ===== PARALLEL complete: " + pthreads.size() + " target(s) scanned =====");
-        try { api.burpSuite().shutdown(); } catch (Throwable th) { scanLog.log("[AI Scanner] shutdown unavailable: " + th); }
+        scanLog.log("===== PARALLEL complete: " + pthreads.size() + " target(s) scanned =====");
+        try { api.burpSuite().shutdown(); } catch (Throwable th) { scanLog.log("shutdown unavailable: " + th); }
     }
 
     /** Add a scheme if the target is a bare host (dev/uat hosts are given without http(s)://). Defaults to https. */
@@ -418,7 +418,7 @@ public class AiScannerExtension implements BurpExtension {
         try {
             String host = java.net.URI.create(url).getHost();
             if (host == null || host.isBlank()) {
-                scanLog.log("[AI Scanner] [warn] cookie-seed: no host in " + url + " — Burp's native crawl will NOT be authenticated.");
+                scanLog.log("[warn] cookie-seed: no host in " + url + " — Burp's native crawl will NOT be authenticated.");
                 return;
             }
             int seeded = 0, attempted = 0;
@@ -429,15 +429,15 @@ public class AiScannerExtension implements BurpExtension {
                 if (n.isEmpty()) continue;
                 attempted++;
                 try { api.http().cookieJar().setCookie(n, v, "/", host, java.time.ZonedDateTime.now().plusDays(1)); seeded++; }
-                catch (Throwable e) { scanLog.debug("[AI Scanner] cookie-seed: setCookie failed for " + n + ": " + e); }
+                catch (Throwable e) { scanLog.debug("cookie-seed: setCookie failed for " + n + ": " + e); }
             }
             // A silent failure here would leave OUR probes authenticated (SessionStore) but Burp's native crawl NOT —
             // a partially-tested surface that masquerades as full auth. Surface it loudly instead of hiding it.
             if (seeded == 0 && attempted > 0)
-                scanLog.log("[AI Scanner] [warn] cookie-seed: 0/" + attempted + " cookies reached Burp's jar — the native "
+                scanLog.log("[warn] cookie-seed: 0/" + attempted + " cookies reached Burp's jar — the native "
                         + "crawl/audit will run UNAUTHENTICATED (our own probes are still authenticated via SessionStore).");
         } catch (Throwable e) {
-            scanLog.log("[AI Scanner] [warn] cookie-seed: jar seeding failed (" + e + ") — Burp's native crawl may be unauthenticated.");
+            scanLog.log("[warn] cookie-seed: jar seeding failed (" + e + ") — Burp's native crawl may be unauthenticated.");
         }
     }
 
@@ -484,9 +484,9 @@ public class AiScannerExtension implements BurpExtension {
                     : AuditIssue.auditIssue(name, detailHtml, remediationDetail, url, info.severity, AuditIssueConfidence.FIRM,
                             info.background, info.remediation, info.severity);
             api.siteMap().add(issue);
-            scanLog.debug("[AI Scanner] dashboard issue raised: " + name + " @ " + url);
+            scanLog.debug("dashboard issue raised: " + name + " @ " + url);
         } catch (Throwable t) {
-            scanLog.log("[AI Scanner] could not raise dashboard issue for " + vulnClass + " @ " + url + ": " + t);
+            scanLog.log("could not raise dashboard issue for " + vulnClass + " @ " + url + ": " + t);
         }
     }
 
@@ -534,7 +534,7 @@ public class AiScannerExtension implements BurpExtension {
                 think != null ? Boolean.parseBoolean(think) : c.disableThinking,
                 c.timeoutSeconds);
         this.engine = engineFor(engineConfig);
-        scanLog.log("[AI Scanner] launch override → provider=" + engineConfig.provider
+        scanLog.log("launch override → provider=" + engineConfig.provider
                 + (engineConfig.provider == EngineConfig.Provider.LOCAL_LLM ? ", baseUrl=" + engineConfig.baseUrl : "")
                 + (model != null ? ", model=" + model : "")
                 + (key != null ? ", apiKey=***" : "")

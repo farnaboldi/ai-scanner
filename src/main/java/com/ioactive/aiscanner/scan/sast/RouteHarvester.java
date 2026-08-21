@@ -177,10 +177,50 @@ public final class RouteHarvester {
             String sub = resolveAspNetTokens(hm.group(2), ctrl);            // null-safe (bare [HttpGet] → "")
             String path = normPath(joinAspNet(prefix, sub));
             if (path.isBlank()) continue;
-            List<String> params = pathParams(path);
+            // Params = path tokens ({id}) PLUS the action method's signature parameters (e.g. Search(string keyword)
+            // → keyword). The signature params are the QUERY/BODY inputs a probe must fuzz — without them a GET route
+            // with no path token (…/products/search) is harvested with ZERO params and its keyword-based SQLi is
+            // never reached. Deterministic, steering-only; discovery live-probes and the oracles decide.
+            List<String> params = new ArrayList<>(pathParams(path));
+            for (String mp : aspNetMethodParams(code, hm.end())) if (!params.contains(mp)) params.add(mp);
             out.add(new StaticHint(method, path, params, params.isEmpty() ? "" : params.get(0), "", "route", prov, 0.5, ""));
         }
         return out;
+    }
+
+    // C# action parameter types that are framework/DI plumbing, not user input — excluded from the fuzzable param set.
+    private static final Pattern ASPNET_SKIP_PARAM_TYPE = Pattern.compile(
+            "(?i)^(cancellationtoken|httpcontext|httprequest|httpresponse|iformcollection|claimsprincipal|"
+          + "ilogger|iloggerfactory|iconfiguration|iserviceprovider|imediator)$");
+
+    /** Extract the action METHOD's declared parameters (query/body inputs) from the C# signature that follows a
+     *  {@code [Http*]} attribute at {@code from}. The signature is the {@code (...)} immediately before the method
+     *  body {@code {}; each comma segment's LAST identifier is the param name (attributes/defaults/types stripped).
+     *  Framework/DI-typed params are dropped. Best-effort + regex-bounded — a miss costs coverage, never soundness. */
+    static List<String> aspNetMethodParams(String code, int from) {
+        List<String> names = new ArrayList<>();
+        try {
+            int brace = code.indexOf('{', from);
+            int end = brace < 0 ? Math.min(code.length(), from + 600) : Math.min(brace, from + 600);
+            if (end <= from) return names;
+            String window = code.substring(from, end);
+            int close = window.lastIndexOf(')');
+            int open = close < 0 ? -1 : window.lastIndexOf('(', close);
+            if (open < 0 || open >= close) return names;
+            String sig = window.substring(open + 1, close);
+            for (String part : sig.split(",")) {
+                String seg = part.replaceAll("\\[[^\\]]*\\]", " ").trim();      // strip [FromQuery]/[FromBody]/…
+                int eq = seg.indexOf('='); if (eq >= 0) seg = seg.substring(0, eq).trim();   // strip default value
+                Matcher idm = Pattern.compile("(\\w+)\\s*$").matcher(seg);
+                if (!idm.find()) continue;
+                String name = idm.group(1);
+                String type = seg.substring(0, seg.length() - name.length()).trim();
+                type = type.replaceAll("[?<>\\[\\],].*$", "").trim();           // Type<...>/Type[]/Type? → base token
+                if (type.isEmpty() || ASPNET_SKIP_PARAM_TYPE.matcher(type).find()) continue;   // no bare word / DI plumbing
+                if (!name.isEmpty() && !names.contains(name)) names.add(name);
+            }
+        } catch (Throwable ignore) { }
+        return names;
     }
 
     private static String resolveAspNetTokens(String s, String ctrl) {

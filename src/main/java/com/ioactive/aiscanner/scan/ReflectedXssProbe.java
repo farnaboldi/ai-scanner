@@ -56,7 +56,7 @@ public final class ReflectedXssProbe {
             }
             return any;
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] reflected-XSS probe error: " + t);
+            scanLog.debug("reflected-XSS probe error: " + t);
             return false;
         }
     }
@@ -69,9 +69,9 @@ public final class ReflectedXssProbe {
             int st = rr0 != null && rr0.response() != null ? rr0.response().statusCode() : -1;
             // GENERIC: a 3xx here means the (authenticated) request bounced — usually to login → session not accepted.
             if (st >= 300 && st < 400)
-                scanLog.debug("[AI Scanner]   rxss " + label + ": HTTP " + st + " redirect → "
+                scanLog.debug("  rxss " + label + ": HTTP " + st + " redirect → "
                         + rr0.response().headerValue("Location") + " (session not accepted for this request?)");
-            else scanLog.trace("[AI Scanner]   rxss " + label + ": response not HTML (HTTP " + st + ")");
+            else scanLog.trace("  rxss " + label + ": response not HTML (HTTP " + st + ")");
             return false;
         }
         String body0 = rr0.response().bodyToString();
@@ -80,8 +80,8 @@ public final class ReflectedXssProbe {
             // GENERIC: reflected nowhere. If it looks like a login page, the session was lost for this request.
             String lb = body0.toLowerCase();
             if (lb.contains("password") && (lb.contains("login") || lb.contains("sign in")))
-                scanLog.debug("[AI Scanner]   rxss " + label + ": canary NOT reflected — LOGIN page (session lost for this request?)");
-            else scanLog.trace("[AI Scanner]   rxss " + label + ": canary not reflected");
+                scanLog.debug("  rxss " + label + ": canary NOT reflected — LOGIN page (session lost for this request?)");
+            else scanLog.trace("  rxss " + label + ": canary not reflected");
             return false;
         }
 
@@ -89,7 +89,7 @@ public final class ReflectedXssProbe {
         boolean inComment = inComment(body0, at);
         boolean inScript  = inScript(body0, at);
         boolean inTag     = inTag(body0, at);
-        scanLog.debug("[AI Scanner]   rxss " + label + ": canary REFLECTED (context: "
+        scanLog.debug("  rxss " + label + ": canary REFLECTED (context: "
                 + (inComment ? "comment" : inScript ? "script" : inTag ? "tag/attr" : "html") + ") — attempting breakout");
 
         // 3) build context-appropriate breakout payloads (ordered: the most specific first). Each carries a
@@ -106,7 +106,7 @@ public final class ReflectedXssProbe {
             HttpRequestResponse rr = send(build.apply(pl));
             boolean present = rr != null && rr.response() != null && rr.response().bodyToString().contains(tag);
             boolean exec = executes(rr, tag);
-            scanLog.debug("[AI Scanner]   rxss " + label + ": payload " + pl + " → tagPresent=" + present + " executes=" + exec);
+            scanLog.debug("  rxss " + label + ": payload " + pl + " → tagPresent=" + present + " executes=" + exec);
             if (!exec) continue;
             HttpRequestResponse rr2 = send(build.apply(pl));                  // re-confirm (zero-FP)
             if (!executes(rr2, tag)) continue;
@@ -203,7 +203,7 @@ public final class ReflectedXssProbe {
                 if (dbg) {
                     String setc = String.join(" | ", rr.response().headers().stream()
                             .filter(h -> h.name().equalsIgnoreCase("Set-Cookie")).map(h -> h.value()).toList());
-                    scanLog.debug("[AI Scanner]   rxss " + req.method() + " " + stripQ(req.url()) + " → HTTP " + st
+                    scanLog.debug("  rxss " + req.method() + " " + stripQ(req.url()) + " → HTTP " + st
                             + " Location: " + loc + " | sent-Cookie=" + trunc(req.headerValue("Cookie"))
                             + (setc.isBlank() ? "" : " | Set-Cookie=" + trunc(setc)));
                 }
@@ -215,14 +215,14 @@ public final class ReflectedXssProbe {
                         if (cookie != null) walk = walk.withHeader("Cookie", cookie);
                         HttpRequestResponse wr = api.http().sendRequest(walk, RequestOptions.requestOptions().withResponseTimeout(12000L));
                         if (dbg && wr != null && wr.response() != null)
-                            scanLog.debug("[AI Scanner]   rxss walk GET " + abs + " → HTTP " + wr.response().statusCode()
+                            scanLog.debug("  rxss walk GET " + abs + " → HTTP " + wr.response().statusCode()
                                     + (wr.response().statusCode() >= 300 && wr.response().statusCode() < 400 ? " Location: " + wr.response().headerValue("Location") : ""));
                     } catch (Exception ignore) { }
                     syncJar(req);   // the interstitial walk-GET may have re-polluted the jar — realign before re-send
                     rr = AiScanner.decompress(
                             api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
                     if (dbg && rr != null && rr.response() != null)
-                        scanLog.debug("[AI Scanner]   rxss re-POST → HTTP " + rr.response().statusCode());
+                        scanLog.debug("  rxss re-POST → HTTP " + rr.response().statusCode());
                 }
             }
             return rr;

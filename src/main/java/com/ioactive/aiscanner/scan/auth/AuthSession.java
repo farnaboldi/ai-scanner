@@ -165,7 +165,8 @@ public final class AuthSession {
     private void mergeCookies(HttpRequestResponse rr) {
         try {
             for (Cookie c : rr.response().cookies()) {
-                if (c.name() != null && !c.name().isBlank()) jar.put(c.name(), c.value() == null ? "" : c.value());
+                if (c.name() != null && !c.name().isBlank())
+                    jar.put(c.name(), c.value() == null ? "" : c.value());
             }
         } catch (Throwable ignore) {
         }

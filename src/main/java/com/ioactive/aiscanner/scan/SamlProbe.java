@@ -90,10 +90,10 @@ public final class SamlProbe {
     public int probe(String host, UnaryOperator<HttpRequest> withSession) {
         Surface s = discover(host);
         if (s.isEmpty()) {
-            scanLog.log("[AI Scanner] SAML probe: no SAML surface found (no metadata / SAMLRequest / SAMLResponse / saml path in scope).");
+            scanLog.log("SAML probe: no SAML surface found (no metadata / SAMLRequest / SAMLResponse / saml path in scope).");
             return 0;
         }
-        scanLog.log("[AI Scanner] SAML probe: surface — metadata=" + yn(s.metadataRr != null)
+        scanLog.log("SAML probe: surface — metadata=" + yn(s.metadataRr != null)
                 + " ACS=" + (s.acsUrl != null ? s.acsUrl : "(none)")
                 + " SP-init=" + (s.ssoUrl != null ? s.ssoUrl : "(none)")
                 + " SLO=" + (s.logoutUrl != null ? s.logoutUrl : "(none)")
@@ -102,13 +102,13 @@ public final class SamlProbe {
         int hits = 0;
         // 0) Self-signed test/library certificate — root-cause HIGH finding; gates or contextualises the rest.
         try { if (s.metadataRr != null && checkPublicTestCert(s)) hits++; }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   saml public-test-cert check error: " + t); }
+        catch (Throwable t) { scanLog.debug("  saml public-test-cert check error: " + t); }
         // 1) unsigned/forged assertion acceptance (auth bypass) — the AUTHORITATIVE test of whether the SP actually
         //    trusts an unsigned assertion. Run it FIRST so its verdict can gate the metadata WantAssertionsSigned
         //    claim below (avoid the classic FP: metadata says signing not required, but the SP still enforces
         //    response-level signing and rejects the forgery).
         Unsigned unsigned = Unsigned.UNTESTED;
-        try { if (s.acsUrl != null) unsigned = checkUnsignedAssertion(s, withSession); } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml unsigned-assertion check error: " + t); }
+        try { if (s.acsUrl != null) unsigned = checkUnsignedAssertion(s, withSession); } catch (Throwable t) { scanLog.debug("  saml unsigned-assertion check error: " + t); }
         if (unsigned == Unsigned.ACCEPTED) hits++;
         // 2) metadata hardening — deterministic reads of the fetched metadata; the assertion-signing note is gated
         //    on the active verdict from (1) so we never overclaim forgeability the SP actually rejects.
@@ -119,11 +119,11 @@ public final class SamlProbe {
         // SamlProbe only logs the observation here — no independent filing — to avoid racing with VerboseErrorProbe
         // for the firstForHost slot and producing a finding backed by the weaker SAML evidence instead of the
         // richer REST evidence (DB schema / source paths) that VerboseErrorProbe surfaces.
-        try { samlStackTraceExercise(s, withSession); } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml stack-trace exercise error: " + t); }
+        try { samlStackTraceExercise(s, withSession); } catch (Throwable t) { scanLog.debug("  saml stack-trace exercise error: " + t); }
         // 4) XXE at the ACS, out-of-band via Burp Collaborator (same mechanism as SsrfProbe/XxeProbe).
-        try { if (s.acsUrl != null && acsXxeOob(s, withSession)) hits++; } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml xxe check error: " + t); }
+        try { if (s.acsUrl != null && acsXxeOob(s, withSession)) hits++; } catch (Throwable t) { scanLog.debug("  saml xxe check error: " + t); }
         // 5) RelayState/ReturnUrl open redirect on the SP-initiated endpoint (reuses the "Open redirect" class).
-        try { if (s.ssoUrl != null && relayStateOpenRedirect(s, withSession)) hits++; } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml open-redirect check error: " + t); }
+        try { if (s.ssoUrl != null && relayStateOpenRedirect(s, withSession)) hits++; } catch (Throwable t) { scanLog.debug("  saml open-redirect check error: " + t); }
         return hits;
     }
 
@@ -198,7 +198,7 @@ public final class SamlProbe {
                 // (d) any in-scope URL whose PATH contains a `saml` segment → candidate endpoint; classify below.
                 if (SAML_PATH_SEG.matcher(pathOf(url)).find()) samlPaths.add(Net.stripQuery(url));
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner]   saml discovery error: " + t); }
+        } catch (Throwable t) { scanLog.debug("  saml discovery error: " + t); }
 
         // Classify remaining `saml`-path candidates by FETCHING them (generic, no path hardcoding): a metadata
         // body fills the metadata slot; a SAMLRequest redirect fills the SP-init slot. This recovers the surface
@@ -370,7 +370,7 @@ public final class SamlProbe {
             HttpRequest req = reqs.get(i);
             HttpRequestResponse rr = send(withSession != null ? withSession.apply(req) : req);
             if (StackTraceOracle.hasStackTrace(rr))
-                scanLog.debug("[AI Scanner]   saml stack-trace observed @ " + urls.get(i)
+                scanLog.debug("  saml stack-trace observed @ " + urls.get(i)
                         + " — VerboseErrorProbe will file the host-wide finding.");
         }
     }
@@ -383,7 +383,7 @@ public final class SamlProbe {
     private boolean acsXxeOob(Surface s, UnaryOperator<HttpRequest> withSession) {
         CollaboratorClient collab;
         try { collab = api.collaborator().createClient(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   saml xxe: Collaborator unavailable — OOB XXE skipped"); return false; }
+        catch (Throwable t) { scanLog.debug("  saml xxe: Collaborator unavailable — OOB XXE skipped"); return false; }
 
         String tag = "sxxe" + seq();
         CollaboratorPayload cp;
@@ -418,7 +418,7 @@ public final class SamlProbe {
                 }
             }
         } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-        catch (Throwable t) { scanLog.debug("[AI Scanner]   saml xxe poll error: " + t); }
+        catch (Throwable t) { scanLog.debug("  saml xxe poll error: " + t); }
         return false;
     }
 

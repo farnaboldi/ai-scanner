@@ -49,10 +49,10 @@ public final class MassAssignProbe {
             if (login == null && LOGIN.matcher(q.path()).find()) login = q;
         }
         if (reg == null || login == null) {
-            scanLog.debug("[AI Scanner]   mass-assign: no JSON register/login pair observed — skipped");
+            scanLog.debug("  mass-assign: no JSON register/login pair observed — skipped");
             return 0;
         }
-        scanLog.debug("[AI Scanner]   mass-assign: reg=" + reg.url() + " login=" + login.url());
+        scanLog.debug("  mass-assign: reg=" + reg.url() + " login=" + login.url());
 
         int n = Math.abs((host + reg.path()).hashCode() % 9000);
         String mUser = "aiscma" + n, nUser = "aiscmn" + n, sacA = "aiscsa" + n, sacB = "aiscsb" + n, pw = "AiscMa!" + n;
@@ -61,19 +61,19 @@ public final class MassAssignProbe {
         int nReg = status(register(reg, nUser, pw, false));
         status(register(reg, sacA, pw, false));
         status(register(reg, sacB, pw, false));
-        scanLog.debug("[AI Scanner]   mass-assign: register M(" + mUser + ")->HTTP " + mReg + ", N->HTTP " + nReg);
+        scanLog.debug("  mass-assign: register M(" + mUser + ")->HTTP " + mReg + ", N->HTTP " + nReg);
         if (mReg < 0 || mReg >= 400) return 0;                                   // registration rejected → can't test
         // 2. log BOTH M and the normal control N in (using their OWN tokens ⇒ a clean same-role-minus-priv diff).
         String tokenM = login(login, mUser, pw);
         String tokenN = login(login, nUser, pw);
-        scanLog.debug("[AI Scanner]   mass-assign: tokens M=" + (tokenM != null) + " N=" + (tokenN != null));
+        scanLog.debug("  mass-assign: tokens M=" + (tokenM != null) + " N=" + (tokenN != null));
         if (tokenM == null || tokenN == null) return 0;
 
         // 3. privilege differential on an admin-tier DELETE (derived user-collection + {id}): N denied, M allowed.
         String collRoot = reg.url().substring(0, reg.url().lastIndexOf('/'));   // …/register → …/users/v1
         int ns = status(send(HttpRequest.httpRequestFromUrl(collRoot + "/" + sacA).withMethod("DELETE"), null, null, tokenN));
         int ms = status(send(HttpRequest.httpRequestFromUrl(collRoot + "/" + sacB).withMethod("DELETE"), null, null, tokenM));
-        scanLog.debug("[AI Scanner]   mass-assign: DELETE differential — N->HTTP " + ns + ", M->HTTP " + ms + " @ " + collRoot + "/{user}");
+        scanLog.debug("  mass-assign: DELETE differential — N->HTTP " + ns + ", M->HTTP " + ms + " @ " + collRoot + "/{user}");
         if (ns >= 200 && ns < 300) return 0;                                     // normal N could ALSO do it ⇒ not a priv escalation (open/BFLA, not mass-assign)
         if (ms >= 200 && ms < 300) {
             HttpRequestResponse ev = send(HttpRequest.httpRequestFromUrl(collRoot + "/" + sacA).withMethod("DELETE"), null, null, tokenM);

@@ -10,7 +10,35 @@ public final class SessionStore {
 
     public boolean has() { return !cookieHeader.isBlank(); }
     public String cookieHeader() { return cookieHeader; }
-    public void set(String c) { this.cookieHeader = c == null ? "" : c.trim(); }
+    public void set(String c) {
+        String incoming = c == null ? "" : c.trim();
+        // DON'T DOWNGRADE a real session: if we already hold a genuine session cookie (a NON-CSRF cookie, e.g.
+        // sessionid) and the incoming value has none (a later/weaker auth pass that only re-grabbed csrftoken),
+        // keep the good one. A successful form-login captured sessionid; a subsequent pass must not clobber it back
+        // to csrftoken-only, which would silently de-authenticate the whole scan.
+        boolean downgrade = !incoming.isEmpty() && hasRealSessionCookie(this.cookieHeader) && !hasRealSessionCookie(incoming);
+        if (downgrade) return;
+        this.cookieHeader = incoming;
+        // Propagate the captured session to Burp's cookie jar too, so the NATIVE crawler + active audit send it —
+        // not only our own withSessionCookie() requests. Without this, auth-gated pages come back as empty 302s to
+        // the native crawl (labs behind login never get discovered) and POSTs 403 (missing session/CSRF cookie).
+        if (!cookieHeader.isEmpty() && onCookieUpdate != null) {
+            try { onCookieUpdate.accept(cookieHeader); } catch (Throwable ignore) { }
+        }
+    }
+    /** True when the header carries a cookie that ISN'T a CSRF/anti-forgery token — i.e. a genuine session cookie. */
+    private static boolean hasRealSessionCookie(String header) {
+        if (header == null) return false;
+        for (String kv : header.split(";")) {
+            int eq = kv.indexOf('=');
+            String name = (eq > 0 ? kv.substring(0, eq) : kv).trim();
+            if (!name.isEmpty() && !com.ioactive.aiscanner.scan.AuthenticatedExplorer.isCsrfParam(name)) return true;
+        }
+        return false;
+    }
+    /** Sink invoked whenever the cookie session is (re)captured — wired to push the cookies into Burp's cookie jar. */
+    private volatile java.util.function.Consumer<String> onCookieUpdate;
+    public void setOnCookieUpdate(java.util.function.Consumer<String> s) { this.onCookieUpdate = s; }
 
     // Bearer/JWT captured from a token-based (SPA/API) login → attached as Authorization on attacks.
     private volatile String bearer = "";
@@ -29,6 +57,10 @@ public final class SessionStore {
 
     /** Authenticated by either mechanism (cookie session or bearer token). */
     public boolean authenticated() { return has() || hasBearer(); }
+
+    /** True when we hold a GENUINE authenticated session — a bearer, OR a cookie that isn't merely a CSRF token.
+     *  {@link #has()} is true even for a csrftoken-only "session" (set on unauth GETs), which isn't real auth. */
+    public boolean hasRealSession() { return hasBearer() || hasRealSessionCookie(this.cookieHeader); }
 
     // ---- SECOND identity B (a distinct registered user) — enables TRUE cross-user access-control differentials
     // (BOLA/BFLA/mass-assignment/GraphQL-authz): "A reads/writes B's exact object" instead of a single-session

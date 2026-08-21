@@ -135,16 +135,31 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             authB.apiRegisterThenLogin(scanner.discoverAuthRequests(host));   // bearer-first (no cookie-jar clobber)
             if (!sessionB.authenticated()) authB.registerThenLogin();          // form fallback
             if (sessionB.authenticated()) {
-                session.setSecondary(sessionB);
-                if (session.hasSecondIdentity())
-                    scanLog.log("[AI Scanner] second identity B registered — TRUE cross-user access-control differential enabled.");
-                else
-                    scanLog.debug("[AI Scanner] second registration yielded the same identity as A — no distinct B.");
+                // ROUTING FIX: B is captured in its OWN fresh SessionStore. If the PRIMARY session never got a
+                // genuine session (e.g. its login wedged by a stale bootstrap csrftoken) but B's fresh login DID,
+                // PROMOTE B to primary — otherwise the working session is orphaned and the crawl + audit keep using
+                // the csrftoken-only primary (labs behind login stay undiscovered, POSTs 403). session.set() here
+                // also pushes the session into Burp's cookie jar (native crawl/audit) via the wired sink.
+                if (!session.hasRealSession() && sessionB.hasRealSession()) {
+                    if (sessionB.has()) session.set(sessionB.cookieHeader());
+                    if (sessionB.hasBearer()) session.setBearer(sessionB.bearer());
+                    if (sessionB.hasSigningKey()) session.setSigningKey(sessionB.signingKey());
+                    if (!sessionB.landingUrl().isBlank()) session.setLandingUrl(sessionB.landingUrl());
+                    if (!sessionB.ownIdentity().isBlank()) session.setOwnIdentity(sessionB.ownIdentity());
+                    scanLog.log("primary session was not genuinely authenticated — promoted the working registration "
+                            + "to primary (crawl + audit now run authenticated).");
+                } else {
+                    session.setSecondary(sessionB);
+                    if (session.hasSecondIdentity())
+                        scanLog.log("second identity B registered — TRUE cross-user access-control differential enabled.");
+                    else
+                        scanLog.debug("second registration yielded the same identity as A — no distinct B.");
+                }
             } else {
-                scanLog.debug("[AI Scanner] no second identity (app has no reachable self-registration) — single-session authz probes.");
+                scanLog.debug("no second identity (app has no reachable self-registration) — single-session authz probes.");
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] second-identity minting skipped: " + t);
+            scanLog.debug("second-identity minting skipped: " + t);
         }
     }
 
@@ -190,7 +205,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         if (!pass.isBlank()) System.setProperty("aiscanner.loginPassword", pass);
         if (pw != null) java.util.Arrays.fill(pw, '\0');   // scrub the password char[] (String copy is unavoidable for the prop)
         if (gotUser || !pass.isBlank())
-            scanLog.log("[AI Scanner] operator credentials set for this session — authenticated scanning enabled for " + h + ".");
+            scanLog.log("operator credentials set for this session — authenticated scanning enabled for " + h + ".");
     }
 
     private List<HttpRequestResponse> collectSelected(ContextMenuEvent event) {
@@ -239,9 +254,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 }
             } catch (Exception ignore) { /* fall back to the raw seed */ }
             api.scope().includeInScope(scope);
-            scanLog.log("[AI Scanner] scope restricted to target host " + scope + " — other hosts are not scanned");
+            scanLog.log("scope restricted to target host " + scope + " — other hosts are not scanned");
         } catch (Exception e) {
-            api.logging().logToError("[AI Scanner] includeInScope failed: " + e);
+            scanLog.log("includeInScope failed: " + e);
         }
     }
 
@@ -278,7 +293,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     private void detectRequestSigning(String host) {
         try {
             var eng = scanner.engine();
-            if (eng == null || !eng.isConfigured()) { scanLog.debug("[AI Scanner]   signing: no engine configured — skip"); return; }
+            if (eng == null || !eng.isConfigured()) { scanLog.debug("  signing: no engine configured — skip"); return; }
 
             // 1) Collect the endpoints that rejected us for a MISSING/INVALID signature (not just 401). Keep the
             // "missing signature" ones separate from "invalid signature": a MISSING-signature 403 flips cleanly to
@@ -300,10 +315,10 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             }
             int gateHits = missing.size() + invalid.size();
             if (gateHits == 0) {
-                scanLog.debug("[AI Scanner]   signing: no request-signature gate observed on " + host + " — skip");
+                scanLog.debug("  signing: no request-signature gate observed on " + host + " — skip");
                 return;
             }
-            scanLog.log("[AI Scanner] signing gate DETECTED on " + host + " (" + gateHits + " endpoint(s): "
+            scanLog.log("signing gate DETECTED on " + host + " (" + gateHits + " endpoint(s): "
                     + missing.size() + " missing-sig, " + invalid.size() + " invalid-sig); e.g. " + gateSample);
 
             // 1b) If we captured a signing key at auth, reproduce the signature and PROVE it unlocks the gate.
@@ -327,7 +342,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                         }
                     }
                     if (alreadyUnlocked > 0)
-                        scanLog.log("[AI Scanner] signing: ✅ " + alreadyUnlocked + " signed API endpoint(s) already returned 2xx "
+                        scanLog.log("signing: ✅ " + alreadyUnlocked + " signed API endpoint(s) already returned 2xx "
                                 + "during explore (e.g. " + unlockedSample + ") — signature scheme is working.");
 
                     java.util.List<String> ordered = new java.util.ArrayList<>(missing);
@@ -351,20 +366,20 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                             try { api.siteMap().add(signed); } catch (Exception ignore) { }
                             if (ss >= 200 && ss < 300 && ss != su) { unlocked = true; winUrl = u; break; }
                         }
-                        scanLog.log("[AI Scanner] signing PROOF on " + winUrl + ": unsigned=HTTP " + su
+                        scanLog.log("signing PROOF on " + winUrl + ": unsigned=HTTP " + su
                                 + " → signed=HTTP " + ss + (unlocked ? "  ✅ SIGNATURE ACCEPTED" : "  (still gated)"));
                         if (unlocked) { unlockedCount++; if (firstWin == null) firstWin = winUrl; }
                     }
                     if (unlockedCount > 0 || alreadyUnlocked > 0)
-                        scanLog.log("[AI Scanner] signing: ✅ signature reproduced — " + (unlockedCount + alreadyUnlocked)
+                        scanLog.log("signing: ✅ signature reproduced — " + (unlockedCount + alreadyUnlocked)
                                 + " endpoint(s) unlocked total. Authenticated probes now sign automatically.");
                     else
-                        scanLog.log("[AI Scanner] signing: signature computed and accepted for evaluation (403→\"invalid\", not \"missing\") "
+                        scanLog.log("signing: signature computed and accepted for evaluation (403→\"invalid\", not \"missing\") "
                                 + "but no tested endpoint flipped to 2xx — likely non-canonical paths or a per-service key.");
-                } catch (Throwable t) { scanLog.debug("[AI Scanner]   signing proof error: " + t); }
+                } catch (Throwable t) { scanLog.debug("  signing proof error: " + t); }
                 return;   // we already have the key + verified it — no need to reverse-engineer it from JS
             }
-            scanLog.log("[AI Scanner] signing: no signing key captured at auth — attempting to locate it in JS…");
+            scanLog.log("signing: no signing key captured at auth — attempting to locate it in JS…");
 
             // 2) Feed the same-host JS to the model to locate the signer. A production SPA bundle is 100s of KB
             // of minified webpack — head-truncating it feeds the model boilerplate, not the signing code. So we
@@ -389,27 +404,30 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 }
                 if (anyHere) bundles++;
             }
-            scanLog.log("[AI Scanner] signing: feeding " + windows + " anchored window(s) from " + bundles
+            scanLog.log("signing: feeding " + windows + " anchored window(s) from " + bundles
                     + " bundle(s) (" + js.length() + " chars) to the model…");
-            if (js.length() == 0) { scanLog.log("[AI Scanner] signing: no signing indicators in same-host JS — cannot locate signer"); return; }
+            if (js.length() == 0) { scanLog.log("signing: no signing indicators in same-host JS — cannot locate signer"); return; }
 
             String recipe = eng.locateSigningFunction(js.toString());
             if (recipe == null || recipe.isBlank()) {
-                scanLog.log("[AI Scanner] signing: model returned nothing (lastError=" + eng.lastError() + ")");
+                scanLog.log("signing: model returned nothing (lastError=" + eng.lastError() + ")");
                 return;
             }
             if (recipe.matches("(?is).*\"found\"\\s*:\\s*false.*")) {
-                scanLog.log("[AI Scanner] signing: model found no signing function in the bundles. raw=" + trunc(recipe, 300));
+                scanLog.log("signing: model found no signing function in the bundles. raw=" + trunc(recipe, 300));
                 return;
             }
-            scanLog.log("[AI Scanner] signing scheme LOCATED:\n" + recipe);
+            scanLog.log("signing scheme LOCATED:\n" + recipe);
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner]   signing: detection error: " + t);
+            scanLog.debug("  signing: detection error: " + t);
         }
     }
 
-    private static final int SEED_MAX_PAGES = 25;   // hard cap on self-crawl breadth (BApp large-project rule)
-    private static final int SEED_MAX_DEPTH = 2;
+    // Self-crawl breadth/depth caps now live in Tuning (crawlPages/crawlDepth) — configurable at scan time via
+    // -Daiscanner.crawlPages / AISCANNER_CRAWL_PAGES (and crawlDepth) or the Settings tab, read inside seedSiteMap().
+    // A too-small breadth starves deep pages: a training/OWASP app links ~18 form-less category hubs at depth 1
+    // (pygoat: /sql,/cmd,/injection…) and BFS spends the whole budget there BEFORE dequeuing the depth-2 lab pages
+    // (/cmd_lab, /sql_lab…) that hold the injectable forms — which is exactly why the default was raised 25→60.
     // <a>/<area>/<form> navigational targets to follow…
     private static final java.util.regex.Pattern SEED_HREF = java.util.regex.Pattern.compile(
             "(?is)<(?:a|area|form)\\b[^>]*\\b(?:href|action)\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
@@ -420,10 +438,31 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     private static final java.util.regex.Pattern SEED_ASSET = java.util.regex.Pattern.compile(
             "(?i)\\.(?:js|css|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|pdf|zip|mp[34]|webp)(?:$|\\?)");
 
+    /** Push a captured "name=value; …" Cookie header into Burp's cookie jar for {@code host} so the NATIVE crawler
+     *  and active audit send the authenticated session too (our own requests already attach it via withSessionCookie).
+     *  The cookie jar's domain is the bare host (cookies aren't port-scoped), so strip any :port. Idempotent — Burp
+     *  overwrites a cookie of the same name; re-invoked on every session (re)capture so a refreshed cookie propagates. */
+    private void pushSessionToCookieJar(String cookieHeader, String host) {
+        if (cookieHeader == null || cookieHeader.isBlank() || host == null || host.isBlank()) return;
+        String h = host.contains(":") ? host.substring(0, host.indexOf(':')) : host;
+        int n = 0;
+        for (String kv : cookieHeader.split(";")) {
+            int eq = kv.indexOf('=');
+            if (eq <= 0) continue;
+            String name = kv.substring(0, eq).trim(), val = kv.substring(eq + 1).trim();
+            if (name.isEmpty()) continue;
+            try { api.http().cookieJar().setCookie(name, val, "/", h, java.time.ZonedDateTime.now().plusDays(1)); n++; }
+            catch (Throwable ignore) { }
+        }
+        if (n > 0) scanLog.debug("session → Burp cookie jar: " + n + " cookie(s) for " + h
+                + " — native crawl + active audit now authenticated.");
+    }
+
     /**
      * Prime the site map when nothing else has — Burp Community has no native crawler, and some SPAs crawl to 0
      * requests. Fetches the seed page (following redirects), then does a BOUNDED same-host link crawl (BFS,
-     * depth ≤ {@value #SEED_MAX_DEPTH}, ≤ {@value #SEED_MAX_PAGES} pages) over its {@code <a>/<form>} targets so a
+     * depth ≤ Tuning.crawlDepth(), ≤ Tuning.crawlPages() pages — both configurable) over its {@code <a>/<form>}
+     * targets so a
      * classic multi-page app's login/search/account pages reach the site map — where the form/param probes and
      * auth discovery see them. An SPA needs no links (its API lives in the JS gatherSources() fetches); an MPA
      * needs exactly this. GET-only; logout/state-changing paths and static assets are skipped. No-op when a
@@ -431,6 +470,8 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
      */
     private void seedSiteMap(String seed, String host, boolean authed) {
         try {
+            final int maxPages = com.ioactive.aiscanner.scan.Tuning.crawlPages();   // configurable reach caps
+            final int maxDepth = com.ioactive.aiscanner.scan.Tuning.crawlDepth();
             // Pre-auth: skip if a same-host HTML page already exists (Pro after a real crawl → don't disturb it).
             // Authed pass: ALWAYS crawl — the logged-in nav (/bank/*, account, transfer…) only appears with the
             // session attached, and those pages differ from their public/redirected pre-auth versions.
@@ -443,15 +484,19 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     if (u.endsWith("/") || u.endsWith(".html") || u.endsWith(".htm") || "HTML".equals(ct)) return;
                 }
             }
-            // Authed pass starts from the post-login landing page (where the app dropped us) — that's the hub the
-            // authenticated navigation hangs off; fall back to the seed if none was captured.
-            String start = authed && session != null && !session.landingUrl().isBlank() ? session.landingUrl() : seed;
             java.util.Set<String> seen = new java.util.LinkedHashSet<>();
             java.util.Deque<String[]> queue = new java.util.ArrayDeque<>();   // {url, depth}
-            queue.add(new String[]{ start, "0" });
-            seen.add(canonSeedUrl(start));
+            // Seed the BFS from the login LANDING page AND the app ROOT. The landing is where the app dropped us, but
+            // the ROOT/dashboard is where the primary nav (→ category hubs → deep lab/vuln pages) hangs off. A login
+            // that lands us in a sub-area (e.g. pygoat's /auth_lab) would otherwise strand the crawl there and never
+            // traverse dashboard → /cmd → /cmd_lab. Both enqueued at depth 0, deduped; BFS covers both neighborhoods.
+            java.util.List<String> starts = new java.util.ArrayList<>();
+            if (authed && session != null && !session.landingUrl().isBlank()) starts.add(session.landingUrl());
+            starts.add(seed);
+            for (String st : starts)
+                if (st != null && !st.isBlank() && seen.add(canonSeedUrl(st))) queue.add(new String[]{ st, "0" });
             int fetched = 0, queued = 0;
-            while (!queue.isEmpty() && fetched < SEED_MAX_PAGES) {
+            while (!queue.isEmpty() && fetched < maxPages) {
                 String[] item = queue.poll();
                 String url = item[0];
                 int depth = Integer.parseInt(item[1]);
@@ -462,13 +507,13 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 String mime = rr.response().statedMimeType() == null ? "" : rr.response().statedMimeType().name();
                 boolean isHtml = "HTML".equals(mime) || body.toLowerCase().contains("<html");
                 if (fetched == 1 && !authed)
-                    scanLog.log("[AI Scanner] seeded site map with " + url + " (HTTP " + rr.response().statusCode()
+                    scanLog.log("seeded site map with " + url + " (HTTP " + rr.response().statusCode()
                             + ", " + rr.response().body().length() + " B)"
                             + (isHtml ? " — following same-host links (bounded) for a multi-page surface."
                                       : " — discovery will mine its client code."));
-                if (!isHtml || depth >= SEED_MAX_DEPTH) continue;
+                if (!isHtml || depth >= maxDepth) continue;
                 java.util.regex.Matcher m = SEED_HREF.matcher(body);
-                while (m.find() && seen.size() < SEED_MAX_PAGES * 4) {
+                while (m.find() && seen.size() < maxPages * 4) {
                     String href = m.group(1).trim();
                     if (href.length() >= 2 && (href.charAt(0) == '"' || href.charAt(0) == '\''))
                         href = href.substring(1, href.length() - 1).trim();
@@ -487,9 +532,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 }
             }
             if (fetched > 1)
-                scanLog.log("[AI Scanner] " + (authed ? "authenticated self-crawl" : "self-crawl") + " (no native crawler): fetched "
+                scanLog.log("" + (authed ? "authenticated self-crawl" : "self-crawl") + " (no native crawler): fetched "
                         + fetched + " same-host page(s), " + queued + " link(s) discovered — attack surface handed to the probes.");
-        } catch (Throwable t) { scanLog.debug("[AI Scanner] seedSiteMap: " + t); }
+        } catch (Throwable t) { scanLog.debug("seedSiteMap: " + t); }
     }
 
     /** GET a URL (attaching the session when {@code authed}), follow up to 2 same-host redirects, add each hop to
@@ -509,7 +554,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // Decompress so the seed page's HTML (and its <script src> refs) is mined, not gzip bytes, behind a
             // compressing proxy/CDN (ngrok, Cloudflare, …). See AiScanner.decompress.
             rr = com.ioactive.aiscanner.scan.AiScanner.decompress(rr);
-            scanLog.debug("[AI Scanner] seed " + url + " → " + rr.response().body().length()
+            scanLog.debug("seed " + url + " → " + rr.response().body().length()
                     + "B, has <script>: " + rr.response().bodyToString().contains("<script"));
             try { api.siteMap().add(rr); } catch (Exception ignore) { }
             last = rr;
@@ -534,7 +579,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     public void startScan(String seedUrl) {
         if (seedUrl == null || seedUrl.isBlank()) return;
         scanLog.setLastTarget(seedUrl);
-        scanLog.log("[AI Scanner] auto-scan launching on " + seedUrl);
+        scanLog.log("auto-scan launching on " + seedUrl);
         crawlAndScan(seedUrl);
     }
 
@@ -542,7 +587,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
      *  targets sequentially in one Burp session (batch autoscan). */
     public void startScanAndWait(String seedUrl) {
         if (seedUrl == null || seedUrl.isBlank()) return;
-        scanLog.log("[AI Scanner] auto-scan launching on " + seedUrl);
+        scanLog.log("auto-scan launching on " + seedUrl);
         Thread t = crawlAndScan(seedUrl);
         if (t != null) { try { t.join(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
     }
@@ -556,7 +601,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             com.ioactive.aiscanner.scan.WafObserver waf = new com.ioactive.aiscanner.scan.WafObserver(api, scanLog, host);
             try {
                 com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.incrementAndGet();   // live concurrent-scan count → LLM timeouts scale by it (correct even when scans are added at will)
-                scanLog.log("[AI Scanner] === run start (build "
+                scanLog.log("=== run start (build "
                         + com.ioactive.aiscanner.AiScannerExtension.BUILD + ") ===");
                 com.ioactive.aiscanner.engine.LlmTiming.reset();   // per-scan LLM latency for the benchmark speed column
                 com.ioactive.aiscanner.engine.LocalAiEngine.resetSeed();   // per-scan deterministic seed sequence (reproducible + cache-proof)
@@ -564,7 +609,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // discovery variance, so it must be visible in the log/report without needing -D launch flags.
                 {
                     com.ioactive.aiscanner.engine.AiEngine e0 = scanner.engine();
-                    scanLog.log("[AI Scanner] engine: " + (e0 == null ? "none (no-ai / deterministic only)" : e0.paramSummary())
+                    scanLog.log("engine: " + (e0 == null ? "none (no-ai / deterministic only)" : e0.paramSummary())
                             + "  |  discovery rounds=" + com.ioactive.aiscanner.scan.EndpointDiscovery.discoveryRoundsPublic());
                 }
                 // Burp AI is PAID — show the REAL credit balance UP FRONT (Burp caches it in WorkspaceConfig.json;
@@ -574,7 +619,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     com.ioactive.aiscanner.engine.AiEngine eng = scanner.engine();
                     if (eng != null && eng.name() != null && eng.name().toLowerCase().contains("burp ai")) {
                         String bal = com.ioactive.aiscanner.engine.MontoyaAiEngine.noteScanStart();
-                        scanLog.log("[AI Scanner] Burp AI credit balance at scan start: "
+                        scanLog.log("Burp AI credit balance at scan start: "
                                 + (bal != null ? bal : "unknown (WorkspaceConfig.json not readable yet)"));
                     }
                 } catch (Throwable ignore) { }
@@ -585,19 +630,25 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 String creditBlock = scanner.creditGateReason();
                 if (creditBlock != null) {
                     scanLog.phase("Skipped — insufficient Burp AI credits");
-                    scanLog.log("[AI Scanner] ⚠ SCAN SKIPPED for " + host + " — " + creditBlock
+                    scanLog.log("⚠ SCAN SKIPPED for " + host + " — " + creditBlock
                             + ". Refusing to start a scan that would run out of credits mid-audit.");
                     scanner.writeSkipReport(creditBlock);
                     scanner.exitIfRequested();
                     return;
                 }
                 boolean wasAuthed = session.authenticated();
+                // Global session propagation: push any captured session (now AND on every future re-capture) into
+                // Burp's cookie jar, so the NATIVE crawler + active audit run authenticated — not just our own
+                // withSessionCookie() requests. Fixes auth-gated pages coming back as empty 302s to the crawl (labs
+                // behind login never discovered) and POSTs 403'ing for a missing session/CSRF cookie.
+                session.setOnCookieUpdate(c -> pushSessionToCookieJar(c, host));
+                if (session.has()) pushSessionToCookieJar(session.cookieHeader(), host);
                 excludeLogoutFromScope(seed);   // fence off *logout* BEFORE any crawl — never visited
                 scanLog.phase("Crawling " + host);
-                scanLog.log("[AI Scanner] crawling " + seed + " …");
+                scanLog.log("crawling " + seed + " …");
                 burp.api.montoya.scanner.Crawl crawl = null;
                 if (scanner.communityEdition()) {
-                    scanLog.log("[AI Scanner] Burp Community edition: native crawler unavailable — using the "
+                    scanLog.log("Burp Community edition: native crawler unavailable — using the "
                             + "extension's own authenticated explorer + JS/OpenAPI discovery for the attack surface.");
                 } else {
                     crawl = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed));
@@ -618,7 +669,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // faithful "what does plain Burp Pro find, unaided" number, counted + reported the SAME way as
                 // the full runs (AiTriage → native-Burp-audit half; deterministic-oracle half is 0 by design).
                 if (nativeOnly()) {
-                    scanLog.log("[AI Scanner] NATIVE-ONLY baseline: no auth, no discovery, no probes — "
+                    scanLog.log("NATIVE-ONLY baseline: no auth, no discovery, no probes — "
                             + "auditing the crawled surface with Burp's own active checks only.");
                     scanLog.phase("Native baseline audit (Burp built-in checks only)");
                     scanner.summarize(scanner.scanNativeBaseline(host), host);   // finalPhase → SCAN COMPLETE + tally + report
@@ -723,7 +774,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                                 || responseHasPasswordForm(rr);
                         if (isLoginShape && loginEndpointsTried >= cap) {
                             if (!capLogged) {
-                                scanLog.log("[AI Scanner] default-creds: reached " + cap + " login-endpoint cap — stopping"
+                                scanLog.log("default-creds: reached " + cap + " login-endpoint cap — stopping"
                                         + " (further aliases won't authenticate with default creds).");
                                 capLogged = true;
                             }
@@ -731,7 +782,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                         }
                         if (hasPasswordParam(rr.request())) {
                             loginEndpointsTried++;
-                            scanLog.log("[AI Scanner] login candidate (request): " + rr.request().url());
+                            scanLog.log("login candidate (request): " + rr.request().url());
                             defaultCredsLogin(rr);
                             // CSRF-protected forms (e.g. DVWA's per-request user_token) reject a replayed
                             // captured body; fall back to a fresh page fetch → fresh token → submit.
@@ -739,7 +790,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                                 loginViaForm(rr.request().url(), rr.request().httpService());
                         } else if (isJsonLogin(rr.request())) {
                             loginEndpointsTried++;
-                            scanLog.log("[AI Scanner] login candidate (JSON body): " + rr.request().url());
+                            scanLog.log("login candidate (JSON body): " + rr.request().url());
                             jsonCredsLogin(rr);
                         } else if (responseHasPasswordForm(rr)) {
                             loginEndpointsTried++;
@@ -751,13 +802,13 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     // endpoint, seed it into the site map (so the auth-page audit covers it), and try
                     // to authenticate (default creds + generic SQLi auth-bypass). No manual requests.
                     if (!session.authenticated()) {
-                        scanLog.log("[AI Scanner] no login in site map — mining client code for an auth endpoint…");
+                        scanLog.log("no login in site map — mining client code for an auth endpoint…");
                         // Same blast-radius cap as the site-map loop: mined candidates can also be N aliases of one
                         // login; batter at most `cap` of them so a multi-alias login can't balloon the credential battery.
                         for (HttpRequestResponse login : probeAuthCandidates(host)) {
                             if (loginEndpointsTried >= cap) {
                                 if (!capLogged) {
-                                    scanLog.log("[AI Scanner] default-creds: reached " + cap + " login-endpoint cap — stopping"
+                                    scanLog.log("default-creds: reached " + cap + " login-endpoint cap — stopping"
                                             + " (further aliases won't authenticate with default creds).");
                                     capLogged = true;
                                 }
@@ -815,18 +866,20 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     excludeAuthPagesFromScope();
 
                     scanLog.phase("Re-crawling authenticated (general pass)");
-                    scanLog.log("[AI Scanner] general authenticated pass over " + host + " …");
+                    scanLog.log("general authenticated pass over " + host + " …");
                     if (!scanner.communityEdition()) {
                         var crawl2 = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed));
                         waitForCrawl(crawl2);
                         logCrawlInventory(host, crawl2.requestCount());
                         stopTask(crawl2, "authenticated crawl");
-                    } else {
-                        // Community has no native crawler → run the bounded self-crawl a SECOND time, now carrying
-                        // the session, so the authenticated pages (/bank/*, account, transfer…) reach the site map
-                        // for the CSRF / open-redirect / param probes. This is the edition's authenticated-pass.
-                        seedSiteMap(seed, host, true);
                     }
+                    // ALWAYS run the session-carrying self-crawl too (BOTH editions, not just Community). Burp's
+                    // native crawler does NOT read our captured session from the cookie jar at crawl start, so on Pro
+                    // crawl2 re-crawls UNAUTHENTICATED — auth-gated hubs come back as empty 302s and the deep lab/vuln
+                    // pages behind them (pygoat /cmd → /cmd_lab, etc.) are never discovered. seedSiteMap attaches the
+                    // Cookie header to EVERY fetch (seedFetch) + seeds from root, so it reliably reaches the
+                    // authenticated surface the native crawler misses. Dedup keeps it from re-doing crawl2's work.
+                    seedSiteMap(seed, host, true);
 
                     // Belt-and-suspenders: if a non-standard logout slipped through and killed the
                     // session, re-authenticate so the explorer fetches protected pages (/bank/*) as 200.
@@ -855,7 +908,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     if (secSel != null) levels = aa.optionValues(secSel[0], secSel[1]);
                 }
 
-                scanLog.log("[AI Scanner] crawl done; AI-scanning " + host + " …");
+                scanLog.log("crawl done; AI-scanning " + host + " …");
                 // Let the probe battery refresh a stale session mid-run: the captured session can expire over the
                 // ~10+ min of probing, so authenticated-only endpoints later bounce to login and late probes miss
                 // them. AiScanner calls this back just before its authenticated reflected-XSS phase. No-op unless
@@ -876,7 +929,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                             .filter(v -> v.matches("(?i)(low|easy|insecure|none|off|no|disabled?)"))
                             .findFirst().orElse(levels.get(0));
                     aa.applySecurity(secSel[0], secSel[1], weakest);
-                    scanLog.log("[AI Scanner] '" + secSel[1] + "' selector " + levels
+                    scanLog.log("'" + secSel[1] + "' selector " + levels
                             + " → auditing at weakest=" + weakest
                             + " (session.cookie=[" + session.cookieHeader() + "])");
                     scanLog.phase("Auditing at " + secSel[1] + "=" + weakest);
@@ -891,12 +944,12 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // after an earlier summarize() would kill Burp while the login audit was still sending.
                 scanner.exitIfRequested();
             } catch (com.ioactive.aiscanner.ui.ScanLog.ScanStopped stopped) {
-                scanLog.log("[AI Scanner] scan stopped by user — halted at phase \"" + scanLog.currentPhase() + "\".");
+                scanLog.log("scan stopped by user — halted at phase \"" + scanLog.currentPhase() + "\".");
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
-                scanLog.log("[AI Scanner] scan interrupted — stopping.");
+                scanLog.log("scan interrupted — stopping.");
             } catch (Exception ex) {
-                api.logging().logToError("[AI Scanner] crawl+scan failed: " + ex.getMessage());
+                scanLog.log("crawl+scan failed: " + ex.getMessage());
             } finally {
                 com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.decrementAndGet();   // this scan ended → drop the live concurrent count
                 try { waf.summary(); } catch (Throwable ignore) { }
@@ -938,9 +991,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     private void stopTask(burp.api.montoya.scanner.Crawl task, String label) {
         try {
             task.delete();
-            scanLog.debug("[AI Scanner] stopped " + label + " task (audit runs alone).");
+            scanLog.debug("stopped " + label + " task (audit runs alone).");
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] could not stop " + label + " task: " + t);
+            scanLog.debug("could not stop " + label + " task: " + t);
         }
     }
 
@@ -950,22 +1003,40 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     private void waitForCrawl(burp.api.montoya.scanner.Crawl crawl) throws InterruptedException {
         int last = -1, stable = 0, ticks = 0;
         long begin = System.currentTimeMillis();
-        long deadline = begin + 4 * 60 * 1000L;
+        long deadline = begin + com.ioactive.aiscanner.scan.Tuning.crawlWaitSec() * 1000L;   // configurable (Timeouts)
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(3000);
-            int c = crawl.requestCount();
+            int c = pollCrawlCount(crawl, last);   // BOUNDED poll: a hung requestCount() must not defeat the deadline
             long elapsed = System.currentTimeMillis() - begin;
             // requestCount stability = done, but only after a 45s floor so a JS-heavy / low-request crawl isn't
             // declared finished instantly (statusMessage — the accurate signal — is unavailable on this build).
             if (c == last) { if (++stable >= 6 && elapsed > 45000) break; } else { stable = 0; last = c; }
-            if (++ticks % 5 == 0) scanLog.debug("[AI Scanner] crawl… requests: " + c);
+            if (++ticks % 5 == 0) scanLog.debug("crawl… requests: " + c);
         }
-        scanLog.log("[AI Scanner] crawl wait ended (requests stable / timeout).");
+        scanLog.log("crawl wait ended (requests stable / timeout).");
+    }
+
+    // Bounded poll of Burp's Crawl.requestCount(). Observed a single requestCount() call BLOCK ~16 min on a
+    // 0-request crawl, freezing waitForCrawl far past its 4-min deadline — the deadline is only checked BETWEEN
+    // iterations, so a Montoya call that blocks inside the loop defeats it entirely (same root cause as the LLM
+    // transport stall: a Montoya call with no client-side timeout we can enforce). Run each poll on a daemon thread
+    // and abandon it after a few seconds, returning the last known count so the stable/deadline logic keeps advancing.
+    private static final java.util.concurrent.ExecutorService CRAWL_POLL_POOL =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "aiscanner-crawl-poll"); t.setDaemon(true); return t;
+            });
+    private int pollCrawlCount(burp.api.montoya.scanner.Crawl crawl, int fallback) {
+        try {
+            return CRAWL_POLL_POOL.submit((java.util.concurrent.Callable<Integer>) crawl::requestCount)
+                    .get(5, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Throwable t) {
+            return fallback < 0 ? 0 : fallback;   // hung/failed poll → treat as "no change" so the wait settles / deadlines out
+        }
     }
 
     /** After the crawl stabilises, list the host's discovered URIs + params (skipping static assets). */
     private void logCrawlInventory(String host, int requestCount) {
-        scanLog.log("[AI Scanner] crawl found " + requestCount + " request(s); inventory for " + host + ":");
+        scanLog.log("crawl found " + requestCount + " request(s); inventory for " + host + ":");
         Set<String> shown = new HashSet<>();
         int urls = 0, withParams = 0;
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
@@ -979,10 +1050,10 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             String ps = paramNames(q);
             urls++;
             if (!ps.isEmpty()) withParams++;
-            scanLog.log("[AI Scanner]   • " + q.method() + " " + path
+            scanLog.log("  • " + q.method() + " " + path
                     + (ps.isEmpty() ? "" : "  [" + ps + "]"));
         }
-        scanLog.log("[AI Scanner] inventory: " + urls + " URI(s), " + withParams + " with parameters.");
+        scanLog.log("inventory: " + urls + " URI(s), " + withParams + " with parameters.");
     }
 
     private static String paramNames(HttpRequest req) {
@@ -1001,7 +1072,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         try {
             HttpRequest base = loginRr.request();
             if (isRegistrationRequest(base)) {
-                scanLog.debug("[AI Scanner] default-creds: skipping " + base.url()
+                scanLog.debug("default-creds: skipping " + base.url()
                         + " — registration/change-password form, not a login (routed to register-then-login).");
                 return;
             }
@@ -1011,7 +1082,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 else if (userParam == null && USER_PARAM.matcher(p.name()).matches()) userParam = p.name();
             }
             if (passParam == null) {
-                scanLog.log("[AI Scanner] default-creds: no password-like parameter in the selected request.");
+                scanLog.log("default-creds: no password-like parameter in the selected request.");
                 return;
             }
             // Scan-scoped guard: the SAME /login is fed to this battery by several auth strategies (site-map loop,
@@ -1020,11 +1091,11 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // "dc " prefix keeps a namespace distinct from loginViaForm (plain url) and jsonCredsLogin ("json ")
             // so each of the 3 request-shapes still gets its single attempt — we kill repeats, not coverage.
             if (!bruteforcedLogins.add("dc " + base.url().split("\\?")[0])) {
-                scanLog.log("[AI Scanner] default-creds: skip " + base.url().split("\\?")[0]
+                scanLog.log("default-creds: skip " + base.url().split("\\?")[0]
                         + " — default-cred battery already run this scan.");
                 return;
             }
-            scanLog.log("[AI Scanner] default-creds: user='" + userParam + "' pass='" + passParam
+            scanLog.log("default-creds: user='" + userParam + "' pass='" + passParam
                     + "' on " + base.url());
 
             HttpRequestResponse bad = tryLogin(base, userParam, "zzinvalid_ai_x", passParam, "zzinvalid_ai_x");
@@ -1037,18 +1108,18 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // means this isn't a login handler — running the whole credential wordlist against it only storms 405s
             // and trips rate limits (observed on the admin scan: ~25 bogus candidates × the wordlist = 82% dup log).
             if (badStatus == 404 || badStatus == 405 || badStatus == 415 || badStatus == 501 || badStatus <= 0) {
-                scanLog.log("[AI Scanner] default-creds: skip " + base.url() + " — not a login handler (HTTP " + badStatus + ").");
+                scanLog.log("default-creds: skip " + base.url() + " — not a login handler (HTTP " + badStatus + ").");
                 return;
             }
             if (badStatus == 429) {
-                scanLog.log("[AI Scanner] default-creds: " + base.url() + " already rate-limited (429) — skip.");
+                scanLog.log("default-creds: " + base.url() + " already rate-limited (429) — skip.");
                 return;
             }
 
             for (String[] cred : DEFAULT_CREDS) {
                 HttpRequestResponse resp = tryLogin(base, userParam, cred[0], passParam, cred[1]);
                 int sc = status(resp);
-                scanLog.log("[AI Scanner]     try " + cred[0] + "/" + cred[1] + " → HTTP "
+                scanLog.log("    try " + cred[0] + "/" + cred[1] + " → HTTP "
                         + sc + ", " + bodyLen(resp) + "b" + locSuffix(resp));
                 if (looksLikeSuccess(resp, bad, cred[0], cred[1])) {
                     // Evidence = the successful login POST (carries the working credentials payload).
@@ -1056,11 +1127,11 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     return;
                 }
                 // Rate-limited: STOP. Continuing just storms 429s and poisons the legit register/login flow.
-                if (sc == 429) { scanLog.log("[AI Scanner] default-creds: endpoint rate-limited (429) — stopping brute."); return; }
+                if (sc == 429) { scanLog.log("default-creds: endpoint rate-limited (429) — stopping brute."); return; }
             }
-            scanLog.log("[AI Scanner] default-creds: none of " + DEFAULT_CREDS.length + " combos worked.");
+            scanLog.log("default-creds: none of " + DEFAULT_CREDS.length + " combos worked.");
         } catch (Exception ex) {
-            api.logging().logToError("[AI Scanner] default-creds failed: " + ex.getMessage());
+            scanLog.log("default-creds failed: " + ex.getMessage());
         }
     }
 
@@ -1150,7 +1221,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                         RequestOptions.requestOptions().withResponseTimeout(12000L));
                 if (rr == null || rr.response() == null) continue;
                 try { api.siteMap().add(rr); } catch (Exception ignore) { }   // so auditAuthPages covers it
-                scanLog.log("[AI Scanner] mined auth endpoint: " + login.method() + " " + hostOf(login.url())
+                scanLog.log("mined auth endpoint: " + login.method() + " " + hostOf(login.url())
                         + URI.create(login.url()).getPath() + " → HTTP " + rr.response().statusCode());
                 out.add(rr);
             } catch (Exception ignore) { }
@@ -1164,44 +1235,44 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             String body = base.bodyToString();
             String passKey = findJsonKey(body, PASS_PARAM);
             String userKey = findJsonKey(body, USER_PARAM);
-            if (passKey == null) { scanLog.log("[AI Scanner] json-login: no password-like key in JSON body."); return; }
+            if (passKey == null) { scanLog.log("json-login: no password-like key in JSON body."); return; }
             // Scan-scoped guard (see defaultCredsLogin): run the JSON default-cred battery ONCE per endpoint. "json "
             // namespace so it's independent of the form batteries on the same url — each shape gets one attempt.
             if (!bruteforcedLogins.add("json " + base.url().split("\\?")[0])) {
-                scanLog.log("[AI Scanner] json-login: skip " + base.url().split("\\?")[0]
+                scanLog.log("json-login: skip " + base.url().split("\\?")[0]
                         + " — default-cred battery already run this scan.");
                 return;
             }
             this.lastLoginReq = base;   // remember for the post-auth identity sweep
-            scanLog.log("[AI Scanner] json-login: user='" + userKey + "' pass='" + passKey + "' on " + base.url());
+            scanLog.log("json-login: user='" + userKey + "' pass='" + passKey + "' on " + base.url());
 
             HttpRequestResponse bad = tryJsonLogin(base, userKey, "zzinvalid_ai_x", passKey, "zzinvalid_ai_x");
             // GATE (same as defaultCredsLogin): only brute an endpoint that behaves like a login. 404/405/415/501
             // → not a login handler; don't run the wordlist+bypass against it (avoids the 405-storm / 429 trips).
             int badSc = status(bad);
             if (badSc == 404 || badSc == 405 || badSc == 415 || badSc == 501 || badSc <= 0) {
-                scanLog.log("[AI Scanner] json-login: skip " + base.url() + " — not a login handler (HTTP " + badSc + ").");
+                scanLog.log("json-login: skip " + base.url() + " — not a login handler (HTTP " + badSc + ").");
                 return;
             }
-            if (badSc == 429) { scanLog.log("[AI Scanner] json-login: " + base.url() + " already rate-limited (429) — skip."); return; }
+            if (badSc == 429) { scanLog.log("json-login: " + base.url() + " already rate-limited (429) — skip."); return; }
             for (String[] cred : DEFAULT_CREDS) {
                 HttpRequestResponse resp = tryJsonLogin(base, userKey, cred[0], passKey, cred[1]);
                 int sc = status(resp);
-                scanLog.log("[AI Scanner]     try " + cred[0] + "/" + cred[1] + " → HTTP "
+                scanLog.log("    try " + cred[0] + "/" + cred[1] + " → HTTP "
                         + sc + ", " + bodyLen(resp) + "b");
                 if (jsonLoginSuccess(resp, bad)) {
                     captureJsonSession(resp, hostOf(base.url()), cred[0], cred[1]);
                     return;
                 }
                 // Rate-limited: STOP (storming 429s poisons the legit register/login flow that follows).
-                if (sc == 429) { scanLog.log("[AI Scanner] json-login: endpoint rate-limited (429) — stopping brute."); return; }
+                if (sc == 429) { scanLog.log("json-login: endpoint rate-limited (429) — stopping brute."); return; }
             }
             // No valid creds → try generic SQLi auth-bypass in the username/email field.
             for (String inj : AUTH_BYPASS) {
                 HttpRequestResponse resp = tryJsonLogin(base, userKey, inj, passKey, BOOTSTRAP_PW);
                 int scb = status(resp);
-                scanLog.log("[AI Scanner]     try auth-bypass " + inj + " → HTTP " + scb);
-                if (scb == 429) { scanLog.log("[AI Scanner] json-login: rate-limited (429) — stopping bypass probe."); return; }
+                scanLog.log("    try auth-bypass " + inj + " → HTTP " + scb);
+                if (scb == 429) { scanLog.log("json-login: rate-limited (429) — stopping bypass probe."); return; }
                 if (jsonLoginSuccess(resp, bad)) {
                     // A registration endpoint "accepts" any email (it CREATES an account) — that is not a SQLi
                     // auth-bypass, it is a signup. Only report the bypass on a real login endpoint (zero-FP);
@@ -1212,9 +1283,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     return;
                 }
             }
-            scanLog.log("[AI Scanner] json-login: none of " + DEFAULT_CREDS.length + " combos (+ bypass) worked.");
+            scanLog.log("json-login: none of " + DEFAULT_CREDS.length + " combos (+ bypass) worked.");
         } catch (Exception ex) {
-            api.logging().logToError("[AI Scanner] json-login failed: " + ex.getMessage());
+            scanLog.log("json-login failed: " + ex.getMessage());
         }
     }
 
@@ -1234,7 +1305,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         if (userKey == null || passKey == null) return;
         Set<String> emails = harvestEmails(host);
         if (emails.isEmpty()) return;
-        scanLog.log("[AI Scanner] identity sweep: SQLi comment-login for " + emails.size() + " harvested email(s)…");
+        scanLog.log("identity sweep: SQLi comment-login for " + emails.size() + " harvested email(s)…");
         int got = 0;
         for (String email : emails) {
             try {
@@ -1246,7 +1317,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 }
             } catch (Exception ignore) { }
         }
-        scanLog.log("[AI Scanner] identity sweep: authenticated as " + got + "/" + emails.size() + " harvested identity(ies).");
+        scanLog.log("identity sweep: authenticated as " + got + "/" + emails.size() + " harvested identity(ies).");
     }
 
     /** Emails the app exposed: from captured in-scope responses + the common /api/Users collection. */
@@ -1301,7 +1372,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         Matcher m = JSON_TOKEN.matcher(resp.response().bodyToString());
         if (m.find()) {
             session.setBearer(m.group(1));
-            scanLog.log("[AI Scanner] json-login: bearer token captured (" + m.group(1).length()
+            scanLog.log("json-login: bearer token captured (" + m.group(1).length()
                     + " chars) — scans now authenticated");
         }
         String cookieHeader = buildCookieHeader(resp);
@@ -1316,9 +1387,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         String loginUrl = resp.request().url();
         if (!isRegistrationEndpoint(loginUrl)) {
             scanLog.found("Default/Weak Credentials", loginUrl, user + "/" + pass, resp);
-            scanLog.log("[AI Scanner] default creds WORK (JSON login): " + user + " / " + pass);
+            scanLog.log("default creds WORK (JSON login): " + user + " / " + pass);
         } else {
-            scanLog.log("[AI Scanner] registered a throwaway account via " + loginUrl
+            scanLog.log("registered a throwaway account via " + loginUrl
                     + " → session bootstrapped (registration, not a weak-cred finding)");
         }
         session.rememberLogin(loginUrl, user, pass);
@@ -1465,7 +1536,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             try {
                 String abs = URI.create(evidence.request().url()).resolve(loc).toString();
                 session.setLandingUrl(abs);
-                scanLog.log("[AI Scanner] authenticated landing: " + abs);
+                scanLog.log("authenticated landing: " + abs);
                 // FINALIZE the session: follow the post-login redirect chain (e.g. Zero Bank's
                 // /auth/accept-certs.html?user_token=…). Without this the session is half-baked and
                 // protected pages (/bank/*) bounce back to login — blocking the authenticated audit.
@@ -1478,10 +1549,10 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         String loginUrl = evidence.request().url();
         if (!isRegistrationEndpoint(loginUrl)) {
             scanLog.found("Default/Weak Credentials", loginUrl, user + "/" + pass, evidence);
-            scanLog.log("[AI Scanner] default creds WORK: " + user + " / " + pass
+            scanLog.log("default creds WORK: " + user + " / " + pass
                     + (session.has() ? " — session captured, scans now authenticated" : " (no cookie captured)"));
         } else {
-            scanLog.log("[AI Scanner] registered account via " + loginUrl + " → session "
+            scanLog.log("registered account via " + loginUrl + " → session "
                     + (session.has() ? "captured" : "attempted")
                     + " (registration bootstrap, not a weak-cred finding)");
         }
@@ -1499,7 +1570,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // Loop guard: an HTTP->HTTPS / cert-accept interstitial (e.g. Zero Bank /auth/accept-certs.html)
             // can 302 to itself forever. Break instead of silently burning hops, and say so.
             if (!seen.add(stripFragment(url))) {
-                scanLog.log("[AI Scanner] post-login chain LOOPED at " + url + " — likely an HTTP->HTTPS or "
+                scanLog.log("post-login chain LOOPED at " + url + " — likely an HTTP->HTTPS or "
                         + "cert-accept interstitial; the authenticated area may sit behind it (no landing to seed).");
                 return;
             }
@@ -1528,9 +1599,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // discovers the post-login nav (missing the whole transactional surface).
                 if (st >= 200 && st < 300 && !isAuthStep(url)) {
                     session.setLandingUrl(url);
-                    scanLog.log("[AI Scanner] authenticated landing promoted to post-login page: " + url);
+                    scanLog.log("authenticated landing promoted to post-login page: " + url);
                 }
-                scanLog.log("[AI Scanner] session finalized (followed post-login chain, HTTP " + st + " @ " + url + ")");
+                scanLog.log("session finalized (followed post-login chain, HTTP " + st + " @ " + url + ")");
                 return;
             }
             // 3xx: follow the Location, resolving relative AND crossing http->https (the authed area is often TLS).
@@ -1538,7 +1609,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             if (next == null || next.isBlank()) return;
             try { url = URI.create(url).resolve(next).toString(); } catch (Exception e) { return; }
         }
-        scanLog.log("[AI Scanner] post-login chain did not resolve to a usable landing within 8 hops (last: " + url + ").");
+        scanLog.log("post-login chain did not resolve to a usable landing within 8 hops (last: " + url + ").");
     }
 
     private static String stripFragment(String u) { int h = u == null ? -1 : u.indexOf('#'); return h < 0 ? u : u.substring(0, h); }
@@ -1610,7 +1681,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             HttpRequestResponse resp = postForm(actionUrl, null, fields, userField, session.loginUser(),
                     passField, session.loginPass(), cookie);
             String sc = buildCookieHeader(resp);
-            scanLog.log("[AI Scanner] re-login → HTTP " + status(resp) + locSuffix(resp)
+            scanLog.log("re-login → HTTP " + status(resp) + locSuffix(resp)
                     + "  | Set-Cookie: " + (sc.isBlank() ? "(none)" : sc));
             if (!sc.isBlank()) {
                 session.set(sc);
@@ -1621,7 +1692,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     try { api.http().cookieJar().setCookie(c.name(), c.value(), "/", h, ZonedDateTime.now().plusDays(1)); }
                     catch (Exception ignore) { }
                 }
-                scanLog.log("[AI Scanner] session re-established + cookie jar synced");
+                scanLog.log("session re-established + cookie jar synced");
                 // Complete any POST-LOGIN interstitial the login POST redirected to (e.g. Zero Bank
                 // /auth/accept-certs.html → /auth/security-check.html) carrying the fresh cookie — otherwise the
                 // session is only half-primed and authenticated POSTs later 302 to login. Bounded; http-forced
@@ -1645,7 +1716,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // verify: does a protected page load with the fresh session? (definitive signal)
                 HttpRequestResponse v = getFreshAuthed(firstProtectedUrl(h));
                 if (v != null && v.response() != null) {
-                    scanLog.log("[AI Scanner]   verify protected page → HTTP " + status(v) + locSuffix(v));
+                    scanLog.log("  verify protected page → HTTP " + status(v) + locSuffix(v));
                 }
             }
             return;
@@ -1705,7 +1776,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // A single-use CSRF token → each attempt must carry a FRESH one (re-GET per attempt), or every cred
             // after the first is rejected on a stale token (the phpMyAdmin false-negative: root/password "failed").
             boolean csrf = fields.keySet().stream().anyMatch(n -> CSRF_FIELD.matcher(n).find());
-            scanLog.log("[AI Scanner] login form @ " + pageUrl + " → POST " + actionUrl
+            scanLog.log("login form @ " + pageUrl + " → POST " + actionUrl
                     + " (user='" + userField + "', pass='" + passField + "'"
                     + (cookie.isBlank() ? "" : ", session cookie carried") + (csrf ? ", per-attempt CSRF token" : "") + ")");
 
@@ -1713,7 +1784,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             HttpRequestResponse bad = csrf
                     ? attemptFresh(pageUrl, actionUrl, svc, uf, pf, "zzinvalid_ai_x", "zzinvalid_ai_x")
                     : postForm(actionUrl, svc, fields, uf, "zzinvalid_ai_x", pf, "zzinvalid_ai_x", cookie);
-            scanLog.log("[AI Scanner]   baseline (bad creds): HTTP " + status(bad) + ", " + bodyLen(bad) + "b" + locSuffix(bad));
+            scanLog.log("  baseline (bad creds): HTTP " + status(bad) + ", " + bodyLen(bad) + "b" + locSuffix(bad));
             // Record the login POST (with the real user/pass field names) into the site map so the auth-page audit
             // (auditAuthPages) has a fuzzable login request. AuthSession's own POSTs aren't recorded, so login SQLi
             // AND NoSQL auth-bypass ($ne/$gt) had no request to test — the headline vuln on Node/Mongo login
@@ -1724,7 +1795,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 HttpRequestResponse resp = csrf
                         ? attemptFresh(pageUrl, actionUrl, svc, uf, pf, cred[0], cred[1])
                         : postForm(actionUrl, svc, fields, uf, cred[0], pf, cred[1], cookie);
-                scanLog.log("[AI Scanner]     try " + cred[0] + "/" + cred[1] + " → HTTP "
+                scanLog.log("    try " + cred[0] + "/" + cred[1] + " → HTTP "
                         + status(resp) + ", " + bodyLen(resp) + "b" + locSuffix(resp));
                 if (looksLikeSuccess(resp, bad, cred[0], cred[1])) {
                     // Evidence: ALWAYS the successful login POST (that's what proves the finding).
@@ -1732,9 +1803,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     captureSession(resp, resp, hostOf(actionUrl), cred[0], cred[1]);
                     return;
                 }
-                if (status(resp) == 429) { scanLog.log("[AI Scanner] default-creds: endpoint rate-limited (429) — stopping."); return; }
+                if (status(resp) == 429) { scanLog.log("default-creds: endpoint rate-limited (429) — stopping."); return; }
             }
-            scanLog.log("[AI Scanner] login form: none of " + DEFAULT_CREDS.length
+            scanLog.log("login form: none of " + DEFAULT_CREDS.length
                     + " default combos worked @ " + actionUrl);
         }
     }

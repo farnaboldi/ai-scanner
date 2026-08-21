@@ -17,8 +17,11 @@ final class StackTraceOracle {
     static final Pattern STACK_FRAME = Pattern.compile("at [A-Za-z_][A-Za-z0-9_.]+\\.[A-Za-z0-9_]+\\(");
     /** An exception type token, or a Python traceback header. */
     static final Pattern EXCEPTION_TOKEN = Pattern.compile("(?i)\\b([A-Za-z0-9_.]*Exception|Traceback \\(most recent call last\\))\\b");
-    /** Framework error-page signatures that are themselves conclusive (ASP.NET yellow-screen, etc.). */
-    static final Pattern FRAMEWORK_ERR = Pattern.compile("(?i)Server Error in |ASP\\.NET Version:|Stack Trace:");
+    /** Framework error-page signatures that are themselves conclusive (ASP.NET yellow-screen, Python traceback,
+     *  Django DEBUG=True error/404 page). These strings only appear in verbose error/debug output → zero-FP. */
+    static final Pattern FRAMEWORK_ERR = Pattern.compile("(?i)Server Error in |ASP\\.NET Version:|Stack Trace:|"
+            + "Traceback \\(most recent call last\\)|"                                    // Python (Flask/Django console/plaintext)
+            + "You're seeing this error because you have|Using the URLconf defined in");  // Django DEBUG=True 500/404 page (routing+settings disclosure)
     /** V8 / Node.js stack frame: `at <fn> (<file>:line:col)` or bare `at <file>:line:col`. The trailing
      *  {@code :line:col} preceded by a JS source file, a {@code node:} core module, or an absolute {@code /path}
      *  is the distinctive V8 shape — a bare "at 12:30:00" time-of-day has no such prefix and cannot match, which

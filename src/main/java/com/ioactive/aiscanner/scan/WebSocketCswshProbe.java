@@ -75,13 +75,13 @@ public final class WebSocketCswshProbe {
     /** Discover WS endpoints (observed + JS-mined) and test each. Returns the number of hosts confirmed vulnerable. */
     public int probe(UnaryOperator<HttpRequest> withSession) {
         List<Candidate> candidates = discover();
-        scanLog.debug("[AI Scanner] CSWSH: " + candidates.size() + " WS endpoint(s) discovered (observed + JS-mined).");
+        scanLog.debug("CSWSH: " + candidates.size() + " WS endpoint(s) discovered (observed + JS-mined).");
         if (candidates.isEmpty()) return 0;
         Set<String> inScopeHosts = inScopeHosts();
         Set<String> reported = new HashSet<>();   // host:port keys already confirmed (dedup + return count)
         for (Candidate c : candidates) {
             try { test(c, withSession, reported, inScopeHosts); }
-            catch (Throwable t) { scanLog.debug("[AI Scanner] CSWSH test error: " + t); }
+            catch (Throwable t) { scanLog.debug("CSWSH test error: " + t); }
         }
         return reported.size();
     }
@@ -150,7 +150,7 @@ public final class WebSocketCswshProbe {
         // a DIFFERENT PORT than the HTTP surface (Burp's host+port scope would drop it), but we must NEVER open a
         // handshake to a host outside the operator's target scope (e.g. a third-party/CDN host the crawl merely touched).
         if (host == null || !inScopeHosts.contains(host.toLowerCase())) {
-            scanLog.debug("[AI Scanner] CSWSH skip (host not in authorised scope): " + url); return;
+            scanLog.debug("CSWSH skip (host not in authorised scope): " + url); return;
         }
         String hostPort = hostPortOf(url);
         if (hostPort != null && reported.contains(hostPort)) return;   // one finding per host:port (distinct WS services differ)
@@ -160,7 +160,7 @@ public final class WebSocketCswshProbe {
             String jar = ambientCookieHeader(host);
             if (jar != null) hs = hs.withAddedHeader("Cookie", jar);
         }
-        if (!hasCookie(hs)) { scanLog.debug("[AI Scanner] CSWSH skip (no ambient cookie): " + url); return; }
+        if (!hasCookie(hs)) { scanLog.debug("CSWSH skip (no ambient cookie): " + url); return; }
 
         // baseline: the endpoint must upgrade with the app's OWN (legitimate) Origin — the origin that legitimately
         // consumes this socket, which a correctly-configured server would allow-list.
@@ -169,7 +169,7 @@ public final class WebSocketCswshProbe {
         String baseStatus = base != null ? String.valueOf(base.status()) : "null";
         boolean baseOk = base != null && base.status() == ExtensionWebSocketCreationStatus.SUCCESS;
         closeQuietly(base);
-        if (!baseOk) { scanLog.debug("[AI Scanner] CSWSH " + url + " baseline did not upgrade (status=" + baseStatus + ")"); return; }
+        if (!baseOk) { scanLog.debug("CSWSH " + url + " baseline did not upgrade (status=" + baseStatus + ")"); return; }
 
         // attack: replay with a foreign Origin — a still-successful upgrade means Origin was never validated
         HttpRequest evil = hs.withUpdatedHeader("Origin", FOREIGN_ORIGIN);
@@ -177,7 +177,7 @@ public final class WebSocketCswshProbe {
         boolean cswsh = attack != null && attack.status() == ExtensionWebSocketCreationStatus.SUCCESS;
         HttpResponse upResp = attack != null ? attack.upgradeResponse().orElse(null) : null;
         closeQuietly(attack);
-        scanLog.debug("[AI Scanner] CSWSH " + url + " baseline=SUCCESS foreignOrigin=" + (attack != null ? attack.status() : "null"));
+        scanLog.debug("CSWSH " + url + " baseline=SUCCESS foreignOrigin=" + (attack != null ? attack.status() : "null"));
         if (!cswsh) return;
 
         if (hostPort != null) reported.add(hostPort);

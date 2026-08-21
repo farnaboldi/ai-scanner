@@ -67,10 +67,8 @@ public final class EndpointDiscovery {
             + "[.\\-].*");
     private static final int PER_SOURCE_CHARS = 8000; // cap on any single page/script body
     private static final int CHUNK_CHARS = 30000;     // sources are packed into ~30k chunks, 1 LLM call each
-    private static final int MAX_CANDIDATES = 200;    // probe budget — high enough to cover the full harvested
-                                                      // API surface (deterministic, not a random 80-of-N subset)
-    private static final int MAX_SOURCES = 40;        // pages/scripts considered per scan
-    private static final int MAX_LLM_CALLS = 8;       // chunks mined per scan (≈240k chars total coverage)
+    // Discovery budgets (maxCandidates / maxSources / maxLlmChunks) live in Tuning — configurable at scan time via
+    // -Daiscanner.maxCandidates|maxSources|maxLlmChunks (or the Settings tab), read at use below. Defaults 200/40/8.
     /** LLM discovery rounds to UNION (temp>0 samples differently each round → more coverage, and the union
      *  converges → reproducible). Default 3; override -Daiscanner.discoveryRounds / AISCANNER_DISCOVERY_ROUNDS.
      *  At temp=0 the early-stop collapses this to 1 round (greedy = identical each pass). Clamped to [1,10]. */
@@ -146,6 +144,11 @@ public final class EndpointDiscovery {
     // across targets/cells: keyed by host, and each matrix cell is its own Burp process (fresh statics).
     private static final java.util.Map<String, Set<String>> specsCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.Map<String, Integer> specsSiteMapCount = new java.util.concurrent.ConcurrentHashMap<>();
+    // Per-host set of content-hashes (url+body) of sources ALREADY sent to the LLM. When the site map grows and we
+    // re-mine, only sources whose hash is NOT here are fed to the LLM — byte-identical bodies are never re-sent
+    // (dedup). Static/scan-scoped like specsCache: shared across the fresh EndpointDiscovery instances the auth
+    // orchestration news per call, reset per matrix cell (own Burp process).
+    private static final java.util.Map<String, Set<String>> llmMinedSourceHashes = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Same-host site-map entry count — a CHEAP freshness signal (no body reads / fetches / LLM) so a memo hit
      *  skips gatherSources() entirely. Re-mine only when the surface actually grew (e.g. authed pages arrived). */
@@ -164,27 +167,41 @@ public final class EndpointDiscovery {
         Set<String> cachedEarly = specsCache.get(host);
         Integer prevSmc = specsSiteMapCount.get(host);
         if (cachedEarly != null && prevSmc != null && prevSmc == smc) {
-            scanLog.debug("[AI Scanner] endpoint discovery: reusing " + cachedEarly.size() + " mined spec(s) for "
+            scanLog.debug("endpoint discovery: reusing " + cachedEarly.size() + " mined spec(s) for "
                     + host + " (site map unchanged since last pass — skipping re-mine + re-LLM + re-fetch)");
             return new LinkedHashSet<>(cachedEarly);
         }
-        Set<String> specs = new LinkedHashSet<>();
+        // The site map GREW (e.g. authenticated pages/scripts arrived). Seed from the previous mine so the specs the
+        // LLM already derived from UNCHANGED sources are RETAINED — otherwise a fresh empty set would lose them, since
+        // below we feed the LLM ONLY the new/changed sources. This seed + the per-source hash dedup are what stop the
+        // LLM being re-burned on byte-identical JS/HTML every post-auth / re-crawl pass.
+        Set<String> specs = new LinkedHashSet<>(cachedEarly != null ? cachedEarly : java.util.Collections.emptySet());
         List<String[]> sources = gatherSources(host);   // {url, body}, deep/authenticated pages first
         if (sources.isEmpty()) {
-            scanLog.log("[AI Scanner] endpoint discovery: no client-side code to mine for " + host + ".");
+            scanLog.log("endpoint discovery: no client-side code to mine for " + host + ".");
             return specs;
         }
         scanLog.phase("AI endpoint discovery (mining JS/HTML)");
         AiEngine eng = engine != null ? engine.get() : null;
         boolean canLlm = eng != null && eng.isConfigured();
+        // CONTENT-HASH DEDUP: split sources into those already sent to the LLM (unchanged) vs new/changed. The hash
+        // keys on url+body, so a same-URL page whose body changed (anon → authenticated /dashboard) counts as new and
+        // is re-mined — only byte-identical bodies are skipped. This is the fix for the repeated full re-discovery.
+        Set<String> minedHashes = llmMinedSourceHashes.computeIfAbsent(host, k -> java.util.concurrent.ConcurrentHashMap.newKeySet());
+        List<String[]> newSources = new ArrayList<>();
+        for (String[] src : sources) if (!minedHashes.contains(srcHash(src[0], src[1]))) newSources.add(src);
+        int skipped = sources.size() - newSources.size();
         int regex = 0, llm = 0;
-        for (String[] src : sources) regex += regexCandidates(src[1], specs);
         // DETERMINISTIC, EXHAUSTIVE pass: harvest every /api/vN/ literal from the FULL body of every same-host
         // script — no truncation, no sampling — so the API surface we probe does NOT depend on which 8k window
         // or which 8 chunks happened to be fed to the LLM (that sampling is what left agents/kb/chat undiscovered
-        // run-to-run). This is the coverage floor; the LLM pass below only ADDS non-literal/inferred routes.
+        // run-to-run). This is the coverage floor; the LLM pass below only ADDS non-literal/inferred routes. Regex +
+        // harvest are cheap and idempotent (re-adding a known spec to the Set is free), so they run over the FULL
+        // source set every pass — the dedup applies ONLY to the expensive LLM pass.
+        for (String[] src : sources) regex += regexCandidates(src[1], specs);
         int harvested = harvestApiPaths(host, specs);
-        List<String> chunks = packChunks(sources);
+        // LLM mines ONLY the new/changed sources. Unchanged ones contributed to the seeded `specs` in a prior pass.
+        List<String> chunks = packChunks(newSources);
         // N-ROUND UNION: at temp>0 the LLM samples DIFFERENT candidates each pass, so we run discovery N times and
         // UNION the results (specs is a Set → dedup is automatic). This tames the sampling variance WITHOUT losing
         // the LLM's exploratory coverage: as N grows, two "N-round" runs converge to the same set (the model's
@@ -193,10 +210,10 @@ public final class EndpointDiscovery {
         int rounds = discoveryRounds();
         int roundsRun = 0;
         int emptyStreak = 0;                            // consecutive rounds that added nothing new
-        for (int r = 0; r < rounds && canLlm; r++) {
+        for (int r = 0; r < rounds && canLlm && !chunks.isEmpty(); r++) {
             int roundBefore = specs.size();
             int rawThisRound = 0;                       // RAW endpoints the LLM parsed this round (pre-dedup)
-            for (int i = 0; i < chunks.size() && i < MAX_LLM_CALLS; i++) {
+            for (int i = 0; i < chunks.size() && i < Tuning.maxLlmChunks(); i++) {
                 int before = specs.size();
                 rawThisRound += llmCandidates(eng, chunks.get(i), specs);   // returns RAW parsed count
                 llm += specs.size() - before;
@@ -205,7 +222,7 @@ public final class EndpointDiscovery {
             int added = specs.size() - roundBefore;
             // Log RAW parsed (what the model actually returned) AND new-after-union — so we can see whether a round
             // added nothing because the LLM returned nothing vs. returned dupes (the variance we've been chasing).
-            if (rounds > 1) scanLog.log("[AI Scanner]   discovery round " + (r + 1) + "/" + rounds
+            if (rounds > 1) scanLog.log("  discovery round " + (r + 1) + "/" + rounds
                     + ": LLM parsed " + rawThisRound + " endpoint(s), +" + added + " new (union now " + specs.size() + ")");
             // Each round uses a DIFFERENT seed → a single empty/weak round is just a bad roll, NOT convergence: the
             // next round (fresh seed) can recover. So only stop after TWO CONSECUTIVE empty rounds (true convergence,
@@ -213,9 +230,13 @@ public final class EndpointDiscovery {
             emptyStreak = (added == 0) ? emptyStreak + 1 : 0;
             if (emptyStreak >= 2) break;
         }
-        scanLog.log("[AI Scanner] endpoint discovery: regex " + regex + " + full-body harvest " + harvested
-                + " + LLM " + llm + " candidate(s) from " + sources.size() + " source(s) in "
-                + Math.min(chunks.size(), MAX_LLM_CALLS) + " chunk(s) × " + roundsRun + " round(s); probing with "
+        // Mark the new sources as mined so a later pass won't re-send them. Only when the LLM actually ran — if it
+        // wasn't configured we mined nothing, so leave them unmarked for a later configured pass.
+        if (canLlm) for (String[] src : newSources) minedHashes.add(srcHash(src[0], src[1]));
+        scanLog.log("endpoint discovery: regex " + regex + " + full-body harvest " + harvested
+                + " + LLM " + llm + " candidate(s) from " + newSources.size() + " new source(s)"
+                + (skipped > 0 ? " (" + skipped + " unchanged skipped — already LLM-mined)" : "")
+                + " in " + Math.min(chunks.size(), Tuning.maxLlmChunks()) + " chunk(s) × " + roundsRun + " round(s); probing with "
                 + (session.has() ? "authenticated session" : "no session") + "…");
         specsCache.put(host, new LinkedHashSet<>(specs));   // memoize; re-mined only when the site map grows
         specsSiteMapCount.put(host, smc);
@@ -295,14 +316,14 @@ public final class EndpointDiscovery {
                         baseReal = true; found++;
                         HttpRequest keep = authedGet(abs);
                         live.add(keep);
-                        scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + Net.stripQuery(abs) + " (assembled)");
+                        scanLog.log("  -> LIVE " + st + "  GET " + Net.stripQuery(abs) + " (assembled)");
                     }
                 }
             }
-            if (found > 0) scanLog.log("[AI Scanner] assembled discovery: " + found
+            if (found > 0) scanLog.log("assembled discovery: " + found
                     + " endpoint(s) via base×leaf (" + probed + " probes).");
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] assembled discovery failed: " + t);
+            scanLog.log("assembled discovery failed: " + t);
         }
     }
 
@@ -383,22 +404,22 @@ public final class EndpointDiscovery {
                     if (st < 200 || st >= 300 || !respIsJson(rr) || isHtmlShell(rr)) continue;
                     found++;
                     live.add(jsonGet(abs));   // the collection read itself (exposure / IDOR surface)
-                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + abs + " (client-route → API resource)");
+                    scanLog.log("  -> LIVE " + st + "  GET " + abs + " (client-route → API resource)");
                     for (String key : responseKeys(rr, 6)) {   // response field keys → candidate query params
                         if (seen.add("GET " + abs + "?" + key)) {
                             live.add(jsonGet(abs + "?" + key + "=" + READ_SEED));
-                            scanLog.log("[AI Scanner]      + param-seeded read: GET " + abs + "?" + key + "= (SQLi/XSS surface)");
+                            scanLog.log("     + param-seeded read: GET " + abs + "?" + key + "= (SQLi/XSS surface)");
                         }
                     }
                 }
             }
-            if (found > 0) scanLog.log("[AI Scanner] client-route API inference: " + found
+            if (found > 0) scanLog.log("client-route API inference: " + found
                     + " resource(s) reached from the SPA's route vocabulary (" + probed + " probes over "
                     + mounts.size() + " mount(s) × " + nouns.size() + " noun(s)).");
-            else scanLog.debug("[AI Scanner] client-route API inference: 0 from " + mounts.size()
+            else scanLog.debug("client-route API inference: 0 from " + mounts.size()
                     + " mount(s) × " + nouns.size() + " noun(s) (" + probed + " probes); nouns=" + nouns);
         } catch (Throwable t) {
-            scanLog.log("[AI Scanner] client-route API inference failed: " + t);
+            scanLog.log("client-route API inference failed: " + t);
         }
     }
 
@@ -467,9 +488,9 @@ public final class EndpointDiscovery {
                 }
             }
         } catch (Throwable t) {
-            scanLog.debug("[AI Scanner] JSON param-read synthesis failed: " + t);
+            scanLog.debug("JSON param-read synthesis failed: " + t);
         }
-        if (added > 0) scanLog.log("[AI Scanner] JSON param-read synthesis: " + added
+        if (added > 0) scanLog.log("JSON param-read synthesis: " + added
                 + " param-seeded read(s) from " + collections + " reached JSON/XML collection(s) → active audit (SQLi/XSS surface).");
     }
 
@@ -584,7 +605,7 @@ public final class EndpointDiscovery {
             String raw = eng.chat(system, "Client code fragments:\n" + ctx + "\n\nReturn the JSON array now.", "discovery: mine-endpoints");
             if (raw == null) return;
             List<JSONObject> objs = lenientObjects(raw);   // salvage complete objects even if the array is truncated
-            if (objs.isEmpty()) { scanLog.log("[AI Scanner] synth: LLM returned 0 parseable endpoint(s)."); return; }
+            if (objs.isEmpty()) { scanLog.log("synth: LLM returned 0 parseable endpoint(s)."); return; }
             final int BUDGET = 240;   // was 80 — too low for ~44 candidates × service-bases, dropped validate-coupon etc.
             // TRACE: exactly what the LLM proposed, so coverage is visible instead of inferred.
             List<String> allLeaves = new ArrayList<>();
@@ -592,10 +613,10 @@ public final class EndpointDiscovery {
                 String lf = o.optString("leaf", o.optString("path", "")).trim();
                 if (!lf.isBlank()) allLeaves.add(o.optString("method", "GET").trim().toUpperCase() + " " + lf);
             }
-            scanLog.log("[AI Scanner] synth: LLM returned " + objs.size() + " candidate(s): " + allLeaves);
+            scanLog.log("synth: LLM returned " + objs.size() + " candidate(s): " + allLeaves);
             int kept = 0, probed = 0;
             for (JSONObject o : objs) {
-                if (probed >= BUDGET) { scanLog.log("[AI Scanner] synth: probe budget " + BUDGET
+                if (probed >= BUDGET) { scanLog.log("synth: probe budget " + BUDGET
                         + " exhausted — remaining candidates NOT probed"); break; }
                 String leaf = o.optString("leaf", o.optString("path", "")).trim();
                 if (leaf.isBlank() || STATIC.matcher(leaf).matches()) continue;
@@ -646,7 +667,7 @@ public final class EndpointDiscovery {
                         for (List<String> fs : variants) {
                             if (probed >= BUDGET) break;
                             if (session != null && session.mutatesOwnAccount(method, abs)) {
-                                scanLog.debug("[AI Scanner]   discovery: skip self-account mutation " + method + " " + Net.stripQuery(abs));
+                                scanLog.debug("  discovery: skip self-account mutation " + method + " " + Net.stripQuery(abs));
                                 break;   // req stays null → this candidate is skipped below (protects our own login)
                             }
                             HttpRequest r = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod(method)
@@ -680,20 +701,20 @@ public final class EndpointDiscovery {
                     if (handlerRan) {
                         live.add(req); kept++;
                         keep(rr, host);   // bridge to site map for IdorGet/Bfla/ChainReplay
-                        scanLog.log("[AI Scanner]   -> LIVE " + st + "  " + method + " " + Net.stripQuery(abs)
+                        scanLog.log("  -> LIVE " + st + "  " + method + " " + Net.stripQuery(abs)
                                 + (fields.isEmpty() ? "" : " {" + String.join(",", fields) + "}") + " (llm-synth)");
                         keptThis = true;
                         break;   // found this leaf's real base — stop trying other bases
                     }
                 }
                 if (!keptThis && !trail.isEmpty())   // TRACE: how far this candidate got before being dropped
-                    scanLog.log("[AI Scanner]   -· DROPPED " + method + " " + leaf
+                    scanLog.log("  -· DROPPED " + method + " " + leaf
                             + (fields.isEmpty() ? "" : " {" + String.join(",", fields) + "}") + " — " + trail);
             }
-            if (kept > 0) scanLog.log("[AI Scanner] LLM body-synthesis: " + kept + " endpoint(s) from "
+            if (kept > 0) scanLog.log("LLM body-synthesis: " + kept + " endpoint(s) from "
                     + objs.size() + " candidate(s), " + probed + " probes.");
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] LLM synthesis failed: " + t);
+            scanLog.log("LLM synthesis failed: " + t);
         }
     }
 
@@ -789,7 +810,7 @@ public final class EndpointDiscovery {
                 String key = method + " " + Net.stripQuery(abs) + " " + fields.keySet();
                 if (!seen.add(key)) continue;
                 if (session != null && session.mutatesOwnAccount(method, abs)) {
-                    scanLog.debug("[AI Scanner]   html-form: skip self-account mutation " + method + " " + Net.stripQuery(abs));
+                    scanLog.debug("  html-form: skip self-account mutation " + method + " " + Net.stripQuery(abs));
                     continue;
                 }
                 StringBuilder enc = new StringBuilder();
@@ -806,10 +827,10 @@ public final class EndpointDiscovery {
                     req = withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs) + "?" + enc).withMethod("GET"));
                 }
                 live.add(req); added++;
-                scanLog.log("[AI Scanner]   -> FORM " + method + " " + Net.stripQuery(abs) + " {" + String.join(",", fields.keySet()) + "}");
+                scanLog.log("  -> FORM " + method + " " + Net.stripQuery(abs) + " {" + String.join(",", fields.keySet()) + "}");
             }
         }
-        if (added > 0) scanLog.log("[AI Scanner] html-form synthesis: " + added + " parameterized form request(s) for the active audit.");
+        if (added > 0) scanLog.log("html-form synthesis: " + added + " parameterized form request(s) for the active audit.");
     }
 
     public List<HttpRequest> discover(String host) {
@@ -827,14 +848,14 @@ public final class EndpointDiscovery {
                 for (com.ioactive.aiscanner.scan.sast.StaticHint h : sourceHints) {
                     if (specs.add(h.toEndpointSpec(SEP))) addedFromSource++;
                 }
-                if (addedFromSource > 0) scanLog.log("[AI Scanner]   +" + addedFromSource
+                if (addedFromSource > 0) scanLog.log("  +" + addedFromSource
                         + " source-derived endpoint spec(s) to probe (SAST-driven surface).");
             }
 
             Set<String> seen = new LinkedHashSet<>();
             int probed = 0;
             for (String spec : specs) {
-                if (probed >= MAX_CANDIDATES) break;
+                if (probed >= Tuning.maxCandidates()) break;
                 // A POST to an API-ish path may consume JSON, not form-encoding: build both variants,
                 // probe each, and keep whichever the server accepts. Without this, a JSON API is fed
                 // form-encoded bodies (rejected / never reaching the JSON sink) and our JSON insertion
@@ -850,7 +871,7 @@ public final class EndpointDiscovery {
 
                 HttpRequest best = null; int bestSt = -1; HttpRequestResponse bestRr = null;
                 for (HttpRequest req : variants) {
-                    if (probed >= MAX_CANDIDATES) break;
+                    if (probed >= Tuning.maxCandidates()) break;
                     probed++;
                     HttpRequestResponse rr = probe(req);
                     int st = statusOf(rr);
@@ -860,7 +881,7 @@ public final class EndpointDiscovery {
                 if (realLive) {
                     live.add(best);
                     keep(bestRr, host);   // bridge to site map for IdorGet/Bfla/ChainReplay
-                    scanLog.log("[AI Scanner]   -> LIVE " + bestSt + "  " + best.method() + " "
+                    scanLog.log("  -> LIVE " + bestSt + "  " + best.method() + " "
                             + Net.stripQuery(best.url()) + paramSuffix(best));
                 } else {
                     String leafPath; try { leafPath = URI.create(sample.url()).getPath(); } catch (Exception e) { leafPath = ""; }
@@ -903,10 +924,10 @@ public final class EndpointDiscovery {
             discoverClientRouteApis(host, baseUrl, live, seen); // SPA route nouns → API resources (frontend-orphaned endpoints)
             harvestHtmlForms(host, live, seen);          // server-rendered <form>s → parameterized GET/POST for the active audit
             synthesizeParamReadsFromJson(host, live, seen); // reached JSON collections → param-seeded reads (response keys ARE the query params)
-            scanLog.log("[AI Scanner] endpoint discovery: " + live.size()
+            scanLog.log("endpoint discovery: " + live.size()
                     + " live endpoint(s) Burp's crawler missed.");
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] endpoint discovery failed: " + t);
+            scanLog.log("endpoint discovery failed: " + t);
         }
         return live;
     }
@@ -1044,7 +1065,7 @@ public final class EndpointDiscovery {
             // username+password but is NOT the login (and org.json keySet order is undefined, so we can't rely on it).
             Pattern LOGINISH = Pattern.compile("(?i).*(token|login|auth|signin|session|oauth).*");
             loginPaths.sort((a, b) -> Integer.compare(LOGINISH.matcher(b).matches() ? 1 : 0, LOGINISH.matcher(a).matches() ? 1 : 0));
-            scanLog.log("[AI Scanner]   -> API AUTH: spec auth header=" + apiAuthHeader + ", login candidate(s)=" + loginPaths);
+            scanLog.log("  -> API AUTH: spec auth header=" + apiAuthHeader + ", login candidate(s)=" + loginPaths);
             if (loginPaths.isEmpty()) return;
 
             // (3) candidate bodies per login path, built from the SPEC's own credential field names (not
@@ -1074,7 +1095,7 @@ public final class EndpointDiscovery {
                         // on every subsequent spec-built request AND every probe (JWT/IDOR/BFLA now run authenticated).
                         if (session != null) session.setBearer(tok);
                         String how = b.contains("OR ") ? "SQLi auth-bypass" : b.contains("@x.io") ? "fresh registration" : "default creds";
-                        scanLog.log("[AI Scanner]   -> API AUTH: obtained a token via " + loginPath + " (" + how
+                        scanLog.log("  -> API AUTH: obtained a token via " + loginPath + " (" + how
                                 + ", fields " + uf + "/" + pf + (extra.isEmpty() ? "" : " + required" + extra) + ", from " + src
                                 + "); auth header = " + (apiAuthHeader == null ? "Authorization: Bearer" : apiAuthHeader));
                         if (jsonBody) checkWeakToken(new JSONObject(resp), tok, url, rr);
@@ -1109,16 +1130,16 @@ public final class EndpointDiscovery {
                         if (tok == null) tok = bearerFromResponseHeaders(rr.response());
                         if (tok != null) {
                             apiAuthToken = tok; if (session != null) session.setBearer(tok);
-                            scanLog.log("[AI Scanner]   -> API AUTH: registered '" + tag + "' on " + regPath
+                            scanLog.log("  -> API AUTH: registered '" + tag + "' on " + regPath
                                     + " -> logged in via " + logPath + " -> token adopted (register-then-login).");
                             if (resp != null && resp.trim().startsWith("{")) checkWeakToken(new JSONObject(resp), tok, logUrl, rr);
                             return;
                         }
                     }
-                } catch (Throwable t) { scanLog.debug("[AI Scanner]   -> API AUTH: two-step register-then-login error: " + t); }
+                } catch (Throwable t) { scanLog.debug("  -> API AUTH: two-step register-then-login error: " + t); }
             }
-            scanLog.log("[AI Scanner]   -> API AUTH: login candidate(s) tried but no token extracted (" + tries + " attempt(s)).");
-        } catch (Throwable t) { scanLog.log("[AI Scanner] spec auth bootstrap error: " + t); }
+            scanLog.log("  -> API AUTH: login candidate(s) tried but no token extracted (" + tries + " attempt(s)).");
+        } catch (Throwable t) { scanLog.log("spec auth bootstrap error: " + t); }
     }
 
     /** Superset JSON credential body: the registered handle (tag) in every common identity field + email + the
@@ -1284,7 +1305,7 @@ public final class EndpointDiscovery {
                 acquireSpecToken(spec, host, root);   // spec-driven auth bootstrap (sets apiAuthHeader/apiAuthToken)
                 int before = live.size();
                 parseSpecPaths(spec, host, root, live, seen);
-                scanLog.log("[AI Scanner]   -> API SPEC " + loc + ": ingested "
+                scanLog.log("  -> API SPEC " + loc + ": ingested "
                         + (live.size() - before) + " live endpoint(s).");
                 if (live.size() > before) return;   // one good spec is enough
             } catch (Exception ignore) { }
@@ -1311,7 +1332,7 @@ public final class EndpointDiscovery {
                     if (st <= 0 || st == 404 || st == 405) continue;   // route absent → not real
                     live.add(req);
                     keep(rr, host);                                    // bridge to site map
-                    scanLog.log("[AI Scanner]   -> SPEC " + st + "  " + method.toUpperCase()
+                    scanLog.log("  -> SPEC " + st + "  " + method.toUpperCase()
                             + " " + Net.stripQuery(req.url()) + paramSuffix(req));
                 } catch (Exception ignore) { }
             }
@@ -1600,7 +1621,7 @@ public final class EndpointDiscovery {
                 int st = statusOf(probe(req));
                 if (st >= 200 && st < 400) {
                     live.add(req);
-                    scanLog.log("[AI Scanner]   -> WELL-KNOWN " + st + "  GET " + p);
+                    scanLog.log("  -> WELL-KNOWN " + st + "  GET " + p);
                 }
             } catch (Exception ignore) { }
         }
@@ -1626,7 +1647,7 @@ public final class EndpointDiscovery {
                     int st = statusOf(probe(withSessionCookie(
                             HttpRequest.httpRequestFromUrl(root + "/assets/i18n/" + key + ".json").withMethod("GET"))));
                     if (st >= 200 && st < 400)
-                        scanLog.log("[AI Scanner]   -> extra-language i18n served (not in /rest/languages): " + key + ".json");
+                        scanLog.log("  -> extra-language i18n served (not in /rest/languages): " + key + ".json");
                 }
             }
         } catch (Exception ignore) { }
@@ -1667,7 +1688,7 @@ public final class EndpointDiscovery {
             live.add(withSessionCookie(HttpRequest.httpRequestFromUrl(finalUrl).withMethod("GET")));
             recordPage(rr, host);
             confirmed++;
-            scanLog.log("[AI Scanner]   -> AI-PATH " + st + "  GET " + pathOnly(finalUrl));
+            scanLog.log("  -> AI-PATH " + st + "  GET " + pathOnly(finalUrl));
             if (st >= 200 && st < 300) enqueueLinks(rr, finalUrl, host, root, 1, queue, seen);
         }
         // Bounded link-follow from confirmed 200 pages (reach the children Burp's crawler would have).
@@ -1681,12 +1702,12 @@ public final class EndpointDiscovery {
             live.add(withSessionCookie(HttpRequest.httpRequestFromUrl(finalUrl).withMethod("GET")));
             recordPage(rr, host);
             confirmed++;
-            scanLog.log("[AI Scanner]   -> AI-PATH(link) " + st + "  GET " + pathOnly(finalUrl));
+            scanLog.log("  -> AI-PATH(link) " + st + "  GET " + pathOnly(finalUrl));
             int depth = Integer.parseInt(cur[1]);
             if (st >= 200 && st < 300 && depth < 2) enqueueLinks(rr, finalUrl, host, root, depth + 1, queue, seen);
         }
         if (confirmed > 0)
-            scanLog.log("[AI Scanner] AI path-discovery: " + confirmed + " unlinked path(s) confirmed live "
+            scanLog.log("AI path-discovery: " + confirmed + " unlinked path(s) confirmed live "
                     + "(proposed " + proposed.size() + ").");
     }
 
@@ -1834,7 +1855,7 @@ public final class EndpointDiscovery {
                     int st = statusOf(probe(withSessionCookie(
                             HttpRequest.httpRequestFromUrl(root + resolved).withMethod("GET"))));
                     if (st >= 200 && st < 300) {
-                        scanLog.log("[AI Scanner]   -> resolved sub-resource GET " + resolved + " (id=" + ids.get(i) + ")");
+                        scanLog.log("  -> resolved sub-resource GET " + resolved + " (id=" + ids.get(i) + ")");
                         break;   // one live id per template is enough to learn the schema
                     }
                 }
@@ -1855,7 +1876,7 @@ public final class EndpointDiscovery {
                     HttpRequestResponse rr = probe(authedGet(url));
                     if (statusOf(rr) >= 200 && statusOf(rr) < 300) {
                         keep(rr, host);   // bridge → IdorGetProbe enumerates a neighbor id (View Basket etc.)
-                        scanLog.log("[AI Scanner]   -> reached own resource GET /" + base + ids.get(i) + " (IDOR seed)");
+                        scanLog.log("  -> reached own resource GET /" + base + ids.get(i) + " (IDOR seed)");
                         break;
                     }
                 }
@@ -1887,10 +1908,10 @@ public final class EndpointDiscovery {
                 out.add(w);
             }
             if (!out.isEmpty())
-                scanLog.log("[AI Scanner] synthesized " + out.size() + " REST write request(s) from collection schemas.");
+                scanLog.log("synthesized " + out.size() + " REST write request(s) from collection schemas.");
             exerciseWrites(host);   // actively send input-validation writes that need a SENT request, not an audit point
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] synthesizeWrites: " + t);
+            scanLog.log("synthesizeWrites: " + t);
         }
         return out;
     }
@@ -1969,7 +1990,7 @@ public final class EndpointDiscovery {
                 // and emit spurious 500s. (e.g. Juice "Empty User Registration")
                 if (hasEmail && done.add("empty:" + coll)) {
                     if (!WriteGuard.allowsRegistration(coll, keys)) {
-                        scanLog.debug("[AI Scanner]   write-gate: skip empty-cred POST to non-registration sink " + Net.stripQuery(coll));
+                        scanLog.debug("  write-gate: skip empty-cred POST to non-registration sink " + Net.stripQuery(coll));
                         continue;
                     }
                     JSONObject b = new JSONObject();
@@ -1979,7 +2000,7 @@ public final class EndpointDiscovery {
                     sendExercise(coll, b, "empty credentials");
                 }
             }
-        } catch (Throwable t) { api.logging().logToError("[AI Scanner] exerciseWrites: " + t); }
+        } catch (Throwable t) { scanLog.log("exerciseWrites: " + t); }
     }
 
     /** A GET whose JSON response discloses a challenge together with its answer (a self-defeating captcha). */
@@ -2056,7 +2077,7 @@ public final class EndpointDiscovery {
             HttpRequest w = withSessionCookie(HttpRequest.httpRequestFromUrl(coll).withMethod("POST")
                     .withAddedHeader("Content-Type", "application/json").withBody(body.toString()));
             int st = statusOf(probe(w));
-            scanLog.log("[AI Scanner]   exercise write [WRITE-tier] [" + what + "] POST " + Net.stripQuery(coll) + " -> HTTP " + st);
+            scanLog.log("  exercise write [WRITE-tier] [" + what + "] POST " + Net.stripQuery(coll) + " -> HTTP " + st);
         } catch (Exception ignore) { }
     }
 
@@ -2212,17 +2233,17 @@ public final class EndpointDiscovery {
                         || st == 400 || st == 401 || st == 403 || st == 422;
                 if (exists) {
                     out.add(req);
-                    scanLog.log("[AI Scanner] derived auth endpoint: POST " + Net.stripQuery(abs) + " → HTTP " + st);
+                    scanLog.log("derived auth endpoint: POST " + Net.stripQuery(abs) + " → HTTP " + st);
                 }
             }
             StringBuilder us = new StringBuilder();
             java.util.LinkedHashSet<String> uu = new java.util.LinkedHashSet<>();
             for (HttpRequest r : out) uu.add(Net.stripQuery(r.url()));
             for (String u : uu) { if (us.length() > 0) us.append(", "); us.append(u); if (us.length() > 400) { us.append("…"); break; } }
-            scanLog.log("[AI Scanner] auth discovery: " + out.size() + " candidate login request(s)"
+            scanLog.log("auth discovery: " + out.size() + " candidate login request(s)"
                     + (uu.isEmpty() ? "." : ": " + us));
         } catch (Throwable t) {
-            api.logging().logToError("[AI Scanner] auth discovery failed: " + t);
+            scanLog.log("auth discovery failed: " + t);
         }
         return out;
     }
@@ -2339,9 +2360,9 @@ public final class EndpointDiscovery {
         // page-method endpoints (e.g. RequestAccess) are exactly what the downstream verbose-error/SQLi probes need.
         StringBuilder fs = new StringBuilder();
         for (String p : found) { if (fs.length() > 0) fs.append(", "); fs.append(p); if (fs.length() > 500) { fs.append("…"); break; } }
-        scanLog.log("[AI Scanner] full-body API harvest: scanned " + scripts + " script(s), "
+        scanLog.log("full-body API harvest: scanned " + scripts + " script(s), "
                 + n + " new distinct API path(s)" + (found.isEmpty() ? "." : ": " + fs));
-        for (String p : found) scanLog.debug("[AI Scanner]   harvested endpoint: " + p);
+        for (String p : found) scanLog.debug("  harvested endpoint: " + p);
         return n;
     }
 
@@ -2379,11 +2400,11 @@ public final class EndpointDiscovery {
                 HttpRequestResponse rr = probe(post);
                 int st = statusOf(rr);
                 String vb = rr != null && rr.response() != null ? rr.response().bodyToString() : null;
-                scanLog.debug("[AI Scanner]   write-body POST " + path + " step " + i + " → HTTP " + st
+                scanLog.debug("  write-body POST " + path + " step " + i + " → HTTP " + st
                         + "  " + trunc(vb == null ? "" : vb.replaceAll("\\s+", " "), 140));
                 if (st >= 200 && st < 300) {
                     keep(rr, host);   // bridge for IdorGet/Bfla/ChainReplay/BodyMutator
-                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  POST " + Net.stripQuery(abs)
+                    scanLog.log("  -> LIVE " + st + "  POST " + Net.stripQuery(abs)
                             + "  [body reconstructed from server validation in " + i + " step(s)]");
                     return post;
                 }
@@ -2410,11 +2431,11 @@ public final class EndpointDiscovery {
             // (BlindSqli/BodyMutator/NoSql). A write that 500s on a NULL column still reaches the SQL string, so the
             // error-based SQLi oracle can fire on it — the RequestAccess SQLi a bodyless probe can never reach.
             if (bestSynth != null) {
-                scanLog.debug("[AI Scanner]   write-body: no 2xx for " + path
+                scanLog.debug("  write-body: no 2xx for " + path
                         + " — feeding best-effort synthesized POST (JSON field present) to the fuzzers.");
                 return bestSynth;
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner]   write-body resolve error: " + t); }
+        } catch (Throwable t) { scanLog.debug("  write-body resolve error: " + t); }
         return null;
     }
 
@@ -2437,7 +2458,7 @@ public final class EndpointDiscovery {
                 int st = statusOf(rr);
                 if (st >= 200 && st < 300 && !isHtmlShell(rr)) {
                     keep(rr, host);
-                    scanLog.log("[AI Scanner]   -> LIVE " + st + "  GET " + Net.stripQuery(candidate) + "  [resolved under API base " + base + "]");
+                    scanLog.log("  -> LIVE " + st + "  GET " + Net.stripQuery(candidate) + "  [resolved under API base " + base + "]");
                     return get;
                 }
                 if (st == 405 || st == 400 || st == 422) {   // real route, needs POST/body → reconstruct
@@ -2445,7 +2466,7 @@ public final class EndpointDiscovery {
                     if (w != null) { live.add(w); return null; }
                 }
             }
-        } catch (Throwable t) { scanLog.debug("[AI Scanner]   base-resolve error: " + t); }
+        } catch (Throwable t) { scanLog.debug("  base-resolve error: " + t); }
         return null;
     }
 
@@ -2722,7 +2743,7 @@ public final class EndpointDiscovery {
             if (isHtml) {
                 int b0 = scriptRefs.size();
                 collectScriptRefs(raw, url, host, scriptRefs);   // note the page's own <script>/preload JS
-                scanLog.debug("[AI Scanner] mine-src " + url + " rawBytes=" + rb.length + " magic=" + magic
+                scanLog.debug("mine-src " + url + " rawBytes=" + rb.length + " magic=" + magic
                         + " afterLen=" + raw.length() + " hasScript=" + raw.contains("<script")
                         + " newRefs=" + (scriptRefs.size() - b0));
             }
@@ -2748,14 +2769,15 @@ public final class EndpointDiscovery {
                 if (!body.isBlank()) { js.add(new String[]{ su, body }); fetched++; }
             } catch (Exception ignore) { }
         }
-        scanLog.log("[AI Scanner] mining sources: " + html.size() + " html + " + js.size() + " js in site map; "
+        scanLog.log("mining sources: " + html.size() + " html + " + js.size() + " js in site map; "
                 + scriptRefs.size() + " referenced JS chunk(s), fetched " + fetched + " new.");
         // deepest paths first (authenticated app views before the public landing pages)
         html.sort((a, b) -> Integer.compare(pathDepth(b[0]), pathDepth(a[0])));
         List<String[]> out = new ArrayList<>();
         out.addAll(html);
         out.addAll(js);
-        return out.size() > MAX_SOURCES ? out.subList(0, MAX_SOURCES) : out;
+        int maxSrc = Tuning.maxSources();
+        return out.size() > maxSrc ? out.subList(0, maxSrc) : out;
     }
 
     /** Collect the same-host .js URLs a page references (script src / preload link href), resolved absolute. */
@@ -2826,6 +2848,20 @@ public final class EndpointDiscovery {
             }
         });
         return sb.length() == 0 ? "" : "  [" + sb + "]";
+    }
+    /** Stable content hash of a mined source (url + body) for the LLM dedup — a byte-identical body at the same URL
+     *  hashes identically (skip re-mining); a changed body (anon → authenticated) hashes differently (re-mine). */
+    private static String srcHash(String url, String body) {
+        String s = (url == null ? "" : url) + "\n" + (body == null ? "" : body);
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(s.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(d.length * 2);
+            for (byte b : d) sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+            return sb.toString();
+        } catch (Throwable t) {
+            return Integer.toHexString(s.hashCode());   // never on JDK17; safe fallback
+        }
     }
     private static String hostOf(String url) { return Net.authority(url); }
     private static int statusOf(HttpRequestResponse rr) {

@@ -52,7 +52,7 @@ public final class RepoFetcher {
         // nested source archive here — NOT only on the download path — so a raw URL handed straight to the
         // extension AND a local clone both get {README + code.zip}-style repos (e.g. vegabird/xvna) made analyzable.
         try { Path p = Paths.get(r); if (Files.isDirectory(p)) { extractNestedZips(p, log); return subDir(r, subpath, log); } } catch (Exception ignore) { }
-        if (!isRemote(r)) { log.log("[AI Scanner] source repo is neither a local directory nor a URL: " + r); return null; }
+        if (!isRemote(r)) { log.log("source repo is neither a local directory nor a URL: " + r); return null; }
         String cacheKey = subpath == null ? r : r + "#" + subpath;
         String cached = CACHE.get(cacheKey);
         if (cached != null) { try { if (Files.isDirectory(Paths.get(cached))) return cached; } catch (Exception ignore) { } }
@@ -70,16 +70,16 @@ public final class RepoFetcher {
         try {
             Path base = Paths.get(root);
             Path direct = base.resolve(subpath);
-            if (Files.isDirectory(direct)) { log.log("[AI Scanner] SAST scoped to subpath: " + subpath); return direct.toString(); }
+            if (Files.isDirectory(direct)) { log.log("SAST scoped to subpath: " + subpath); return direct.toString(); }
             try (var s = Files.list(base)) {   // zipball wrapper dir (e.g. globocom-secDevLabs-<sha>/)
                 for (Path child : (Iterable<Path>) s::iterator) {
                     if (!Files.isDirectory(child)) continue;
                     Path cand = child.resolve(subpath);
-                    if (Files.isDirectory(cand)) { log.log("[AI Scanner] SAST scoped to subpath: " + subpath); return cand.toString(); }
+                    if (Files.isDirectory(cand)) { log.log("SAST scoped to subpath: " + subpath); return cand.toString(); }
                 }
             }
-            log.log("[AI Scanner] [warn] SAST subpath not found (" + subpath + ") — analyzing full repo");
-        } catch (Exception e) { log.debug("[AI Scanner] subDir error: " + e); }
+            log.log("[warn] SAST subpath not found (" + subpath + ") — analyzing full repo");
+        } catch (Exception e) { log.debug("subDir error: " + e); }
         return root;
     }
 
@@ -92,18 +92,18 @@ public final class RepoFetcher {
             try {
                 byte[] zip = httpGet(zipUrl);
                 if (zip == null || zip.length < 64) continue;
-                log.log("[AI Scanner] fetched source archive over HTTP (no git): " + zipUrl + " (" + zip.length + " bytes)");
+                log.log("fetched source archive over HTTP (no git): " + zipUrl + " (" + zip.length + " bytes)");
                 Path dir = extract(zip);
                 extractNestedZips(dir, log);   // repos that ship source as a nested .zip (e.g. vegabird/xvna = README + xvna.zip)
                 long files;
                 try (var s = Files.walk(dir)) { files = s.filter(Files::isRegularFile).count(); }
-                log.log("[AI Scanner] extracted " + files + " file(s) → " + dir);
+                log.log("extracted " + files + " file(s) → " + dir);
                 return dir.toString();
             } catch (Exception e) {
-                log.debug("[AI Scanner] source archive attempt failed (" + zipUrl + "): " + e);
+                log.debug("source archive attempt failed (" + zipUrl + "): " + e);
             }
         }
-        log.log("[AI Scanner] could not fetch a source archive for " + url + " — only public GitHub/GitLab HTTP "
+        log.log("could not fetch a source archive for " + url + " — only public GitHub/GitLab HTTP "
                 + "archives are auto-fetched (for private/other repos set AISCANNER_GIT_TOKEN, or clone and "
                 + "associate a local path). Continuing black-box.");
         return null;
@@ -201,8 +201,8 @@ public final class RepoFetcher {
                 if (dest.startsWith(root) && zp.getParent() != null && zp.getParent().getFileName() != null
                         && zp.getParent().getFileName().toString().endsWith("-unzipped")) continue;  // don't recurse into our own output
                 int n = unzipInto(data, dest, root);
-                if (n > 0) log.log("[AI Scanner] SAST: extracted nested archive " + root.relativize(zp) + " → " + n + " file(s)");
-            } catch (Exception e) { log.debug("[AI Scanner] nested-zip extract failed for " + zp + ": " + e); }
+                if (n > 0) log.log("SAST: extracted nested archive " + root.relativize(zp) + " → " + n + " file(s)");
+            } catch (Exception e) { log.debug("nested-zip extract failed for " + zp + ": " + e); }
         }
     }
 
