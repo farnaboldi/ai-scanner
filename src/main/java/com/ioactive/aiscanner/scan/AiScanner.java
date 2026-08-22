@@ -13,12 +13,12 @@ import burp.api.montoya.scanner.AuditConfiguration;
 import burp.api.montoya.scanner.BuiltInAuditConfiguration;
 import burp.api.montoya.scanner.audit.Audit;
 import burp.api.montoya.scanner.audit.issues.AuditIssue;
-import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
 import com.ioactive.aiscanner.engine.AiEngine;
 import com.ioactive.aiscanner.scan.flow.FlowEngine;
 import com.ioactive.aiscanner.scan.flow.StepResult;
 import com.ioactive.aiscanner.scan.sast.AgenticSourceAnalyzer;
 import com.ioactive.aiscanner.scan.sast.CoarseSourceAnalyzer;
+import com.ioactive.aiscanner.scan.sast.PostmanParser;
 import com.ioactive.aiscanner.scan.sast.RepoFetcher;
 import com.ioactive.aiscanner.scan.sast.RouteHarvester;
 import com.ioactive.aiscanner.scan.sast.SourceAnalyzer;
@@ -52,7 +52,6 @@ public final class AiScanner {
 
     private final MontoyaApi api;
     private final Supplier<AiEngine> engine; // reserved for triage; not used for injection
-    private final ScanConfig config;
     private final ScanLog scanLog;
     private final SessionStore session;
     private final java.util.function.BooleanSupplier cancelled;  // true once the extension is unloaded
@@ -154,7 +153,6 @@ public final class AiScanner {
                      java.util.function.Function<String, String> repoResolver) {
         this.api = api;
         this.engine = engine;
-        this.config = config;
         this.scanLog = scanLog;
         this.session = session;
         this.cancelled = cancelled;
@@ -301,6 +299,14 @@ public final class AiScanner {
                     SourceFindings harvested = RouteHarvester.harvest(localRepo);
                     if (!harvested.isEmpty())
                         scanLog.log("SAST(routes): " + harvested.size() + " route/GraphQL directive(s) harvested from source.");
+                    // Postman collections shipped in the repo document routes + params (and payloads) a code-only
+                    // harvest can't see — the decisive surface for APIs that serve no live spec and answer a
+                    // catch-all 200. Merged as ordinary route hints (live-probed + oracle-gated like any other).
+                    SourceFindings postman = PostmanParser.parse(localRepo);
+                    if (!postman.isEmpty()) {
+                        scanLog.log("SAST(postman): " + postman.size() + " route(s) from Postman collection(s) in source.");
+                        harvested = SourceFindings.combine(harvested, postman);
+                    }
                     // Optional LLM pass (taint-aware sinks) layered on top when an engine is configured.
                     SourceFindings llm = SourceFindings.empty();
                     AiEngine sastEng = engine != null ? engine.get() : null;
@@ -316,6 +322,13 @@ public final class AiScanner {
                     }
                     hints0 = SourceFindings.combine(llm, harvested);
                     scanLog.log("source analysis total: " + hints0.size() + " directive(s).");
+                    // Auth-from-Postman: if the repo ships a Postman collection with a login request and we have no
+                    // session yet, bootstrap a token from it (reusing the spec-driven register→login flow). Decisive
+                    // for JSON APIs that serve no live spec — the whole authenticated surface is otherwise unreachable.
+                    if (session == null || !session.hasBearer()) {
+                        try { new EndpointDiscovery(api, engine, session, scanLog).acquireTokenFromPostman(localRepo, host); }
+                        catch (Throwable t) { scanLog.debug("postman auth bootstrap: " + t); }
+                    }
                 }
             } catch (Throwable t) {
                 scanLog.debug("source analysis skipped: " + t);
@@ -565,7 +578,17 @@ public final class AiScanner {
             scanLog.log("reflected-XSS probe: " + hits + " endpoint(s) with a breakout-confirmed reflected XSS.");
         });
 
-        // (reflected-XSS — WAF-evasion + context-aware breakout — is folded into the "rxss" action above.)
+        // Stored (second-order) XSS: create → view. A payload persisted by one request (a comment/review/profile
+        // field) and rendered UNENCODED on a DIFFERENT page is invisible to a stateless active audit — yet it is the
+        // higher-impact XSS class. We plant a unique executable marker in each writable param, then re-fetch the
+        // PRG/redirect target, the write URL, the site root and the crawled GET pages, and confirm the marker runs
+        // there. Zero-FP by construction (unique unguessable marker; raw-substring match, so an encoded reflection
+        // never counts). Generic — no per-app field/route knowledge.
+        attackActions.put("sxss", () -> {
+            String base = !targets.isEmpty() ? originOf(targets.get(0).url()) : siteMapOrigin(host);
+            int hits = new StoredXssProbe(api, scanLog).probe(base, targets, this::withSession);
+            scanLog.log("stored-XSS probe: " + hits + " endpoint(s) with a persisted, execution-confirmed stored XSS.");
+        });
 
         // Deterministic path-traversal oracle via path REFLECTION (generic; catches file-path params a JSON API
         // exposes with no /etc/passwd readback — the value flows into a server path echoed in an error, and a
@@ -824,6 +847,16 @@ public final class AiScanner {
         attackActions.put("cswsh", () -> {
             int hits = new WebSocketCswshProbe(api, scanLog).probe(this::withSession);
             scanLog.log("WebSocket CSWSH probe: " + hits + " socket(s) upgrade cross-origin with ambient cookies.");
+        });
+
+        // Injection fuzzing OVER WebSocket messages: apps that deliver their input through a WS (DVWS-style) hide
+        // their SQLi/XSS/SSTI/traversal/cmdi sinks from an HTTP audit — the input is a WS frame, not a param. This
+        // opens each mined ws:// endpoint and sends the SAME oracle seed set (VulnClasses) over the socket, applying
+        // the SAME deterministic verdicts to the reply. Complements cswsh (handshake flaw) with message-level bugs.
+        attackActions.put("wsfuzz", () -> {
+            String base = !targets.isEmpty() ? originOf(targets.get(0).url()) : siteMapOrigin(host);
+            int hits = new WsFuzzProbe(api, scanLog).probe(base, this::withSession);
+            scanLog.log("WebSocket fuzz probe: " + hits + " injection(s) confirmed over WebSocket message(s).");
         });
 
         // ③ Agentic multi-step flow-engine — the LLM plans the next request from each response (targeting only),
@@ -1482,7 +1515,13 @@ public final class AiScanner {
             // All header lines start with '#', which the harness metric() (^VULNERABILITY:/^HIGH /^MED ) ignores,
             // so scoring is unchanged; the e2e matrix can read '# time_seconds=' / '# severity ' for its table.
             java.util.List<String> out = new java.util.ArrayList<>(reportSummaryHeader());
-            out.addAll(scanLog.findingsReport());
+            // Show the severity at the END of each of OUR deterministic finding lines (native Burp lines already carry
+            // HIGH/MED as a PREFIX; ours started bare). Suffix — the line still begins with "VULNERABILITY:", so the
+            // e2e metric() parser (^VULNERABILITY:) is unaffected and nothing is repeated in the header.
+            for (String line : scanLog.findingsReport()) {
+                if (line != null && line.trim().startsWith("VULNERABILITY:")) out.add(line + "  [" + sevOf(line) + "]");
+                else out.add(line);
+            }
             java.nio.file.Files.write(java.nio.file.Path.of(path), out);
             scanLog.log("findings report written → " + path);
         } catch (Throwable t) {

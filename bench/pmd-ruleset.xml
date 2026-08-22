@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<ruleset name="ai-scanner"
+         xmlns="http://pmd.sourceforge.net/ruleset/2.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://pmd.sourceforge.net/ruleset/2.0.0 https://pmd.sourceforge.io/ruleset_2_0_0.xsd">
+    <description>ai-scanner</description>
+    <rule ref="rulesets/java/quickstart.xml">
+        <exclude name="ControlStatementBraces"/>
+        <exclude name="AvoidCatchingGenericException"/>
+        <exclude name="EmptyCatchBlock"/>
+        <exclude name="UseLocaleWithCaseConversions"/>
+        <exclude name="GuardLogStatement"/>
+        <exclude name="UnnecessaryFullyQualifiedName"/>
+        <exclude name="AssignmentInOperand"/>
+        <exclude name="AvoidUsingVolatile"/>
+        <exclude name="LooseCoupling"/>
+        <exclude name="OneDeclarationPerLine"/>
+        <exclude name="UnusedFormalParameter"/>
+        <exclude name="LiteralsFirstInComparisons"/>
+        <exclude name="AvoidReassigningParameters"/>
+        <exclude name="AvoidReassigningLoopVariables"/>
+        <exclude name="ForLoopCanBeForeach"/>
+        <exclude name="AvoidDuplicateLiterals"/>
+    </rule>
+</ruleset>

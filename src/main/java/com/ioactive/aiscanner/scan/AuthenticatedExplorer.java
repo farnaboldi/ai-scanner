@@ -478,7 +478,6 @@ public final class AuthenticatedExplorer {
                 int st = statusOf(rr);
                 if (st < 200 || st >= 400) continue;
                 api.siteMap().add(rr);
-                String fu = rr.request().url().toLowerCase();
                 scanLog.debug("  amd server-path: " + st + " " + rr.request().url());
                 fetchServerPaths(host, rr.request().url(), rr.response().bodyToString(), seen, depth + 1);
             }

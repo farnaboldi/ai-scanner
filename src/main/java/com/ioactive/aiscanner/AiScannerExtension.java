@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 661;
+    public static final int BUILD = 699;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -56,6 +56,9 @@ public class AiScannerExtension implements BurpExtension {
     /** The log mirror (Burp output + optional -Daiscanner.logFile) — promoted to a field so per-target
      *  {@link ScanLog}s built in {@link #launchParallel} share the same sink. Set in {@link #initialize}. */
     private volatile java.util.function.Consumer<String> logMirror;
+    /** Race-free guard: at most ONE on-demand "test &lt;module&gt;" run at a time (it sets a GLOBAL -Daiscanner.only
+     *  around a scan, so a concurrent run would corrupt that property AND double the target load). */
+    private final java.util.concurrent.atomic.AtomicBoolean onDemandModuleRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /** True once Burp has unloaded the extension — long-running loops check this to stop promptly. */
     public boolean isUnloaded() { return unloaded; }
@@ -165,6 +168,39 @@ public class AiScannerExtension implements BurpExtension {
         // Multi-target chat command: `scan URL1 (REPO1) and URL2 (REPO2)` → CONCURRENT DAST+SAST scans, one
         // per-target unit each. Fire-and-forget (Burp stays open); NEVER touches aiscanner.exitOnComplete.
         chat.setBatchScanHandler(pairs -> launchParallel(pairs, null, /*exitWhenDone=*/false));
+        // On-demand single-module "test <module>" from the Agent tab. TWO cases:
+        //   • A scan is ALREADY running → ENQUEUE the module into it (do NOT start a second scan). Ticking its
+        //     checkbox rewrites -Daiscanner.only, which the attack loop reads LIVE per phase, so the module runs when
+        //     the battery reaches its phase (if not already passed) and the status-bar denominator grows by one — no
+        //     re-crawl, no racing a second scan against a fragile target.
+        //   • No scan running → fresh re-scan restricted to that ONE probe (transient only=), reusing the warm site
+        //     map so discovery is fast. Race-free single-flight so a double "test" can't launch two.
+        chat.setModuleHandler(hostKey -> {
+            String host = hostKey[0], key = hostKey[1];
+            if (scanLog.isScanActive()) {   // ENQUEUE into the in-flight scan
+                boolean known = settingsTab.selectModuleBox(key);   // tick checkbox + rewrite only= (read live per phase)
+                String warn = scanLog.attackPhasePassed(key)
+                        ? " — WARNING: its phase may already have run this scan (queued anyway; it'll apply next scan)"
+                        : " — it'll run when the attack battery reaches that phase";
+                scanLog.log(known ? "[ai] queued '" + key + "' into the running scan's attack modules" + warn
+                                  : "[ai] unknown module '" + key + "' — not queued");
+                return;
+            }
+            // No scan running → fresh re-scan scoped to this ONE module (warm site map), race-free single-flight.
+            if (!onDemandModuleRunning.compareAndSet(false, true)) {
+                scanLog.log("[ai] on-demand module run ignored — one is already starting.");
+                return;
+            }
+            String prev = System.getProperty("aiscanner.only");
+            System.setProperty("aiscanner.only", key);
+            scanLog.log("[ai] on-demand module '" + key + "' on " + host + " (only=" + key + ", warm site map)");
+            try { menuProvider.startScanAndWait(host.matches("(?i)^https?://.*") ? host : "http://" + host + "/"); }
+            catch (Throwable t) { scanLog.log("[ai] on-demand module run error: " + t); }
+            finally {
+                if (prev == null) System.clearProperty("aiscanner.only"); else System.setProperty("aiscanner.only", prev);
+                onDemandModuleRunning.set(false);
+            }
+        });
         scanLog.enableChat(msg -> {
             scanLog.log("[you] " + msg);
             new Thread(() -> scanLog.log("[ai] " + chat.reply(msg)), "ais-chat").start();

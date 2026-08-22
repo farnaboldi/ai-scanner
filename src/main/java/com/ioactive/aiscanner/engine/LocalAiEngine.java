@@ -112,6 +112,14 @@ public final class LocalAiEngine extends PromptAiEngine {
                 // Transport failure (hard-deadline hit / HTTP 0 / connection reset under load) — retry ONCE with a
                 // fresh seed so a single blip doesn't silently drop a discovery/payload call. If the retry also
                 // fails it propagates to the outer catch and we return "" as before.
+                // SURFACE it: swallowing this used to make a stalled call invisible — a full hard-deadline burned
+                // with zero log output (and the stall watchdog blinded to the cause). Log the attempt + how long it
+                // took, so a multi-minute retry chain is never silent again.
+                long spent1 = System.currentTimeMillis() - t0;
+                logger.accept("llm transport failed after " + (spent1 / 1000) + "s"
+                        + (label == null || label.isBlank() ? "" : " <" + label + ">")
+                        + " (" + transport.getClass().getSimpleName()
+                        + (transport.getMessage() == null ? "" : ": " + transport.getMessage()) + ") — retrying once");
                 body.put("seed", SEED_SEQ.incrementAndGet());
                 raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
             }
@@ -121,20 +129,26 @@ public final class LocalAiEngine extends PromptAiEngine {
             // seed + a small temperature bump breaks the degenerate sample; the SAME exact request returns good content
             // on retry. Only when we asked for a real answer (non-empty prompt) and got nothing back.
             if (content.isBlank() && raw != null && !raw.isEmpty() && userPrompt != null && !userPrompt.isBlank()) {
+                if (LogLevel.debug()) logger.accept("llm empty reply"
+                        + (label == null || label.isBlank() ? "" : " <" + label + ">")
+                        + " seed=" + seed + " — retrying once with fresh seed + temp bump");
                 body.put("seed", SEED_SEQ.incrementAndGet());
                 body.put("temperature", Math.min(1.0, cfg.temperature + 0.3));
                 String raw2 = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
                 String c2 = extractContent(raw2);
                 if (!c2.isBlank()) { raw = raw2; content = c2; }
             }
-            LlmTiming.record(System.currentTimeMillis() - t0);   // benchmark speed column: time WAITING on the model
+            long ms = System.currentTimeMillis() - t0;
+            LlmTiming.record(ms);   // benchmark speed column: time WAITING on the model
             // Targeted per-call DEBUG (metadata only — NOT the request/response bodies, which are noise): seed +
-            // sizes, so an empty/degenerate reply (the "round 2 parsed 0" mystery) is visible as resp=0 (transport
-            // returned nothing) vs resp=NNN content=0 (a real reply we failed to parse). On with -Daiscanner.debug.
+            // DURATION + sizes, so an empty/degenerate reply (the "round 2 parsed 0" mystery) is visible as resp=0
+            // (transport returned nothing) vs resp=NNN content=0 (a real reply we failed to parse), AND a slow call
+            // is visible as its wall-clock ms (a 17-min discovery stall was invisible without this). -Daiscanner.debug.
             if (LogLevel.debug()) logger.accept("llm-call "
                     + (label == null || label.isBlank() ? "" : "<" + label + "> ") + "seed=" + seed
                     + " req=" + (userPrompt == null ? 0 : userPrompt.length()) + "ch"
                     + " -> resp=" + (raw == null ? 0 : raw.length()) + "ch content=" + content.length() + "ch"
+                    + " in " + ms + "ms"
                     + (raw == null || raw.isEmpty() ? "  [EMPTY TRANSPORT REPLY]" : ""));
             if (LogLevel.trace()) {   // TRACE: dump the full response body (so a parse-to-0 reply can be read)
                 String c = content.replaceAll("\\s+", " ").trim();

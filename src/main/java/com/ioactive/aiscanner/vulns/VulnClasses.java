@@ -21,8 +21,14 @@ public final class VulnClasses {
     private VulnClasses() { }
 
     public static List<VulnClass> all() {
-        return List.of(sqlInjection(), reflectedXss(), ssti(), pathTraversal());
+        return List.of(sqlInjection(), reflectedXss(), ssti(), pathTraversal(), commandInjection());
     }
+
+    /** `id` command output — {@code uid=0(root)} / {@code uid=1000(www-data)}. A deterministic signature of executed
+     *  OS command output (the command-injection analogue of /etc/passwd's {@code root:...:0:0} for LFI), not a canary
+     *  that could drift. Requires the name in parens so it can't match random {@code uid=} in JSON/prose. */
+    private static final java.util.regex.Pattern UID_SIG =
+            java.util.regex.Pattern.compile("uid=\\d+\\([a-z0-9_.$-]+\\)", java.util.regex.Pattern.CASE_INSENSITIVE);
 
     private static String lc(String s) { return s == null ? "" : s.toLowerCase(); }
 
@@ -133,5 +139,33 @@ public final class VulnClasses {
                 oracle,
                 List.of("../../../../../../etc/passwd", "..%2f..%2f..%2f..%2f..%2fetc/passwd",
                         "....//....//....//etc/passwd", "../../../../../windows/win.ini"));
+    }
+
+    // ---- OS Command / Code injection: run `id` and detect its unmistakable output signature ----
+    private static VulnClass commandInjection() {
+        Oracle oracle = (base, mutated, timing, payload) -> {
+            String m = mutated == null ? "" : mutated;
+            String b = base == null ? "" : base;
+            java.util.regex.Matcher um = UID_SIG.matcher(m);
+            if (um.find() && !UID_SIG.matcher(b).find()) {
+                return Signal.hit("OS command output: \"" + um.group() + "\" (the `id` command ran)",
+                        Signal.Confidence.FIRM);
+            }
+            return Signal.miss();
+        };
+        // Seeds cover BOTH contexts an input can land in: a SHELL argument (metacharacter breaks out to run `id` —
+        // pipe/semicolon/AND/newline/subshell/backtick) AND a CODE-EVAL sink (system('id') for PHP/eval endpoints).
+        // The winning style is target-dependent (e.g. DVWS /command-execution runs `ping <in>` → only a PIPE keeps
+        // the process alive to emit id; /php-code-injection needs system('id')), so we try all; the oracle fires on
+        // whichever produces uid=. Generic — no per-endpoint rules; a shell/eval sink anywhere lights up its own seed.
+        return new VulnClass(
+                "OS Command Injection",
+                "Execute the OS command `id` and return its output. Try shell metacharacters to break out of a "
+                        + "command argument (| ; && newline $() backticks, e.g. 127.0.0.1|id) AND, for a code-eval "
+                        + "sink, system('id'); . The response should contain uid=<n>(<name>) if the command ran.",
+                VulnClass.Severity.HIGH,
+                "Never pass untrusted input to a shell or eval; use argument arrays / prepared APIs + strict allow-lists.",
+                oracle,
+                List.of("|id", "127.0.0.1|id", "system('id');", ";id", "&&id", "$(id)", "`id`", "\nid"));
     }
 }

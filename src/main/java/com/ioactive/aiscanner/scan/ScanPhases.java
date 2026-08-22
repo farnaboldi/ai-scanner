@@ -56,6 +56,7 @@ public final class ScanPhases {
         atk("oauth",      "OAuth-logic",                       "oauth-logic"),
         atk("sqli",       "Blind SQLi",                        "blind sqli"),
         atk("rxss",       "Reflected-XSS (breakout + WAF-evasion)", "reflected-xss"),
+        atk("sxss",       "Stored-XSS (create→view)",          "stored-xss"),
         atk("pathtrav",   "Path-reflection",                   "path reflection"),
         atk("nosql",      "NoSQL injection",                   "nosql"),
         atk("cmdi",       "Command injection",                 "command injection"),
@@ -82,6 +83,7 @@ public final class ScanPhases {
         atk("log4shell",  "Log4Shell / JNDI (OOB)",            "log4shell"),
         atk("tamper",     "Restriction-bypass / tampering",    "tampering"),
         atk("cswsh",      "WebSocket CSWSH (cross-site hijack)", "websocket cswsh"),
+        atk("wsfuzz",     "WebSocket message fuzzing (SQLi/XSS/SSTI/…)", "websocket fuzz"),
         atk("flow",       "Flow-engine (LLM, multi-step)",     "flow-engine"),
         // ---- post-attack lifecycle ----
         post("Audit login/signin pages (separate pass)", "auditing login"),

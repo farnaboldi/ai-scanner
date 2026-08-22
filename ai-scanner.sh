@@ -177,7 +177,11 @@ fi
 # verification, and signing-function location all no-op) — so fail fast HERE instead of discovering it from
 # the /log tab mid-run. A real chat round-trip is used (not just /models) so a wrong/missing API key is caught
 # too. Only enforced for the local-LLM provider; override with AISCANNER_SKIP_LLM_CHECK=1.
-if [ "${AISCANNER_PROVIDER:-LOCAL_LLM}" = "LOCAL_LLM" ] && [ "${AISCANNER_SKIP_LLM_CHECK:-0}" != "1" ]; then
+# NO-AI mode (AISCANNER_NO_AI=1) is deterministic-only — no LLM is called during the scan — so skip the
+# preflight entirely (otherwise a self-contained no-LLM run still refuses to launch without a live endpoint).
+case "${AISCANNER_NO_AI:-}" in ""|false|0|no|off) _NO_AI=0;; *) _NO_AI=1;; esac
+if [ "$_NO_AI" = 1 ]; then echo "preflight: NO-AI mode (AISCANNER_NO_AI) — deterministic-only, skipping LLM check."; fi
+if [ "$_NO_AI" != 1 ] && [ "${AISCANNER_PROVIDER:-LOCAL_LLM}" = "LOCAL_LLM" ] && [ "${AISCANNER_SKIP_LLM_CHECK:-0}" != "1" ]; then
   echo "preflight: testing LLM ${BASE_URL%/}/chat/completions (model=$MODEL)…"
   # Retry a transient endpoint blip (e.g. an ngrok tunnel dropping for a minute) instead of aborting the whole
   # scan → 0. Auth failures (401/403) are NOT retried (a key won't appear by waiting). Tunable via env.

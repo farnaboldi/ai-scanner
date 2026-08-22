@@ -34,6 +34,46 @@ public final class ChatAssistant {
     private volatile java.util.function.Consumer<java.util.List<String[]>> batchScanHandler;
     public void setBatchScanHandler(java.util.function.Consumer<java.util.List<String[]>> h) { this.batchScanHandler = h; }
 
+    /** Wired by the extension: run ONE probe module on demand against an ALREADY-scanned host, reusing the warm
+     *  site map (no re-crawl). String[] = {host, moduleKey}. Null → on-demand module run unavailable. */
+    private volatile java.util.function.Consumer<String[]> moduleHandler;
+    public void setModuleHandler(java.util.function.Consumer<String[]> h) { this.moduleHandler = h; }
+
+    /** On-demand single-module command: "test|run|probe|fuzz <module> [rest…]" (e.g. "test SQLi on the current
+     *  scan"). Group 2 is the module alias; a URL after the verb (a scan intent) is NOT matched (no bare word). */
+    private static final java.util.regex.Pattern MODULE_CMD = java.util.regex.Pattern.compile(
+            "(?i)^\\s*(?:test|run|probe|fuzz)\\s+([a-z0-9][a-z0-9_-]*)\\b.*$");
+
+    /** Resolve a loose module alias to a ScanPhases attack-module key. The set of VALID keys is read from
+     *  {@link com.ioactive.aiscanner.scan.ScanPhases#attackModules()} — the SINGLE registry — so a newly added
+     *  module (e.g. {@code wsfuzz}) is reachable here automatically with no edit and can never drift. We only map
+     *  spoken SYNONYMS that differ from the canonical key; the exact key is then confirmed against the registry.
+     *  Null if it isn't a known module. */
+    private static String resolveModuleKey(String alias) {
+        if (alias == null || alias.isBlank()) return null;
+        String x = alias.toLowerCase().replaceAll("[^a-z0-9]", "");
+        switch (x) {   // spoken synonym → canonical key (ONLY where the word differs from the ScanPhases key)
+            case "sql": case "sqlinjection":                 x = "sqli"; break;
+            case "xss": case "reflectedxss":                 x = "rxss"; break;
+            case "storedxss":                                x = "sxss"; break;
+            case "bola": case "idorget":                     x = "idor"; break;
+            case "massassignment":                           x = "massassign"; break;
+            case "rce": case "command": case "commandinjection": x = "cmdi"; break;
+            case "template": case "templateinjection":       x = "ssti"; break;
+            case "jndi": case "log4j":                       x = "log4shell"; break;
+            case "websocket": case "ws":                     x = "cswsh"; break;
+            case "websocketfuzz": case "wsfuzzing": case "wsinjection": x = "wsfuzz"; break;
+            case "xml":                                      x = "xxe"; break;
+            case "deserialization":                          x = "deser"; break;
+            case "pathtraversal": case "traversal": case "fileinclusion": x = "lfi"; break;
+            case "openredirect":                             x = "redirect"; break;
+            default: break;
+        }
+        for (com.ioactive.aiscanner.scan.ScanPhases.Phase p : com.ioactive.aiscanner.scan.ScanPhases.attackModules())
+            if (p.key.equalsIgnoreCase(x)) return p.key;   // authoritative: keys come from the ONE registry
+        return null;
+    }
+
     /** Matches "scan / escanea / audit / crawl / test" followed by a URL or bare hostname. */
     private static final java.util.regex.Pattern SCAN_CMD = java.util.regex.Pattern.compile(
             "(?i)^\\s*(?:scan|escanea|audit(?:ar)?|crawl|test)\\s+(https?://\\S+|[\\w.-]+\\.[a-z]{2,}(?:/\\S*)?)\\s*$");
@@ -120,6 +160,31 @@ public final class ChatAssistant {
             history.add("User: " + userMsg);
             history.add("Assistant: " + reply);
             return reply;
+        }
+        // --- on-demand single-module run against an already-scanned host (reuses the warm site map) ---
+        java.util.regex.Matcher mod = MODULE_CMD.matcher(userMsg.trim());
+        if (mod.matches()) {
+            String key = resolveModuleKey(mod.group(1));
+            if (key != null) {   // a known module — otherwise fall through (it was ordinary chat/scan text)
+                java.util.function.Consumer<String[]> mh = moduleHandler;
+                if (mh == null) return "(on-demand module run not available)";
+                Set<String> hosts = scope.hosts();
+                if (hosts.isEmpty()) return "(nothing scanned yet — scan a host first, then 'test " + key + "')";
+                final String host = hosts.iterator().next();   // the scanned host (reuse its discovered surface)
+                // A scan already running → the handler ENQUEUES the module into it (ticks the checkbox, rewrites the
+                // live only= filter, status bar +1) instead of starting a second scan. No scan → fresh scoped re-scan.
+                boolean live = scanLog.isScanActive();
+                new Thread(() -> mh.accept(new String[]{ host, key }), "chat-module").start();
+                String reply = live
+                        ? "Queued '" + key + "' into the running scan's attack modules — it'll run when the battery "
+                          + "reaches that phase (if it hasn't passed it yet). The Modules checkbox ticks and the "
+                          + "status-bar phase count goes +1; no second scan is started."
+                        : "Running the '" + key + "' module on " + host + " — reusing the discovered surface "
+                          + "(no re-crawl). Watch the log tab for findings.";
+                history.add("User: " + userMsg);
+                history.add("Assistant: " + reply);
+                return reply;
+            }
         }
         AiEngine e = engine.get();
         if (e == null || !e.isConfigured())

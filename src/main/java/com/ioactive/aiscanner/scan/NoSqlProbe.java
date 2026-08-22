@@ -12,7 +12,6 @@ import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.net.URI;
-import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
