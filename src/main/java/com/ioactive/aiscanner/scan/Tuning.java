@@ -24,6 +24,11 @@ public final class Tuning {
     public static int maxSources()    { return i("aiscanner.maxSources",    "AISCANNER_MAX_SOURCES",    40,  5,  300); }
     /** Max ~30k-char chunks fed to the LLM per discovery round. */
     public static int maxLlmChunks()  { return i("aiscanner.maxLlmChunks",  "AISCANNER_MAX_LLM_CHUNKS",  8,  1,   40); }
+    /** HARD cap on LLM discovery calls summed across ALL re-entries in ONE scan (crawl→discovery→re-crawl→discovery…).
+     *  Without it a re-crawl-heavy target re-mines each pass (rounds × chunks) → ~100 calls, pinning the scan in
+     *  discovery for tens of minutes before the attack battery ever runs. The deterministic regex + /api/vN/ harvest
+     *  floor still runs every pass (free), so bounding only the LLM pass never loses that coverage. */
+    public static int maxLlmDiscoveryCalls() { return i("aiscanner.maxLlmDiscoveryCalls", "AISCANNER_MAX_LLM_DISCOVERY_CALLS", 32, 1, 500); }
     /** Max candidate endpoints probed (the deterministic probe budget). */
     public static int maxCandidates() { return i("aiscanner.maxCandidates","AISCANNER_MAX_CANDIDATES", 200, 10, 2000); }
 

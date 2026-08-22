@@ -31,6 +31,11 @@ public final class MontoyaLlmHttp implements LlmHttp {
     // this deadline so the caller ALWAYS unblocks. Override with -Daiscanner.llmHardDeadlineMs.
     private static final long HARD_DEADLINE_MS = Long.getLong("aiscanner.llmHardDeadlineMs", 180_000L);
     private static final long RESP_TIMEOUT_MS = Long.getLong("aiscanner.llmResponseTimeoutMs", 120_000L);
+    // ABSOLUTE ceiling on the per-call deadline AFTER the ×parallelism scaling. Without it, N concurrent scans push the
+    // hard deadline to 180s×N (observed 15 min at N≈5), so a single stalled response can pin the whole scan for a
+    // quarter hour before the watchdog even notices. A genuine discovery call is 2–25s even at 5×, so capping at 5 min
+    // only ever kills a truly stuck call. Override with -Daiscanner.llmHardDeadlineCapMs.
+    private static final long HARD_DEADLINE_CAP_MS = Long.getLong("aiscanner.llmHardDeadlineCapMs", 300_000L);
     // LIVE count of scans hitting the LLM concurrently — each scan increments on start / decrements on end
     // (AiContextMenuProvider.crawlAndScan), so it stays correct even when scans are ADDED at will (an Agent-tab
     // command launching more targets into a running Burp). N concurrent scans share ONE local model → each call waits
@@ -62,8 +67,11 @@ public final class MontoyaLlmHttp implements LlmHttp {
             }
         }
         int par = Math.max(1, PARALLELISM.get());   // scale timeouts by the number of concurrent scans sharing the model
-        RequestOptions opts = RequestOptions.requestOptions().withResponseTimeout(RESP_TIMEOUT_MS * par);
-        long hardDeadline = HARD_DEADLINE_MS * par;
+        // Scale by concurrency BUT clamp to an absolute ceiling — a leaked/high `par` must not let one stalled call
+        // block the scan for a quarter hour (see HARD_DEADLINE_CAP_MS). Response timeout tracks the same cap.
+        long hardDeadline = Math.min(HARD_DEADLINE_MS * par, HARD_DEADLINE_CAP_MS);
+        RequestOptions opts = RequestOptions.requestOptions()
+                .withResponseTimeout(Math.min(RESP_TIMEOUT_MS * par, HARD_DEADLINE_CAP_MS));
         // Enforce the HARD deadline: run on a daemon thread, abandon it (best-effort cancel) if it exceeds the bound.
         // Montoya's own timeout can't be trusted for a stalled body, so this is the real guarantee the scan proceeds.
         final HttpRequest fReq = req;

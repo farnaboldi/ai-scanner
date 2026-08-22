@@ -26,6 +26,75 @@ public final class IssueLibrary {
     public static Info describe(String vulnClass) {
         String v = vulnClass == null ? "" : vulnClass.toLowerCase();
 
+        // --- Log4Shell / JNDI injection (CVE-2021-44228, CWE-917) — unauthenticated RCE. Matched first so it
+        //     never falls through to the generic MEDIUM default: an OAST-proven remote-code-execution class is
+        //     the highest severity Burp exposes, not a mid-tier finding. ---
+        if (v.contains("log4shell") || v.contains("jndi"))
+            return new Info(HIGH,
+                "<p>A request header (or parameter) whose value the application passes to a logging call is "
+                + "interpreted by a vulnerable Apache Log4j2 as a lookup expression. A "
+                + "<code>${jndi:ldap://&hellip;}</code> payload made the server perform an attacker-controlled "
+                + "JNDI/LDAP resolution, confirmed out-of-band by a DNS/LDAP callback to a unique Burp Collaborator "
+                + "host (CVE-2021-44228, &ldquo;Log4Shell&rdquo;; CWE-917: Expression Language Injection). On "
+                + "affected Log4j2 versions this JNDI resolution loads and executes a remote class, yielding "
+                + "<b>unauthenticated remote code execution</b> in the application's context. Because the sink is a "
+                + "log statement, the payload reaches it regardless of route or authentication, so any logged, "
+                + "request-controlled value is exploitable.</p>",
+                "<p>Upgrade Apache Log4j2 to 2.17.1+ (2.3.2 for Java 7; 2.12.4 for Java 8 on the 2.12 line). As "
+                + "interim mitigations remove the <code>JndiLookup</code> class from the classpath "
+                + "(<code>zip -q -d log4j-core-*.jar org/apache/logging/log4j/core/lookup/JndiLookup.class</code>) "
+                + "&mdash; flag-based mitigations such as <code>log4j2.formatMsgNoLookups=true</code> are incomplete "
+                + "on older 2.x. Additionally restrict outbound egress from application servers and avoid logging "
+                + "untrusted input verbatim.</p>");
+
+        // --- Cross-site scripting (CWE-79). Stored/second-order is the higher-impact case (runs for every viewer);
+        //     rated HIGH to match Burp's own XSS severity. Matched before the generic MEDIUM default. ---
+        if (v.contains("cross-site scripting") || v.contains("xss"))
+            return new Info(HIGH,
+                "<p>User-controlled input is placed into an HTML response WITHOUT output encoding, so an injected "
+                + "<code>&lt;svg onload=&hellip;&gt;</code>/<code>&lt;script&gt;</code> executes in the victim's "
+                + "browser (CWE-79). When the payload is persisted by one request and rendered on a later page seen by "
+                + "other users (stored/second-order XSS), every viewer runs the attacker's script &mdash; enabling "
+                + "session/cookie theft, request forgery in the victim's authenticated context, credential capture and "
+                + "full account takeover.</p>",
+                "<p>Contextually output-encode every piece of untrusted data at the point it is written to the page "
+                + "(HTML-entity-encode for element/attribute text; the framework's auto-encoding output, e.g. Razor "
+                + "<code>@value</code>, must NOT be bypassed with <code>Html.Raw</code>/<code>MvcHtmlString</code>). "
+                + "Add a restrictive Content-Security-Policy as defense-in-depth, and validate/allow-list input where a "
+                + "fixed format is expected.</p>");
+
+        // --- OS command / code injection (CWE-78 / CWE-94) — the input reaches a shell or an eval() sink and the
+        //     scanner proved arbitrary execution by running `id` (uid=... in the reply). That is remote code
+        //     execution, the highest-impact class, so HIGH — never the generic MEDIUM default. ---
+        if (v.contains("command injection") || v.contains("os command") || v.contains("code injection"))
+            return new Info(HIGH,
+                "<p>User-controlled input is passed to an operating-system shell or a code-evaluation sink "
+                + "(<code>system</code>/<code>exec</code>/<code>eval</code>/backticks) without neutralisation, so an "
+                + "injected command executes on the server with the application's privileges (CWE-78 OS Command "
+                + "Injection / CWE-94 Code Injection). The scanner confirmed execution deterministically by running "
+                + "<code>id</code> and observing its <code>uid=&hellip;(&hellip;)</code> output in the response &mdash; "
+                + "i.e. arbitrary remote code execution: full read/write of server data, lateral movement and host "
+                + "takeover.</p>",
+                "<p>Never build a shell command or evaluate code from untrusted input. Call programs via an argument "
+                + "array (no shell), e.g. <code>execve</code>/<code>ProcessBuilder</code> with separate args; remove "
+                + "<code>eval</code>/<code>system</code> on user data entirely. Where an external command is truly "
+                + "required, strictly allow-list the permitted values and reject everything else.</p>");
+
+        // --- Server-Side Template Injection (CWE-1336 / CWE-94) — untrusted input evaluated by a template engine,
+        //     which is server-side code execution (arithmetic marker evaluated = the engine ran attacker input; the
+        //     step from there to RCE is small and engine-specific). Rated HIGH to match VulnClasses.ssti()'s own
+        //     Severity.HIGH — the describe() default of MEDIUM under-rated it. ---
+        if (v.contains("template injection") || v.contains("ssti"))
+            return new Info(HIGH,
+                "<p>User-controlled input is evaluated by a server-side template engine (CWE-1336 / CWE-94). The "
+                + "scanner confirmed evaluation by injecting an arithmetic marker (e.g. <code>{{1337*1337}}</code>) and "
+                + "observing the computed product in the response &mdash; i.e. the engine executed attacker input. "
+                + "Depending on the engine this escalates to reading server data, SSRF, or full remote code "
+                + "execution.</p>",
+                "<p>Never build templates from untrusted input. Pass user data only as bound template <em>variables</em> "
+                + "(logic-less rendering), use a sandboxed engine, and validate/allow-list where a fixed format is "
+                + "expected.</p>");
+
         // --- SAML SSO (matched before the generic branches; each class name starts with "SAML …") ---
         if (v.contains("saml") && v.contains("test certificate"))
             return new Info(HIGH,

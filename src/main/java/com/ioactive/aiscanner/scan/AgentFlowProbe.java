@@ -385,12 +385,6 @@ public final class AgentFlowProbe {
         return null;
     }
 
-    private boolean raise(String host, String vulnClass, String detail, HttpRequestResponse... evidence) {
-        scanLog.found(vulnClass, "https://" + host + "/", detail, evidence);
-        scanLog.incFinding();
-        return true;
-    }
-
     private static String hostOf(String url) { return Net.authority(url); }
 
     private static String pathOnly(String url) {

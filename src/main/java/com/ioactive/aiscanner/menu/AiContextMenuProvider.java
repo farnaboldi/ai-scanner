@@ -9,7 +9,6 @@ import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.Cookie;
 import burp.api.montoya.http.message.params.ParsedHttpParameter;
 import burp.api.montoya.http.message.requests.HttpRequest;
-import burp.api.montoya.scanner.audit.issues.AuditIssue;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import com.ioactive.aiscanner.scan.AiScanner;
@@ -605,6 +604,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                         + com.ioactive.aiscanner.AiScannerExtension.BUILD + ") ===");
                 com.ioactive.aiscanner.engine.LlmTiming.reset();   // per-scan LLM latency for the benchmark speed column
                 com.ioactive.aiscanner.engine.LocalAiEngine.resetSeed();   // per-scan deterministic seed sequence (reproducible + cache-proof)
+                com.ioactive.aiscanner.scan.EndpointDiscovery.resetScanBudget();   // per-scan LLM discovery-call ceiling → discovery can't grind ~100 calls across re-crawls and stall before the attack battery
                 // Record the exact LLM sampling config in EVERY run (GUI or headless) — temperature drives the
                 // discovery variance, so it must be visible in the log/report without needing -D launch flags.
                 {
@@ -1100,8 +1100,6 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
 
             HttpRequestResponse bad = tryLogin(base, userParam, "zzinvalid_ai_x", passParam, "zzinvalid_ai_x");
             int badStatus = status(bad);
-            int badLen = bodyLen(bad);
-            Set<String> badCookies = cookieNames(bad);
 
             // GATE: only brute an endpoint that actually BEHAVES like a login. A real login rejects invalid creds
             // with a credential error (400/401/403/200/302); a 404/405/415/501 (e.g. nginx "Method Not Allowed")

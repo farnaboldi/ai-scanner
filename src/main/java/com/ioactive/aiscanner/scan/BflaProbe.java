@@ -5,7 +5,6 @@ import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
-import org.json.JSONObject;
 
 import java.net.URI;
 import java.util.ArrayList;
@@ -128,7 +127,7 @@ public final class BflaProbe {
                 int s3 = status(r3);
                 if (s3 < 200 || s3 >= 300) continue;                             // must actually REACH the function (2xx)
                 HttpRequestResponse ctrl = send("GET", c.base + c.controlPath(), cookie, bearer);
-                if (status(ctrl) == 0 || shape(r3).equals(shape(ctrl))) continue;// junk noun → route doesn't exist
+                if (status(ctrl) == 0 || Net.shape(r3).equals(Net.shape(ctrl))) continue;// junk noun → route doesn't exist
                 scanLog.found("Broken Function Level Authorization (BFLA)", u,
                         "GET reached the privileged-role function '" + segs[roleIdx] + "/" + segs[nounIdx]
                         + "' as a non-privileged user. Evidence req/resp: [1] our-session=" + s3
@@ -211,7 +210,7 @@ public final class BflaProbe {
         if (s3 == 0 || s3 == 401 || s3 == 403) return false;                       // secured (403) / denied → correct
         HttpRequestResponse ctrl = send(method, c.base + c.controlPath(), cookie, bearer);
         if (status(ctrl) == 0) return false;
-        if (shape(r3).equals(shape(ctrl))) return false;                           // route-not-found → doesn't exist
+        if (Net.shape(r3).equals(Net.shape(ctrl))) return false;                           // route-not-found → doesn't exist
         scanLog.found("Broken Function Level Authorization (BFLA)", url,
                 method + " reached an admin-tier function as a non-privileged user. Evidence req/resp: "
                         + "[1] our-session=" + s3 + " (reached the function), [2] no-session=" + s2
@@ -219,33 +218,6 @@ public final class BflaProbe {
                 r3, r2, ctrl);
         scanLog.incFinding();
         return true;
-    }
-
-    /** Response SHAPE = status + sorted top-level JSON keys (value/order-insensitive), or a path-stripped
-     *  token signature for non-JSON — so a real handler's response is distinguishable from route-not-found
-     *  without any framework-specific strings, and reorder noise can't move it. */
-    private static String shape(HttpRequestResponse rr) {
-        if (rr == null || rr.response() == null) return "none";
-        int st = rr.response().statusCode();
-        String body = rr.response().bodyToString();
-        if (body != null) {
-            String t = body.trim();
-            if (t.startsWith("{")) {
-                try {
-                    JSONObject o = new JSONObject(t);
-                    String[] keys = o.keySet().toArray(new String[0]);
-                    Arrays.sort(keys);
-                    return st + ":keys:" + String.join(",", keys);
-                } catch (Throwable ignore) { /* fall through */ }
-            }
-        }
-        String norm = (body == null ? "" : body)
-                .replaceAll("\\d+", "#")
-                .replaceAll("(?i)[a-z0-9/_.-]{16,}", " ")   // drop long path/id-ish tokens (incl. the echoed URL)
-                .replaceAll("\\s+", " ").trim();
-        String[] toks = norm.split(" ");
-        Arrays.sort(toks);
-        return st + ":body:" + String.join(" ", toks);
     }
 
     private HttpRequestResponse send(String method, String url, String cookie, String bearer) {

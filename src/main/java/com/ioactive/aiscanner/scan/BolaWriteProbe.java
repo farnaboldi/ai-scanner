@@ -116,13 +116,11 @@ public final class BolaWriteProbe {
                     // WRITE our marker into the victim's sub-resource with OUR session
                     HttpRequestResponse wr = send(HttpRequest.httpRequestFromUrl(writeUrl).withMethod(method)
                             .withBody("{\"" + field + "\":\"" + marker + "\"}").withHeader("Content-Type", "application/json"), cookie, bearer);
-                    boolean landed = false;
                     if (wr != null && wr.response() != null && wr.response().statusCode() < 400) {
                         // READ BACK: did our marker land on the victim's object?
                         HttpRequestResponse after = send(HttpRequest.httpRequestFromUrl(objUrl).withMethod("GET"), cookie, bearer);
                         if (after != null && after.response() != null && after.response().statusCode() == 200
                                 && after.response().bodyToString() != null && after.response().bodyToString().contains(marker)) {
-                            landed = true;
                             landedVictims.add(victim);
                             if (firstEvidence == null) firstEvidence = new HttpRequestResponse[]{ wr, after };
                             // SECOND-IDENTITY witness: read the victim's object back AS B. If a genuinely different

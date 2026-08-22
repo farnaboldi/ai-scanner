@@ -5,9 +5,7 @@ import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
-import org.json.JSONObject;
 
-import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -90,7 +88,7 @@ public final class UnauthAccessProbe {
                 if (ar == null || ar.response() == null) continue;
                 int anonSt = ar.response().statusCode();
                 if (anonSt < 200 || anonSt >= 300) continue;                                // properly denied → correct
-                if (shape(rr).equals(shape(ar))) {
+                if (Net.shape(rr).equals(Net.shape(ar))) {
                     // Pinpoint WHICH secret + WHERE: name+redact it in the detail and HIGHLIGHT its bytes in the
                     // response (a Burp response Marker) so the analyst sees it in a big body (e.g. /openapi.json).
                     Secret sec = findSecret(ar.response().bodyToString());
@@ -164,32 +162,6 @@ public final class UnauthAccessProbe {
             if (Character.isDigit(c)) d = true; else if (Character.isLetter(c)) a = true;
         }
         return d && a && !v.contains(" ");
-    }
-
-    /** status + sorted top-level JSON keys (value/order-insensitive), or a path-stripped token signature for
-     *  non-JSON — same shape function BflaProbe uses so reorder/value noise can't move it. */
-    private static String shape(HttpRequestResponse rr) {
-        if (rr == null || rr.response() == null) return "none";
-        int st = rr.response().statusCode();
-        String body = rr.response().bodyToString();
-        if (body != null) {
-            String t = body.trim();
-            if (t.startsWith("{")) {
-                try {
-                    JSONObject o = new JSONObject(t);
-                    String[] keys = o.keySet().toArray(new String[0]);
-                    Arrays.sort(keys);
-                    return st + ":keys:" + String.join(",", keys);
-                } catch (Throwable ignore) { /* fall through */ }
-            }
-        }
-        String norm = (body == null ? "" : body)
-                .replaceAll("\\d+", "#")
-                .replaceAll("(?i)[a-z0-9/_.-]{16,}", " ")
-                .replaceAll("\\s+", " ").trim();
-        String[] toks = norm.split(" ");
-        Arrays.sort(toks);
-        return st + ":body:" + String.join(" ", toks);
     }
 
 

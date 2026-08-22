@@ -19,7 +19,10 @@ public final class SourceFindings {
 
     public static SourceFindings empty() { return new SourceFindings(new ArrayList<>()); }
 
-    /** Union two hint sets, deduped by (method,path,param,class); {@code a} wins ties (e.g. LLM over harvested). */
+    /** Union two hint sets, deduped by (method,path,paramName,class,PARAMS); {@code a} wins ties (e.g. LLM over
+     *  harvested). The full param LIST is part of the key so a richer hint (e.g. a Postman route carrying its query
+     *  param {@code [url]}) is NOT collapsed into a same-path param-less hint from another source — losing the very
+     *  param that is the sink (an SSRF {@code ?url=}). Two same-path hints with different params now BOTH survive. */
     public static SourceFindings combine(SourceFindings a, SourceFindings b) {
         LinkedHashMap<String, StaticHint> m = new LinkedHashMap<>();
         if (a != null) for (StaticHint h : a.all()) m.putIfAbsent(key(h), h);
@@ -28,7 +31,8 @@ public final class SourceFindings {
     }
 
     private static String key(StaticHint h) {
-        return (h.method + "|" + h.path + "|" + h.paramName + "|" + h.vulnClass).toLowerCase();
+        java.util.TreeSet<String> ps = new java.util.TreeSet<>(h.params);
+        return (h.method + "|" + h.path + "|" + h.paramName + "|" + h.vulnClass + "|" + ps).toLowerCase();
     }
 
     public boolean isEmpty() { return hints.isEmpty(); }

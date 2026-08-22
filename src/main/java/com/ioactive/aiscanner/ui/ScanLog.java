@@ -35,10 +35,6 @@ public final class ScanLog {
     // transient sub-status never advances the step number twice. One entry per distinct ScanPhases label.
     private final java.util.Set<String> countedPhases = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private volatile int lastStep = 0;   // current step number = the active phase's position in ScanPhases
-    /** Best-known total for the progress bar. The first-run estimate is DERIVED from SettingsTab's module lists
-     *  (pre-attack + attack + post-attack) — the same lists that render the Settings→Modules checkboxes, so the
-     *  two can never disagree — and is then self-corrected to the actual phase() count at each scan end. */
-    private volatile int phasesTotal = SettingsTab.fullRunPhaseCount();
     /** Panel holding the progress bar + (later) the chat row — occupies BorderLayout.SOUTH. */
     private final JPanel southPanel = new JPanel(new BorderLayout());
     private final Consumer<String> mirror;
@@ -103,22 +99,10 @@ public final class ScanLog {
             abortRequested = false;
             startWatchdog();
             hostClassClaimed.clear();
-            // Estimate from the only= filter: lifecycle phases (always) + selected attack probes + post phases.
-            // 6 lifecycle-before + N attack + 3 post. If no filter, use phasesTotal from last scan (learned).
-            String flt = moduleFilter();
-            if (flt != null) {
-                long attack = com.ioactive.aiscanner.scan.ScanPhases.ALL.stream()
-                        .filter(p -> p.isAttack() && p.key != null && flt.contains(p.key)).count();
-                phasesTotal = (int) Math.max(SettingsTab.lifecyclePhaseCount() + attack, SettingsTab.lifecyclePhaseCount());  // floor = lifecycle-only run
-            }
-            // If flt == null (full run) keep phasesTotal from the previous scan — it's more accurate than any formula.
             phaseSeen.set(0);
             countedPhases.clear();
             lastStep = 0;
         } else {
-            // Scan ended: learn the real total so the next run has a better estimate.
-            int actual = phaseSeen.get();
-            if (actual > 0) phasesTotal = actual;
             stopWatchdog();
         }
         javax.swing.SwingUtilities.invokeLater(() -> {
@@ -244,6 +228,24 @@ public final class ScanLog {
     private volatile String currentPhase = "Idle";
     private volatile boolean filterAnnounced = false;   // -Daiscanner.only banner printed once per session
     public String currentPhase() { return currentPhase; }
+    /** Best-effort "is it too late?": has the running scan's attack battery already advanced PAST the phase for
+     *  {@code key}? Used by the Agent-tab "test &lt;module&gt;" enqueue to warn when a module is added after its phase
+     *  already ran. Returns false during any lifecycle/earlier phase (i.e. still in time). Registry-ordered, so it
+     *  tracks the exact execution order the attack loop follows. */
+    public boolean attackPhasePassed(String key) {
+        if (key == null) return false;
+        com.ioactive.aiscanner.scan.ScanPhases.Phase target = null, cur = null;
+        for (com.ioactive.aiscanner.scan.ScanPhases.Phase p : com.ioactive.aiscanner.scan.ScanPhases.ALL) {
+            if (p.isAttack() && key.equalsIgnoreCase(p.key)) target = p;
+            // The attack battery sets currentPhase to the phase LABEL (scanLog.phase(Phase) → currentPhase=p.label),
+            // so resolve the current phase by LABEL — NOT ScanPhases.match(), whose titleMatch substring misses 6
+            // attack labels (CSRF/IDOR/SSRF/GraphQL/Path-reflection/WebSocket fuzz) and would wrongly report "in time".
+            if (p.label.equalsIgnoreCase(currentPhase)) cur = p;
+        }
+        if (target == null || cur == null || !cur.isAttack()) return false;   // in lifecycle/sub-status → still in time
+        // >= : if the target's OWN phase is the current one, its skip decision has already been made this scan → too late.
+        return com.ioactive.aiscanner.scan.ScanPhases.position(cur) >= com.ioactive.aiscanner.scan.ScanPhases.position(target);
+    }
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private final List<String> lines = Collections.synchronizedList(new ArrayList<>());   // display buffer (bounded)
     private final JTextField search = new JTextField();

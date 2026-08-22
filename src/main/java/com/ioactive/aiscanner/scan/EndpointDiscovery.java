@@ -44,6 +44,13 @@ public final class EndpointDiscovery {
     // guards enter — the same conditions under which the request was accepted, so no junk/FP surface.
     private final List<HttpRequestResponse> keptResponses = new ArrayList<>();
 
+    // Soft-404 content signature: some APIs answer HTTP 200 for EVERY unknown path (a catch-all like DVCSharp's
+    // "DVCSharp API: Route not found!"), which defeats status-based existence probing — phantom paths look LIVE and
+    // param reconstruction invents junk fields. We learn the catch-all body from random paths and treat any 2xx
+    // whose body matches it as NOT-live (a content 404). Null when the host uses real 404s (nothing to prune).
+    private String softNotFound = null;
+    private boolean softNotFoundLearned = false;
+
     // AI-path-discovered PAGES (see probeAiProposedPaths). Unlike keptResponses (JSON endpoints for the
     // IDOR/BFLA bridge, which deliberately filters out text/html via isHtmlShell), these are the real HTML
     // pages we set out to find — e.g. an unlinked /admin/ console. The caller adds them to the site map and
@@ -117,7 +124,7 @@ public final class EndpointDiscovery {
     private void keep(HttpRequestResponse rr, String host) {
         if (rr == null || rr.response() == null) return;
         if (!host.equalsIgnoreCase(hostOf(rr.request().url()))) return;
-        if (isHtmlShell(rr)) return;
+        if (isHtmlShell(rr) || isSoftNotFound(rr)) return;
         int st = rr.response().statusCode();
         // A real handler ran for this path. 405 = the path exists but our METHOD was wrong (GET a POST-only API);
         // 500 = the handler ran and threw (e.g. a REST endpoint that errors on a malformed/GET request). Both mean a
@@ -127,6 +134,48 @@ public final class EndpointDiscovery {
         // Bounded (defensive): this list is per-scan and drained into the site map, but cap it so a huge
         // discovered surface can never pin an unbounded set of HTTP messages in memory (BApp large-project rule).
         if (handlerRan && keptResponses.size() < 500) keptResponses.add(rr);
+    }
+
+    /** Learn the host's catch-all (soft-404) body by probing two DIFFERENT random paths. Only sets a signature when
+     *  both answer 2xx with the SAME body (path-independent catch-all) — so a real-404 host, or a soft-404 that
+     *  echoes the path, never yields a signature and nothing is over-pruned. Cheap: two GETs, once per host. */
+    private void learnSoftNotFound(String baseUrl) {
+        if (softNotFoundLearned || baseUrl == null) return;
+        softNotFoundLearned = true;
+        try {
+            String base = baseUrl.replaceAll("/+$", "");
+            String t1 = "aiscnf" + Long.toString(Math.abs(System.nanoTime()), 36);
+            String t2 = "aiscnf" + Long.toString(Math.abs(System.nanoTime()) + 7, 36);
+            HttpRequestResponse r1 = probe(HttpRequest.httpRequestFromUrl(base + "/" + t1).withMethod("GET"));
+            HttpRequestResponse r2 = probe(HttpRequest.httpRequestFromUrl(base + "/api/" + t2).withMethod("GET"));
+            int s1 = statusOf(r1), s2 = statusOf(r2);
+            if (s1 < 200 || s1 >= 300 || s2 < 200 || s2 >= 300) return;   // real 404s → status gating already works
+            String b1 = normBody(r1, t1), b2 = normBody(r2, t2);
+            if (!b1.isEmpty() && b1.equals(b2)) {
+                softNotFound = b1;
+                scanLog.log("  soft-404: host answers 2xx for unknown paths (content catch-all) — pruning phantom "
+                        + "endpoints + junk params by body signature.");
+            }
+        } catch (Throwable ignore) { }
+    }
+
+    /** A 2xx response whose body matches the learned catch-all signature — a content 404, not a real endpoint. */
+    private boolean isSoftNotFound(HttpRequestResponse rr) {
+        if (softNotFound == null || rr == null || rr.response() == null) return false;
+        int st = rr.response().statusCode();
+        if (st < 200 || st >= 300) return false;
+        return normBody(rr, null).equals(softNotFound);
+    }
+
+    /** Normalize a response body for signature comparison: strip the probed nonce (so a path-echoing 404 still
+     *  matches), collapse whitespace, lowercase, bound length. */
+    private static String normBody(HttpRequestResponse rr, String stripToken) {
+        if (rr == null || rr.response() == null) return "";
+        String b = rr.response().bodyToString();
+        if (b == null) return "";
+        if (stripToken != null) b = b.replace(stripToken, "");
+        b = b.trim().toLowerCase().replaceAll("\\s+", " ");
+        return b.length() > 300 ? b.substring(0, 300) : b;
     }
 
     /**
@@ -149,6 +198,14 @@ public final class EndpointDiscovery {
     // (dedup). Static/scan-scoped like specsCache: shared across the fresh EndpointDiscovery instances the auth
     // orchestration news per call, reset per matrix cell (own Burp process).
     private static final java.util.Map<String, Set<String>> llmMinedSourceHashes = new java.util.concurrent.ConcurrentHashMap<>();
+    // Per-SCAN LLM discovery-call budget, summed across every re-entry (mineSpecs runs once per crawl→discovery pass,
+    // and the auth orchestration re-enters several times). Reset at scan start ({@link #resetScanBudget}); enforced in
+    // {@link #mineSpecs} so a re-crawl-heavy target cannot grind ~100 discovery LLM calls and stall before the attack
+    // battery. Not per-host on purpose: the ceiling is the whole scan's discovery spend, not each host's.
+    private static final java.util.concurrent.atomic.AtomicInteger llmDiscoveryCalls = new java.util.concurrent.atomic.AtomicInteger(0);
+    /** Zero the per-scan LLM discovery-call budget. Called once at scan start (the memos above are session-static and
+     *  intentionally NOT cleared, so a warm re-scan reuses them; only this call counter resets per scan). */
+    public static void resetScanBudget() { llmDiscoveryCalls.set(0); }
 
     /** Same-host site-map entry count — a CHEAP freshness signal (no body reads / fetches / LLM) so a memo hit
      *  skips gatherSources() entirely. Re-mine only when the surface actually grew (e.g. authed pages arrived). */
@@ -210,15 +267,24 @@ public final class EndpointDiscovery {
         int rounds = discoveryRounds();
         int roundsRun = 0;
         int emptyStreak = 0;                            // consecutive rounds that added nothing new
+        boolean budgetHit = false;                      // per-scan LLM discovery-call ceiling reached → stop the LLM pass
+        int maxDiscCalls = Tuning.maxLlmDiscoveryCalls();
         for (int r = 0; r < rounds && canLlm && !chunks.isEmpty(); r++) {
             int roundBefore = specs.size();
             int rawThisRound = 0;                       // RAW endpoints the LLM parsed this round (pre-dedup)
             for (int i = 0; i < chunks.size() && i < Tuning.maxLlmChunks(); i++) {
+                if (llmDiscoveryCalls.get() >= maxDiscCalls) {   // per-SCAN ceiling, summed across ALL re-entries
+                    scanLog.log("  discovery: per-scan LLM budget reached (" + maxDiscCalls + " calls) — continuing "
+                            + "with the deterministic regex + /api/ harvest floor only (attack battery proceeds).");
+                    budgetHit = true; break;
+                }
                 int before = specs.size();
+                llmDiscoveryCalls.incrementAndGet();
                 rawThisRound += llmCandidates(eng, chunks.get(i), specs);   // returns RAW parsed count
                 llm += specs.size() - before;
             }
             roundsRun++;
+            if (budgetHit) break;
             int added = specs.size() - roundBefore;
             // Log RAW parsed (what the model actually returned) AND new-after-union — so we can see whether a round
             // added nothing because the LLM returned nothing vs. returned dupes (the variance we've been chasing).
@@ -251,6 +317,16 @@ public final class EndpointDiscovery {
     private boolean synthDone = false;   // LLM body-synthesis runs once (in the authenticated pass)
 
     /** True when a 2xx response is really the SPA's HTML app shell (nginx catch-all), not a real endpoint. */
+    private static final Pattern WRITABLE_FIELD = Pattern.compile("(?is)<(input|textarea|select)\\b[^>]*\\bname\\s*=");
+    /** A server-rendered page with a real form: contains a {@code <form>} AND a named input/textarea/select. The
+     *  SPA catch-all shell fails this (its forms are rendered client-side), so it stays filtered. */
+    private static boolean hasWritableForm(HttpRequestResponse rr) {
+        if (rr == null || rr.response() == null) return false;
+        String b = rr.response().bodyToString();
+        if (b == null || !b.toLowerCase().contains("<form")) return false;
+        return WRITABLE_FIELD.matcher(b).find();
+    }
+
     private static boolean isHtmlShell(HttpRequestResponse rr) {
         if (rr == null || rr.response() == null) return false;
         String ct = rr.response().headerValue("Content-Type");
@@ -767,6 +843,7 @@ public final class EndpointDiscovery {
      */
     private void harvestHtmlForms(String host, List<HttpRequest> live, Set<String> seen) {
         int added = 0;
+        Set<String> formShapes = new java.util.HashSet<>();   // (method + id-templated path + field names) → collapse clones
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
             if (added >= MAX_FORMS) break;
             if (rr.response() == null || rr.request() == null) continue;
@@ -809,6 +886,14 @@ public final class EndpointDiscovery {
                 if (fields.isEmpty()) continue;
                 String key = method + " " + Net.stripQuery(abs) + " " + fields.keySet();
                 if (!seen.add(key)) continue;
+                // Structural dedup: a catalog renders the SAME form once per item (POST /Cart/AddOrder/38,
+                // /39, /40 … — identical {Quantity,token}, only the id differs). Left unchecked, dozens of
+                // near-clones eat the MAX_FORMS budget and crowd out DISTINCT write surfaces (a blog reply, a
+                // profile edit) whose params are the real stored-XSS/SQLi sinks. Collapse forms whose (method +
+                // path-with-numeric-ids-templated + field-name-set) match to ONE representative. Generic — the
+                // template is derived from the URL shape, no app rules.
+                String shape = method + " " + Net.stripQuery(abs).replaceAll("/\\d+(?=/|$)", "/{id}") + " " + fields.keySet();
+                if (!formShapes.add(shape)) { scanLog.debug("  html-form: skip near-duplicate " + shape); continue; }
                 if (session != null && session.mutatesOwnAccount(method, abs)) {
                     scanLog.debug("  html-form: skip self-account mutation " + method + " " + Net.stripQuery(abs));
                     continue;
@@ -839,6 +924,7 @@ public final class EndpointDiscovery {
             String baseUrl = baseUrlFor(host);
             Set<String> specs = mineSpecs(host);
             if (baseUrl == null) return live;
+            learnSoftNotFound(baseUrl);   // detect a 2xx catch-all so phantom paths don't pollute the probe surface
 
             // SAST-driven surface expansion: source analysis may name routes/params the crawler never linked
             // to. Add them as candidate specs — they ride the SAME live-probe + keep() path below, so any
@@ -847,6 +933,7 @@ public final class EndpointDiscovery {
                 int addedFromSource = 0;
                 for (com.ioactive.aiscanner.scan.sast.StaticHint h : sourceHints) {
                     if (specs.add(h.toEndpointSpec(SEP))) addedFromSource++;
+                    scanLog.debug("  src-hint: " + h.method + " " + h.path + " params=" + h.params);
                 }
                 if (addedFromSource > 0) scanLog.log("  +" + addedFromSource
                         + " source-derived endpoint spec(s) to probe (SAST-driven surface).");
@@ -866,7 +953,13 @@ public final class EndpointDiscovery {
                 if (!host.equalsIgnoreCase(hostOf(sample.url()))) continue;   // stay in scope
                 if (STATIC.matcher(sample.url()).matches() || sample.url().toLowerCase().contains(".js")) continue;
                 if (AuthenticatedExplorer.SESSION_RESET.matcher(sample.url()).matches()) continue; // never probe login/logout
-                String key = sample.method() + " " + Net.stripQuery(sample.url());
+                // Key by (method + path + PARAM NAMES), not path alone: the same endpoint reached with different
+                // params (a source/Postman-declared ?url= for SSRF vs a response-key-reconstructed ?Error=) must BOTH
+                // survive — a path-only key dropped whichever spec came second, silently losing the real sink param.
+                java.util.TreeSet<String> pn = new java.util.TreeSet<>();
+                for (var p : sample.parameters())
+                    if (p.type() == HttpParameterType.URL || p.type() == HttpParameterType.BODY) pn.add(p.name());
+                String key = sample.method() + " " + Net.stripQuery(sample.url()) + " " + pn;
                 if (!seen.add(key)) continue;
 
                 HttpRequest best = null; int bestSt = -1; HttpRequestResponse bestRr = null;
@@ -877,7 +970,17 @@ public final class EndpointDiscovery {
                     int st = statusOf(rr);
                     if (liveRank(st) > liveRank(bestSt)) { bestSt = st; best = req; bestRr = rr; }
                 }
-                boolean realLive = best != null && bestSt >= 200 && bestSt < 400 && !isHtmlShell(bestRr);
+                boolean realLive = best != null && bestSt >= 200 && bestSt < 400 && !isHtmlShell(bestRr) && !isSoftNotFound(bestRr);
+                // MPA write surface: a server-rendered HTML page carrying a real <form> (a blog reply, a profile
+                // edit, a comment box) is a genuine write endpoint, not a SPA catch-all shell — but isHtmlShell()
+                // drops ALL text/html, so realLive is false and the page never reaches the site map that
+                // harvestHtmlForms mines. Bridge form-bearing HTML pages to the site map explicitly so their
+                // (stored-XSS / SQLi) sinks get synthesized. Safe for SPAs: their JS shell has no server-rendered
+                // <form> with named fields, so hasWritableForm() is false. Generic — keyed on <form>, no app rules.
+                if (best != null && !realLive && hasWritableForm(bestRr)) {
+                    try { api.siteMap().add(bestRr); } catch (Throwable ignore) { }
+                    scanLog.debug("  bridged form-bearing HTML page to site map: " + Net.stripQuery(best.url()));
+                }
                 if (realLive) {
                     live.add(best);
                     keep(bestRr, host);   // bridge to site map for IdorGet/Bfla/ChainReplay
@@ -1027,6 +1130,26 @@ public final class EndpointDiscovery {
     }
 
     /**
+     * Auth bootstrap from a Postman collection shipped in the source repo: convert the collection to a minimal
+     * OpenAPI spec ({@link com.ioactive.aiscanner.scan.sast.PostmanParser#toOpenApiSpec}) and drive the SAME
+     * spec-driven register→login→extract-token flow below. Decisive for APIs that serve no live spec and answer a
+     * catch-all 200 (which defeats route/existence guessing): the collection's login request is the only reliable
+     * auth signal. No new auth logic — pure reuse. Sets the shared session bearer on success.
+     */
+    public void acquireTokenFromPostman(String repoPath, String host) {
+        if (apiAuthToken != null || (session != null && session.hasBearer())) return;
+        org.json.JSONObject spec;
+        try { spec = com.ioactive.aiscanner.scan.sast.PostmanParser.toOpenApiSpec(repoPath); }
+        catch (Throwable t) { scanLog.debug("  -> API AUTH: Postman spec build error: " + t); return; }
+        if (spec == null) return;
+        String root = baseUrlFor(host);
+        if (root == null || root.isBlank()) return;
+        root = root.replaceAll("/+$", "");
+        scanLog.log("  -> API AUTH: no live spec — bootstrapping auth from the repo's Postman collection.");
+        acquireSpecToken(spec, host, root);
+    }
+
+    /**
      * SPEC-DRIVEN AUTH BOOTSTRAP (no hardcoding — everything is read from the app's own OpenAPI doc). A REST
      * API that authenticates via a custom header (X-Auth-Token) keeps its authed surface (e.g. /user/{id}
      * returning a stored password) out of reach until we hold a token. We (1) learn the auth-header NAME from
@@ -1078,7 +1201,13 @@ public final class EndpointDiscovery {
                 String pf = cf != null ? cf[1] : "password";
                 String extra = extraRequiredFields(loginOps.get(loginPath), uf, pf);   // e.g. ,"op":"basic"
                 String url = root + (loginPath.startsWith("/") ? loginPath : "/" + loginPath);
-                for (String b : credentialBodies(uf, pf, extra)) {
+                // Try the collection's OWN example body FIRST (real demo creds) — a seeded account logs in directly;
+                // then the synthesized guesses. (x-example is set only when a Postman collection seeded this op.)
+                List<String> bodies = new ArrayList<>();
+                String ex = loginOps.get(loginPath).optString("x-example", "");
+                if (!ex.isBlank()) bodies.add(ex);
+                bodies.addAll(credentialBodies(uf, pf, extra));
+                for (String b : bodies) {
                     if (tries++ > 80) break;
                     HttpRequest r = withSessionCookie(HttpRequest.httpRequestFromUrl(url).withMethod("POST"))
                             .withHeader("Content-Type", "application/json").withBody(b);
@@ -1119,11 +1248,18 @@ public final class EndpointDiscovery {
                 String lpf = (lcf != null && lcf.length > 1 && lcf[1] != null) ? lcf[1] : "password";
                 String regUrl = root + (regPath.startsWith("/") ? regPath : "/" + regPath);
                 String logUrl = root + (logPath.startsWith("/") ? logPath : "/" + logPath);
+                // Prefer the collection's OWN example bodies (a Postman collection ships register + login with the
+                // SAME demo creds, e.g. test@test.com/test123) — register creates that account, login returns its
+                // token. Falls back to synthesized nonce creds (superCreds) when no example was shipped.
+                String regBody = loginOps.get(regPath).optString("x-example", "");
+                String logBody = loginOps.get(logPath).optString("x-example", "");
+                if (regBody.isBlank()) regBody = superCreds(tag, email, pass, rpf);
+                if (logBody.isBlank()) logBody = superCreds(tag, email, pass, lpf);
                 try {
                     probe(withSessionCookie(HttpRequest.httpRequestFromUrl(regUrl).withMethod("POST"))
-                            .withHeader("Content-Type", "application/json").withBody(superCreds(tag, email, pass, rpf)));
+                            .withHeader("Content-Type", "application/json").withBody(regBody));
                     HttpRequestResponse rr = probe(withSessionCookie(HttpRequest.httpRequestFromUrl(logUrl).withMethod("POST"))
-                            .withHeader("Content-Type", "application/json").withBody(superCreds(tag, email, pass, lpf)));
+                            .withHeader("Content-Type", "application/json").withBody(logBody));
                     if (rr != null && rr.response() != null && statusOf(rr) >= 200 && statusOf(rr) < 300) {
                         String resp = rr.response().bodyToString();
                         String tok = (resp != null && resp.trim().startsWith("{")) ? extractToken(new JSONObject(resp)) : null;
@@ -1149,7 +1285,13 @@ public final class EndpointDiscovery {
         StringBuilder b = new StringBuilder("{\"username\":\"").append(tag).append("\",\"user\":\"").append(tag)
                 .append("\",\"login\":\"").append(tag).append("\",\"name\":\"").append(tag)
                 .append("\",\"email\":\"").append(email).append("\",\"password\":\"").append(pass)
-                .append("\",\"passwordConfirm\":\"").append(pass).append("\",\"repeatPassword\":\"").append(pass).append("\"");
+                .append("\",\"passwordConfirm\":\"").append(pass).append("\",\"repeatPassword\":\"").append(pass)
+                // password-confirmation goes by many names across frameworks; send them all (a form ignores the ones
+                // it doesn't bind) so a "passwords do not match" gate never blocks the register step. ASP.NET uses
+                // passwordConfirmation; Rails password_confirmation; others confirmPassword/confirm_password/confirm.
+                .append("\",\"passwordConfirmation\":\"").append(pass).append("\",\"password_confirmation\":\"").append(pass)
+                .append("\",\"confirmPassword\":\"").append(pass).append("\",\"confirm_password\":\"").append(pass)
+                .append("\",\"confirm\":\"").append(pass).append("\"");
         if (pf != null && !pf.isBlank() && !pf.equalsIgnoreCase("password"))
             b.append(",\"").append(pf).append("\":\"").append(pass).append("\"");
         return b.append("}").toString();
@@ -2151,6 +2293,8 @@ public final class EndpointDiscovery {
         try {
             String baseUrl = baseUrlFor(host);
             if (baseUrl == null) return out;
+            learnSoftNotFound(baseUrl);   // this instance is fresh (per-call): learn the catch-all so a 2xx-for-any-path
+                                          // app doesn't turn every DERIVED /auth/verb permutation into a phantom login
             Set<String> seen = new LinkedHashSet<>();
             Set<String> specs = mineSpecs(host);
 
@@ -2228,9 +2372,11 @@ public final class EndpointDiscovery {
                         .withAddedHeader("Content-Type", "application/json")
                         .withBody("{\"email\":\"1\",\"password\":\"1\"}"));
                 probed++;
-                int st = statusOf(probe(req));
-                boolean exists = st == 200 || st == 201 || st == 204 || (st >= 300 && st < 400)
-                        || st == 400 || st == 401 || st == 403 || st == 422;
+                HttpRequestResponse rr = probe(req);
+                int st = statusOf(rr);
+                boolean exists = (st == 200 || st == 201 || st == 204 || (st >= 300 && st < 400)
+                        || st == 400 || st == 401 || st == 403 || st == 422)
+                        && !isSoftNotFound(rr);   // a 2xx catch-all answers EVERY derived /auth/verb path → not a real login
                 if (exists) {
                     out.add(req);
                     scanLog.log("derived auth endpoint: POST " + Net.stripQuery(abs) + " → HTTP " + st);

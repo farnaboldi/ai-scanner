@@ -18,6 +18,11 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.UnaryOperator;
 
 /**
@@ -35,6 +40,11 @@ public final class Log4ShellProbe {
 
     private final MontoyaApi api;
     private final ScanLog scanLog;
+    // Daemon pool used ONLY to bound a single collab.getAllInteractions() call — Montoya's Collaborator polling has
+    // no client timeout, so a slow/unreachable Collaborator server can block each poll ~50s (17 min over 20 rounds).
+    private static final ExecutorService POLL_POOL = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "log4shell-poll"); t.setDaemon(true); return t;
+    });
 
     // Headers apps routinely funnel into a logger — the classic Log4Shell reach (a request logs them pre-auth).
     private static final String[] HEADERS = {
@@ -103,6 +113,7 @@ public final class Log4ShellProbe {
             tags.add(tag);
         }
         HttpRequestResponse rr = send(m, withSession);
+        scanLog.debug("  log4shell: sprayed " + tags.size() + " header payload(s) → " + url);
         if (rr != null) for (String tag : tags) tagToRr.put(tag, rr);
     }
 
@@ -143,11 +154,23 @@ public final class Log4ShellProbe {
         // round-trip, or an LDAP-only (no-DNS) sink can lag — 15s was too tight (christophetd log4shell fired the
         // lookup but the interaction hadn't been retrieved yet). Default ~50s, overridable.
         int rounds = Integer.getInteger("aiscanner.log4shellPollRounds", 20);
+        long budgetMs = Long.getLong("aiscanner.log4shellPollBudgetMs", 60_000L);   // hard wall-clock cap on the whole poll
+        long perCallMs = Long.getLong("aiscanner.log4shellPollCallMs", 8_000L);     // cap ONE getAllInteractions() call
+        long startMs = System.currentTimeMillis();
         try {
             for (int round = 0; round < rounds; round++) {
+                if (System.currentTimeMillis() - startMs >= budgetMs) {
+                    scanLog.debug("  log4shell: poll budget (" + budgetMs + "ms) reached — stopping after " + round + " round(s)");
+                    break;
+                }
                 Thread.sleep(2500);
                 List<Interaction> interactions;
-                try { interactions = collab.getAllInteractions(); } catch (Throwable t) { break; }
+                // Bound the blocking Collaborator poll: a slow/unreachable server must not stretch the phase.
+                try {
+                    Future<List<Interaction>> f = POLL_POOL.submit(collab::getAllInteractions);
+                    try { interactions = f.get(perCallMs, TimeUnit.MILLISECONDS); }
+                    catch (TimeoutException te) { f.cancel(true); scanLog.debug("  log4shell: getAllInteractions > " + perCallMs + "ms — Collaborator slow/unreachable, stopping poll"); break; }
+                } catch (Throwable t) { scanLog.debug("  log4shell: getAllInteractions error: " + t); break; }
                 if (interactions == null || interactions.isEmpty()) continue;
                 for (Interaction it : interactions) {
                     String tag = it.customData().orElse(null);
@@ -164,6 +187,7 @@ public final class Log4ShellProbe {
             }
         } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         catch (Throwable t) { scanLog.debug("  log4shell: poll error: " + t); }
+        scanLog.debug("  log4shell: poll done — " + hits + " endpoint(s) confirmed across " + rounds + " round(s).");
         return hits;
     }
 }

@@ -70,9 +70,16 @@ public final class FlowEngine {
 
         Set<String> visited = new LinkedHashSet<>();   // anti-loop across all seeds
         int findings = 0, seedCount = 0;
+        // Wall-clock budget for the WHOLE flow phase: bounds MAX_SEEDS×MAX_STEPS live sends (each up to the sender's
+        // 12s response timeout) + planner calls so one slow target can't stretch the phase to tens of minutes.
+        long deadlineMs = System.currentTimeMillis() + Long.getLong("aiscanner.flowBudgetMs", 240_000L);
 
         for (HttpRequest seed : seeds) {
             if (seedCount++ >= MAX_SEEDS) break;
+            if (System.currentTimeMillis() >= deadlineMs) {
+                scanLog.debug("  flow: time budget reached — stopping after " + (seedCount - 1) + " seed(s)");
+                break;
+            }
 
             StepResult obs0 = safeSend(sessionizer.apply(seed));   // OBSERVE step-0: un-mutated, authenticated
             if (obs0 == null || !obs0.live()) continue;
@@ -82,6 +89,7 @@ public final class FlowEngine {
             int plateau = 0;
 
             for (int step = 1; step <= MAX_STEPS_PER_SEED; step++) {
+                if (System.currentTimeMillis() >= deadlineMs) break;
                 String observation = RequestContext.of(cursor).forLlm();
                 String carriedId = firstIdOrToken(cursor);                 // from the REAL response bytes
 
@@ -139,8 +147,6 @@ public final class FlowEngine {
             Signal s = vc.oracle.detect(baselineBody, body, act.elapsedMs(), p.body());
             if (s.hit) { report(vc.id, url, s.evidence); return true; }
         }
-
-        boolean changed = !body.equals(baselineBody) && body.length() > 20;
 
         // NOTE: NO create→consume oracle. "an id/token minted earlier is echoed in a later 2xx" is just
         // normal read-after-write of YOUR OWN resource (create a post → read it back) or a login echoing

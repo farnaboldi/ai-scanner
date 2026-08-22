@@ -57,7 +57,7 @@ ALL_TARGETS=(
   "wackopicko|docker|adamdoupe/wackopicko|0|80|/|https://github.com/adamdoupe/WackoPicko"
   "tiredful|docker|aiscanner-tiredful:local|0|8000|/api/v1/|https://github.com/payatu/Tiredful-API"
   "vulnerableapp|running|aisc-vulnerableapp|9090|9090|/VulnerableApp/|https://github.com/SasanLabs/VulnerableApp"
-  "log4shell|running|aisc-log4shell|8899|8080|/|"
+  "log4shell|running|aisc-log4shell|8901|8080|/|"
   "crapi|running|crapi-web|8888|80|/|https://github.com/OWASP/crAPI"
   "dvws|running|dvws-node-web-1|8180|80|/|https://github.com/snoopysecurity/dvws-node"
   "dvoauth|running|gallery|3005|3005|/|https://github.com/koenbuyens/Vulnerable-OAuth-2.0-Applications"
@@ -65,7 +65,7 @@ ALL_TARGETS=(
   "sstipy|running|aisc-ti-python|5056|13375|/Jinja2|https://github.com/Hackmanit/template-injection-playground"
   "dvwssock|running|DVWS_WEB|8888|8888|/csrf.php|https://github.com/interference-security/DVWS"
   "vulnlab|running|aisc-vulnlab|1337|80|/|https://github.com/Yavuzlar/VulnLab"
-  "webgoatnet|running|aisc-webgoatnet|9500|8080|/|https://github.com/jerryhoff/WebGoat.NET"
+  "webgoatnet|running|aisc-webgoatnet|9500|8080|/|https://github.com/tobyash86/WebGoat.NET"
   "goof|running|aisc-goof|3011|3001|/|https://github.com/snyk-labs/nodejs-goof"
   "nodevuln|running|nodevuln-vulnerable_node-1|4290|3000|/|https://github.com/cr0hn/vulnerable-node"
   "zero|external||||http://zero.webappsecurity.com/|"
@@ -184,6 +184,19 @@ free_hostport(){   # $1=host port → stop any leftover/restart=always container
 stop_running(){   # $1=container → stop the whole compose project (don't remove; these are pre-built)
   local c="$1" m
   compose_members "$c" | while read -r m; do [ -n "$m" ] && docker stop "$m" >/dev/null 2>&1; done
+}
+
+setup_dvwssock(){   # OWASP Damn Vulnerable Web Sockets: a PHP app (8888) whose vuln inputs travel over a Ratchet
+                    # WebSocket server (8080). Publish BOTH ports, and rewrite the hardcoded WS host dvws.local→localhost
+                    # in the served source — macOS resolves the .local TLD via mDNS (NOT /etc/hosts), so dvws.local never
+                    # points at the container; localhost needs no host entry and the WS becomes reachable with no manual
+                    # setup. Self-bootstrapping (own docker run) because the target needs two published ports.
+  docker rm -f DVWS_WEB >/dev/null 2>&1
+  docker run -d --name DVWS_WEB -p 127.0.0.1:8888:8888 -p 127.0.0.1:8080:8080 dvws-sockets-web:latest >/dev/null 2>&1 \
+    || { say "  [warn] dvwssock: image 'dvws-sockets-web:latest' missing — build it from https://github.com/interference-security/DVWS (docker compose)"; return 1; }
+  wait_http "http://localhost:8888/csrf.php" || say "  [warn] dvwssock slow/failed to come up"
+  docker exec DVWS_WEB sh -lc "sed -i 's/dvws\\.local/localhost/g' /opt/DVWS/*.php" >/dev/null 2>&1
+  say "  dvwssock: DVWS_WEB up — 8888 (HTTP) + 8080 (WS); WS host rewritten dvws.local→localhost (no /etc/hosts needed)"
 }
 
 setup_dvwa(){   # $1=base → login admin/password, create DB, security=low
@@ -313,6 +326,7 @@ run_pair(){   # $@ = target names → bring each up + stabilize, ONE Burp scanni
     case "$t" in   # self-bootstrapping targets own their bring-up; everything else = generic start_running + optional setup
       goof)       setup_goof;;
       nodevuln)   setup_nodevuln;;
+      dvwssock)   setup_dvwssock;;
       *) [ "$kind" = running ] && start_running "$image" "$base"
          case "$t" in
            dvoauth) setup_dvoauth "$base";;
@@ -390,6 +404,7 @@ for tname in $PRIORITY; do
         case "$tname" in   # self-bootstrapping targets own their full bring-up; others just start the pre-built container
           goof)       setup_goof;;
           nodevuln)   setup_nodevuln;;
+          dvwssock)   setup_dvwssock;;
           *) start_running "$image" "http://localhost:$hostport$path";;
         esac
         curl_url="http://localhost:$hostport$path"

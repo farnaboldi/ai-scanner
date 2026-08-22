@@ -164,6 +164,29 @@ public final class SettingsTab {
         }
     }
 
+    /** Enqueue an attack module (Agent-tab "test &lt;module&gt;") into a scan already in progress. The only= write is
+     *  SYNCHRONOUS (thread-safe System property, read live per phase by the running scan) so it takes effect at once
+     *  and the caller can sample "did I catch it in time?" immediately after — NO deferred-EDT TOCTOU. Only the visual
+     *  tick is deferred to the EDT. Returns true if the module (checkbox) exists. */
+    public boolean selectModuleBox(String key) {
+        if (key == null) return false;
+        JCheckBox cb = moduleBoxes.get(key.toLowerCase());
+        if (cb == null) return false;
+        appendOnlyFilter(key.toLowerCase());   // authoritative synchronous write; the running scan reads only= live
+        javax.swing.SwingUtilities.invokeLater(() -> { if (!cb.isSelected()) cb.setSelected(true); });  // visual only
+        return true;
+    }
+
+    /** Append one attack-module key to {@code -Daiscanner.only} IN PLACE. No-op when no filter is active (a full run
+     *  already runs everything — ticking one box must not RESTRICT it to just that one) or the key is already present.
+     *  Keeps the ticked checkbox consistent with the property so a later {@link #applyModuleSelection()} agrees. */
+    private static void appendOnlyFilter(String key) {
+        String cur = System.getProperty("aiscanner.only");
+        if (cur == null || cur.isBlank()) return;
+        for (String k : cur.split(",")) if (k.trim().equalsIgnoreCase(key)) return;
+        System.setProperty("aiscanner.only", cur + "," + key);
+    }
+
     /** Focus the most relevant field for the current provider (called when the Settings view is opened). */
     public void focusBaseUrl() { focusFirstField(); }
     private void focusFirstField() {

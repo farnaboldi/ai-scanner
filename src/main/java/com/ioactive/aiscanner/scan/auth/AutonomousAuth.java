@@ -11,7 +11,6 @@ import com.ioactive.aiscanner.ui.ScanLog;
 import org.json.JSONObject;
 
 import java.net.URI;
-import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -190,6 +189,7 @@ public final class AutonomousAuth {
         // incl. a SIBLING ORIGIN the SPA calls — e.g. seed :3001 but the real login is the API's :8080/login).
         // The JS-mining candidates are built on the SEED origin, so a cross-port/subdomain API login is otherwise
         // never tried. Origin-aware + generic.
+        if (session.authenticated()) return true;   // a cheaper/earlier strategy (manual, source/Postman) already won
         loginCandidates = mergeCandidates(loginCandidates, siteMapLoginCandidates());
         if (loginCandidates == null || loginCandidates.isEmpty()) return false;
         // Dedup by (method, path): the site map holds MANY copies of the same login/candidate request, so without
@@ -201,23 +201,24 @@ public final class AutonomousAuth {
                 if (c != null) uniq.putIfAbsent(c.method() + " " + c.url().split("\\?")[0], c);
             loginCandidates = new java.util.ArrayList<>(uniq.values());
         }
-        // Prefer a DISPOSABLE, readable mailbox so an email-verification / OTP step can be completed
-        // autonomously; fall back to a throwaway @example.com for apps that don't verify email (or that
-        // block disposable domains). Both are generic — only the mailbox address changes.
-        // Try each configured disposable provider (mailinator, then mail.tm) — if one never delivers/reads the
-        // OTP (throttled or its domain is blocked by the target), re-run the whole sign-up with the next one.
+        // FAST PATH FIRST: a throwaway @example.com register→login works for every API that does NOT verify email
+        // (dvcsharp, VAmPI, …). Try it BEFORE the slow disposable-mailbox OTP flow — which is only needed when the
+        // app actually gates on email verification — so we don't burn minutes polling a mailbox an app never needed.
+        if (attemptApiRegister(loginCandidates, null, null)) return true;
+        if (session.authenticated()) return true;
+        // FALLBACK — apps that REQUIRE an email-verification / OTP step: use a DISPOSABLE, readable mailbox so the
+        // verification can be completed autonomously. Try each provider (mailinator, then mail.tm); one working
+        // provider is enough (the signup/login PATH permutation is mailbox-independent), so only fall through to the
+        // next when a signup was ACCEPTED but its verification email never arrived (throttled/blocked inbox).
         List<DisposableMailbox> boxes;
         try { boxes = DisposableMailbox.mintAll(api); } catch (Throwable t) { boxes = java.util.Collections.emptyList(); }
         for (DisposableMailbox box : boxes) {
+            if (session.authenticated()) return true;
             scanLog.log("API auth: trying disposable mailbox provider '" + box.providerName() + "' (" + box.address() + ")");
             if (attemptApiRegister(loginCandidates, box.address(), box)) return true;
             if (session.authenticated()) return true;   // captured mid-attempt (e.g. signup returned a token)
-            // One working provider is enough: the signup/login PATH permutation is mailbox-independent, so only
-            // fall through to the next provider when a signup was ACCEPTED but its verification email never
-            // arrived (throttled/blocked inbox). A path-permutation miss re-runs identically → don't hammer.
             if (!needMailboxFallback) break;
         }
-        if (attemptApiRegister(loginCandidates, null, null)) return true;   // no-verify apps: throwaway @example.com
         scanLog.debug("API auth: no JSON login endpoint returned a token.");
         return false;
     }
