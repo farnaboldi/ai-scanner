@@ -30,7 +30,7 @@ public final class EngineConfig {
 
     public EngineConfig(Provider provider, String baseUrl, String model, String apiKey, double temperature,
                         int maxTokens, boolean disableThinking, int timeoutSeconds) {
-        this.provider = provider == null ? Provider.LOCAL_LLM : provider;
+        this.provider = provider == null ? Provider.BURP_AI : provider;   // App-Store default when unspecified
         this.baseUrl = baseUrl == null ? "" : baseUrl.trim();
         this.model = model == null ? "" : model.trim();
         this.apiKey = apiKey == null ? "" : apiKey.trim();

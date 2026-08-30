@@ -18,10 +18,7 @@ import java.util.regex.Pattern;
  * / double-extension variants; a successful non-index delivery is the finding (and trips the
  * corresponding "forgotten backup / access log / null byte" challenges server-side).
  */
-public final class FileServePathProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class FileServePathProbe extends Probe {
 
     // Sensitive/blocked backup-ish extensions worth trying to exfiltrate.
     private static final Pattern SENSITIVE = Pattern.compile(
@@ -30,8 +27,7 @@ public final class FileServePathProbe {
     private static final String[] BYPASS = { "%2500.md", "%2500.pdf", "%00.md", ".md", ".pdf" };
 
     public FileServePathProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** Retry sensitive served files (in scope) with null-byte/extension-bypass suffixes. */
@@ -50,7 +46,7 @@ public final class FileServePathProbe {
                         HttpRequest req = HttpRequest.httpRequestFromUrl(base + suf).withMethod("GET");
                         if (cookieHeader != null && !cookieHeader.isBlank()) req = req.withHeader("Cookie", cookieHeader);
                         if (bearer != null && !bearer.isBlank()) req = req.withHeader("Authorization", "Bearer " + bearer);
-                        HttpRequestResponse r = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                        HttpRequestResponse r = send(req);
                         if (r == null || r.response() == null) continue;
                         int st = r.response().statusCode();
                         int len = r.response().body().length();
@@ -74,5 +70,5 @@ public final class FileServePathProbe {
         String b = body.toLowerCase();
         return b.contains("<!doctype html") || b.contains("<html") || b.contains("index of");
     }
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

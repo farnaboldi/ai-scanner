@@ -55,7 +55,7 @@ public final class AutonomousAuth {
     private static final Pattern TAG         = Pattern.compile("(?is)<(input|select|button|textarea)\\b[^>]*>");
     private static final Pattern PW_INPUT    = Pattern.compile("(?is)<input\\b[^>]*type\\s*=\\s*['\"]?password");
     private static final Pattern A_LINK      = Pattern.compile("(?is)<a\\b[^>]*\\bhref\\s*=\\s*['\"]?([^'\" >]+)['\"]?[^>]*>(.*?)</a>");
-    private static final Pattern REGISTER    = Pattern.compile("(?i)regist|sign.?up|new.?user|create.?account|create.?an?.?account");
+    private static final Pattern REGISTER    = Pattern.compile("(?i)regist|sign.?up|new.?user|user.?new|add.?user|create.?user|create.?account|create.?an?.?account");
     private static final Pattern USER_FIELD  = Pattern.compile("(?i).*(user|email|login|usuario|account|name).*|^log$");   // ^log$ = WordPress's username field
     // A field that specifically denotes a LOGIN HANDLE (username/login/account) — distinct from the email address
     // AND from descriptive name fields (first/last/display/company). USER_FIELD is deliberately broad (it matches
@@ -65,6 +65,8 @@ public final class AutonomousAuth {
     private static final Pattern SEC_SELECT  = Pattern.compile("(?i).*(security|seclev|difficulty|level|mode).*");
     private static final Pattern LOW_OPTION  = Pattern.compile("(?i)^(low|easy|insecure|none|off|no|disabled?)$");
     private static final Pattern RESET_BTN   = Pattern.compile("(?i)(create|reset|initiali[sz]e|setup|install).{0,25}(database|db|data|schema|table|app)");
+    // A NEGATIVE / non-submitting button (cancel/back/reset) — never send its name=value as the clicked action.
+    private static final Pattern CANCEL_BTN  = Pattern.compile("(?i)\\b(cancel|reset|back|clear|logout|abort|close|previous|undo)\\b");
     private static final Pattern LOGOUT      = Pattern.compile("(?i)(logout|log-out|log_off|sign.?out)");
     // "between 6 and 10", "6 to 10 characters", "at least 6", "minimum of 6", "max 10 characters"
     private static final Pattern RANGE       = Pattern.compile("(?i)between\\s+(\\d{1,3})\\s+and\\s+(\\d{1,3})|(\\d{1,3})\\s*(?:to|-|–)\\s*(\\d{1,3})\\s*char");
@@ -132,7 +134,10 @@ public final class AutonomousAuth {
 
         HttpRequestResponse resp = null;
         for (int attempt = 0; attempt < 4; attempt++) {
-            resp = s.postForm(action, buildBody(form, user, pass, /*forLogin*/false, null));
+            String regBody = buildBody(form, user, pass, /*forLogin*/false, null);
+            resp = s.postForm(action, regBody);
+            scanLog.debug("register: POST " + action + " body=" + regBody + " → HTTP "
+                    + (resp != null && resp.response() != null ? resp.response().statusCode() : -1));
             String body = bodyOf(resp);
             boolean rerendered = PW_INPUT.matcher(body).find();       // still showing a password form → likely rejected
             int[] range = parseLengthConstraint(body);
@@ -228,6 +233,11 @@ public final class AutonomousAuth {
     // "Username: batman  Password: Batman@123" (or user=/pass=) disclosed in a page — a common vuln-app pattern.
     private static final Pattern CRED_PAIR = Pattern.compile(
             "(?is)\\buser(?:name)?\\b\\s*[:=]\\s*([^\\s:<>\"']{2,63}).{0,80}?\\bpass(?:word)?\\b\\s*[:=]\\s*([^\\s:<>\"']{2,63})");
+    // Same-host URL whose page is likely to disclose an OAuth2 client + a token flow — proactively fetched by
+    // oauthPasswordGrant when the site map hasn't yet captured that page's body (form-bearing HTML is bridged to
+    // the site map only in a LATER discovery phase, after this auth step runs). Generic — keyed on URL hints.
+    private static final Pattern OAUTH_HINT =
+            Pattern.compile("(?i)(oauth|token|authoriz|handle.?user|grant|client[_-]?id|get.?token)");
 
     /**
      * OAuth2 "password" grant, fully autonomous. Deliberately-vulnerable apps (Tiredful, many OAuth labs) — and
@@ -243,10 +253,37 @@ public final class AutonomousAuth {
         LinkedHashSet<String> credKeys = new LinkedHashSet<>();
         java.util.List<String[]> creds = new java.util.ArrayList<>();
         boolean sawPasswordGrant = false;
+        // Candidate page bodies to harvest: every same-host site-map response, PLUS a proactive GET of same-host
+        // pages whose URL hints at a token/oauth flow whose body isn't in the site map yet (the crawl VISITED
+        // /handle-user-token/, but its form-bearing HTML is bridged to the site map only in a later discovery
+        // phase — AFTER this auth step). Fetching them here makes the harvest independent of crawl/bridge order.
+        java.util.LinkedHashMap<String, String> pages = new java.util.LinkedHashMap<>();   // url → body (deduped)
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
             if (rr.request() == null || rr.response() == null || !sameHost(rr.request().url())) continue;
-            String body = bodyOf(rr);
-            if (body == null || body.isEmpty()) continue;
+            String u = rr.request().url(), body = bodyOf(rr);
+            if (u != null && body != null && !body.isEmpty()) pages.putIfAbsent(u.split("#")[0], body);
+        }
+        java.util.LinkedHashSet<String> hintUrls = new java.util.LinkedHashSet<>();
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            if (rr.request() == null) continue;
+            String u = rr.request().url();
+            if (u != null && sameHost(u) && OAUTH_HINT.matcher(u).find()) hintUrls.add(u.split("#")[0]);
+        }
+        int fetched = 0;
+        for (String u : hintUrls) {
+            if (fetched >= 10) break;
+            if (pages.containsKey(u)) continue;                  // already have this body from the site map
+            try {
+                HttpRequestResponse rr = com.ioactive.aiscanner.scan.AiScanner.decompress(api.http().sendRequest(
+                        HttpRequest.httpRequestFromUrl(u),
+                        burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(10000L)));
+                fetched++;
+                String body = bodyOf(rr);
+                if (body != null && !body.isEmpty()) pages.put(u, body);
+            } catch (Throwable ignore) { }
+        }
+        for (java.util.Map.Entry<String, String> pg : pages.entrySet()) {
+            String pageUrl = pg.getKey(), body = pg.getValue();
             Matcher im = TAG.matcher(body);                       // hidden OAuth client fields (attr order-independent)
             while (im.find()) {
                 String tag = im.group(), name = attr(tag, "name"), val = attr(tag, "value");
@@ -262,7 +299,7 @@ public final class AutonomousAuth {
                 // skip non-navigable actions ("javascript:getToken()" contains "token" but is NOT a URL).
                 if (act == null || !act.toLowerCase().contains("token") || act.regionMatches(true, 0, "javascript:", 0, 11)) continue;
                 try {
-                    String u = URI.create(rr.request().url()).resolve(act).toString();
+                    String u = URI.create(pageUrl).resolve(act).toString();
                     if (u.startsWith("http://") || u.startsWith("https://")) tokenUrls.add(u);
                 } catch (Exception ignore) {}
             }
@@ -275,7 +312,12 @@ public final class AutonomousAuth {
         }
         if (clientId == null || clientSecret == null) return false;   // not an OAuth2 password-grant app we can drive
         String base = seedUrl.replaceAll("/+$", "");
-        for (String p : new String[]{ "/oauth/token/", "/oauth/token", "/o/token/", "/o/token" }) tokenUrls.add(base + p);
+        // Standard OAuth token paths at BOTH the seed base AND the host ORIGIN: the token endpoint usually sits at
+        // the root (/oauth/token/), NOT under a deep seed path (Tiredful seeds /api/v1/ but /oauth/token/ is at /).
+        String origin = base;
+        try { java.net.URI su = URI.create(seedUrl); origin = su.getScheme() + "://" + su.getAuthority(); } catch (Exception ignore) { }
+        for (String root : origin.equals(base) ? new String[]{ base } : new String[]{ origin, base })
+            for (String p : new String[]{ "/oauth/token/", "/oauth/token", "/o/token/", "/o/token" }) tokenUrls.add(root + p);
         String oe = arg("aiscanner.loginEmail", "AISCANNER_LOGIN_EMAIL"), op = arg("aiscanner.loginPassword", "AISCANNER_LOGIN_PASSWORD");
         if (oe != null && op != null && credKeys.add(oe + " " + op)) creds.add(new String[]{oe, op});
         for (String[] dc : com.ioactive.aiscanner.menu.AiContextMenuProvider.DEFAULT_CREDS) if (credKeys.add(dc[0] + " " + dc[1])) creds.add(dc);
@@ -495,7 +537,9 @@ public final class AutonomousAuth {
         try { java.net.URI u = java.net.URI.create(seedUrl); origin = u.getScheme() + "://" + u.getAuthority(); }
         catch (Exception e) { return false; }
         String[] paths = {"/login", "/rest/login", "/api/login", "/auth/login", "/signin",
-                          "/authenticate", "/perform_login", "/j_spring_security_check"};
+                          "/authenticate", "/perform_login", "/j_spring_security_check",
+                          // ASP.NET Web API RESTful-controller convention: login = AuthorizationsController / SessionsController / TokensController
+                          "/api/authorizations", "/api/sessions", "/api/tokens", "/authorizations"};
         String[][] fields = {{"username", "password"}, {"j_username", "j_password"},
                              {"email", "password"}, {"name", "password"}, {"user", "pass"}};
         for (String p : paths) {
@@ -538,9 +582,14 @@ public final class AutonomousAuth {
         String email = emailOverride != null ? emailOverride : tag + "@example.com";
         String number = "9" + String.format("%09d", nonce % 1_000_000_000L);   // 10-digit unique phone
         String pass = "Aisc!" + (nonce % 100000) + "Zx";                        // meets common strength rules
+        // Password-confirmation field naming varies across frameworks; send every common variant (a lenient
+        // register ignores the extras) so a "passwords do not match" gate never blocks signup. ASP.NET uses
+        // passwordConfirmation; Rails password_confirmation; others confirmPassword/confirm_password.
         String signup = "{\"name\":\"" + tag + "\",\"username\":\"" + tag + "\",\"email\":\"" + email
                 + "\",\"number\":\"" + number + "\",\"phone\":\"" + number + "\",\"password\":\"" + pass
-                + "\",\"passwordConfirm\":\"" + pass + "\",\"repeatPassword\":\"" + pass + "\"}";
+                + "\",\"passwordConfirm\":\"" + pass + "\",\"repeatPassword\":\"" + pass
+                + "\",\"passwordConfirmation\":\"" + pass + "\",\"password_confirmation\":\"" + pass
+                + "\",\"confirmPassword\":\"" + pass + "\",\"confirm_password\":\"" + pass + "\"}";
         // Log in with the REGISTERED HANDLE (tag) as username/user/login/name — the account was created with
         // username=tag, so a username-keyed JSON API needs tag, NOT the email (VAmPI answers "Username does not
         // exist" when sent the email). Keep email in the email field for email-login apps (crAPI). Superset body;
@@ -578,6 +627,21 @@ public final class AutonomousAuth {
                         scanLog.log("signup " + signupUrl + " → HTTP " + sc0 + " | "
                                 + (sb0 == null ? "" : sb0.substring(0, Math.min(160, sb0.length())).replaceAll("\\s+", " ")));
                     }
+                    // MINIMAL-BODY FALLBACK before giving up on a 500: our superset sends many common fields
+                    // betting the handler "ignores extras" — but a STRICT or MASS-ASSIGNMENT register does the
+                    // OPPOSITE: it consumes EVERY field (e.g. INSERTs each one), so an unknown column/field like
+                    // name/email makes it 500. The adaptive loop below only ADDS fields (fixes "missing required"),
+                    // never trims, so it can't recover a "too many fields" 500. Retry ONCE with a bare
+                    // {username,password}; if a real handler now answers, adopt that body and continue (any
+                    // resulting 400/422 is then completed by the adaptive loop). Generic — no app-specific names.
+                    if (sc0 == 500) {
+                        String minimal = "{\"username\":\"" + tag + "\",\"password\":\"" + pass + "\"}";
+                        HttpRequestResponse mr = registerSend(signupUrl, minimal);
+                        int mc = mr != null && mr.response() != null ? mr.response().statusCode() : -1;
+                        scanLog.log("signup " + signupUrl + " superset→500; retried minimal {username,password} → HTTP "
+                                + (mc < 0 ? "no response" : mc));
+                        if (mc >= 200 && mc < 500 && mc != 404 && mc != 405) { signup = minimal; sr = mr; sc0 = mc; }
+                    }
                     // Structural failure → mark dead so no candidate/provider ever re-POSTs it. 405/501 = wrong
                     // method/not implemented; 500 = the endpoint errors on our body (won't self-heal on retry);
                     // 404 = absent. A 400/422 (validation) is NOT dead — the adaptive round loop below can fix it.
@@ -606,6 +670,23 @@ public final class AutonomousAuth {
                     boolean signupOk = sr != null && sr.response() != null
                             && sr.response().statusCode() < 400 && !looksHtmlShell(sr);
                     if (captureLoginToken(s, loginUrl, login, signupUrl)) { session.setOwnIdentity(tag); return true; }   // maybe no verify needed
+                    // DECOUPLED register↔login: the login endpoint is NOT always a verb-sibling of the register
+                    // endpoint. ASP.NET RESTful controllers put register at /api/registrations and login at
+                    // /api/authorizations (distinct controllers); other APIs register at /users and log in at
+                    // /token. When the account was genuinely CREATED (2xx), try the SAME fresh credentials against
+                    // every OTHER discovered login candidate — so a real signup isn't wasted on the wrong login URL.
+                    if (signupOk) {
+                        for (HttpRequest lc : loginCandidates) {
+                            String lu = lc == null ? null : lc.url();
+                            if (lu == null) continue;
+                            // FRESH session per cross-endpoint login: the register response may set a cookie/state on
+                            // `s` that a login controller rejects (observed on dvcsharp: the exact creds return 401
+                            // on the register's session yet 200 on a clean one). Login is stateless — retry every
+                            // candidate (incl. loginUrl) on a clean session, bypassing the same-session POST-once guard.
+                            AuthSession ls = new AuthSession(api, host);
+                            if (captureLoginToken(ls, lu, login, signupUrl, true)) { session.setOwnIdentity(tag); return true; }
+                        }
+                    }
                     // Only wait for an emailed code if the signup endpoint actually ACCEPTED the request
                     // (2xx/3xx) — else a 404/405 sibling would make us block on the inbox for nothing.
                     if (box != null && signupOk) {
@@ -645,12 +726,24 @@ public final class AutonomousAuth {
 
     /** POST the login body; capture a JWT (or a 2xx + session cookie) as the authenticated session. */
     private boolean captureLoginToken(AuthSession s, String loginUrl, String login, String signupUrl) {
+        return captureLoginToken(s, loginUrl, login, signupUrl, false);
+    }
+
+    /** @param bypassDedup when true, skip the (endpoint,creds) POST-once guard — used by the post-register
+     *  cross-endpoint retry on a FRESH session (the guard already fired on the register's session). */
+    private boolean captureLoginToken(AuthSession s, String loginUrl, String login, String signupUrl, boolean bypassDedup) {
         if (deadLoginUrls.contains(loginUrl)) return false;   // proven not a login handler / blocked — don't re-POST
         // Same (endpoint + exact credentials) already attempted → re-POSTing gets the SAME verdict and just hammers
         // the server (the retry-storm that self-trips a WAF 403). Bad creds don't become good on a retry.
-        if (!triedLogins.add(loginUrl + " ## " + (login == null ? "" : login))) return false;
+        if (!bypassDedup && !triedLogins.add(loginUrl + " ## " + (login == null ? "" : login))) return false;
         HttpRequestResponse r = s.postJson(loginUrl, login);
         String body = bodyOf(r);
+        if (com.ioactive.aiscanner.engine.LogLevel.debug()) {
+            String em = ""; try { em = new JSONObject(login).optString("email", new JSONObject(login).optString("username", "")); } catch (Throwable ig) {}
+            scanLog.debug("  captureLoginToken " + loginUrl + " (id=" + em + ") → HTTP "
+                    + (r != null && r.response() != null ? r.response().statusCode() : -1)
+                    + " body=" + (body == null ? "" : body.substring(0, Math.min(80, body.length())).replaceAll("\\s+"," ")));
+        }
         Matcher jm = JWT.matcher(body == null ? "" : body);
         if (jm.find()) {
             session.setBearer(jm.group());
@@ -724,6 +817,22 @@ public final class AutonomousAuth {
                     HttpRequestResponse fr = s.postForm(loginUrl, form);
                     int fc = code(fr);
                     String fb = bodyOf(fr);
+                    // OAuth2 PASSWORD-GRANT / JWT login (FastAPI OAuth2PasswordRequestForm, and many token APIs):
+                    // the form POST returns a JWT in the JSON body and NO cookie — the cookie-only acceptance
+                    // below would discard it. Capture the bearer from the body first. Generic (standard field).
+                    if (fb != null && fc >= 200 && fc < 400) {
+                        Matcher fjm = JWT.matcher(fb);
+                        String tok = fjm.find() ? fjm.group() : "";
+                        if (tok.isEmpty()) { try { tok = new JSONObject(fb).optString("access_token", ""); } catch (Throwable ig) { } }
+                        if (!tok.isEmpty()) {
+                            session.setBearer(tok);
+                            captureSigningKey(fb);
+                            s.publishTo(session, seedUrl, null, null, null);
+                            scanLog.log("API auth: logged in via " + loginUrl
+                                    + " (form-encoded OAuth2 password grant) → JWT bearer captured.");
+                            return true;
+                        }
+                    }
                     boolean backOnLogin = fb != null && PW_INPUT.matcher(fb).find();   // failure → login page re-rendered
                     // A 2xx/redirect + cookie is NOT proof of authentication: an SSO/federation endpoint (e.g. a SAML
                     // /Saml2/SignIn that bounces to an external IdP) sets state cookies (esctx/stsservicecookie/Saml2…)
@@ -812,6 +921,34 @@ public final class AutonomousAuth {
         try {
             JSONObject cur = (body != null && body.trim().startsWith("{")) ? new JSONObject(body) : new JSONObject();
             JSONObject errs = new JSONObject(errorJson == null ? "{}" : errorJson);
+            // LIST-FORM validation errors (FastAPI/Pydantic, DRF): {"detail":[{"loc":["body","phone_number"],
+            // "type":"missing","msg":"Field required"}]} — 'detail'/'errors' is an ARRAY, not an object, so the
+            // object-keyed logic below misses it entirely. Extract each field from loc[last] and fill it. This
+            // generalizes to every FastAPI/Pydantic app (a large share of modern APIs), not one target.
+            org.json.JSONArray errList = errs.optJSONArray("detail");
+            if (errList == null) errList = errs.optJSONArray("errors");
+            if (errList != null) {
+                boolean filledAny = false;
+                for (int i = 0; i < errList.length(); i++) {
+                    JSONObject e = errList.optJSONObject(i);
+                    if (e == null) continue;
+                    String field = null;
+                    org.json.JSONArray loc = e.optJSONArray("loc");
+                    if (loc != null && loc.length() > 0) field = loc.optString(loc.length() - 1, null);
+                    if (field == null || field.isBlank()) field = e.optString("field", e.optString("param", ""));
+                    // Skip the wrapper segment ("body"/"query"/"path") and any non-field token.
+                    if (field == null || field.isBlank()
+                            || field.equalsIgnoreCase("body") || field.equalsIgnoreCase("query")
+                            || field.equalsIgnoreCase("path")) continue;
+                    String enumVal = firstEnumOption(fieldErrText(e.opt("msg")));
+                    Object existing = cur.opt(field);
+                    if (enumVal != null) { cur.put(field, enumVal); filledAny = true; }
+                    else if (existing == null || (existing instanceof String && ((String) existing).isBlank())) {
+                        cur.put(field, valueForField(field, email, pass)); filledAny = true;
+                    }
+                }
+                if (filledAny) return forceIdentity(cur.toString(), email, pass);
+            }
             JSONObject fields = errs.optJSONObject("data");
             if (fields == null) fields = errs.optJSONObject("errors");
             if (fields == null) fields = errs.optJSONObject("detail");
@@ -902,7 +1039,8 @@ public final class AutonomousAuth {
 
     /** Signup URLs derived from a login endpoint (swap the login-verb leaf for a signup verb). */
     private static List<String> signupSiblings(String loginUrl) {
-        return leafSiblings(loginUrl, new String[]{ "signup", "register", "sign-up", "signUp", "registration" });
+        return leafSiblings(loginUrl, new String[]{ "signup", "register", "sign-up", "signUp",
+                "registration", "registrations" });   // "registrations" = ASP.NET RegistrationsController convention
     }
 
     /** Identity-resource leaf nouns: a REST app often has NO /register alias and instead creates accounts
@@ -983,7 +1121,8 @@ public final class AutonomousAuth {
                 }
             }
             for (String o : origins)
-                for (String leaf : new String[]{ "/login", "/signin", "/authenticate", "/api/login", "/rest/login", "/auth/login" }) {
+                for (String leaf : new String[]{ "/login", "/signin", "/authenticate", "/api/login", "/rest/login",
+                        "/auth/login", "/api/authorizations", "/api/sessions", "/api/tokens" }) {
                     if (urls.size() >= 30) break;
                     urls.add(o + leaf);
                 }
@@ -1057,7 +1196,10 @@ public final class AutonomousAuth {
         String action = resolveAction(form, pageUrl);
         String loginBody = buildBody(form, user, pass, /*forLogin*/true, null);
         HttpRequestResponse resp = s.postForm(action, loginBody);
-        if (!verifyAuthenticated(s)) return false;
+        boolean authed = verifyAuthenticated(s);
+        scanLog.debug("loginWith: POST " + action + " body=" + loginBody + " → HTTP "
+                + (resp != null && resp.response() != null ? resp.response().statusCode() : -1) + " authed=" + authed);
+        if (!authed) return false;
         s.publishTo(session, urlOf(resp, pageUrl), pageUrl, user, pass);   // login redirect's final url = real entry
         return true;
     }
@@ -1195,6 +1337,37 @@ public final class AutonomousAuth {
             String f = firstFormWith(body, 2);
             if (f != null) return new String[]{f, u};
         }
+        // Proactive probe of CONVENTIONAL registration URLs: a sign-up page is often reachable directly but NOT
+        // linked from any pre-auth page (bWAPP's /user_new.php is only linked from the authenticated portal — a
+        // chicken-and-egg: we can't crawl it until we're in, and we can't get in without it). The crawler also may
+        // reach it only AFTER this auth step. GET each well-known path FRESH and accept its 2-password (or, on a
+        // register-named URL, 1-password) form. Generic well-known-paths list — the register analogue of the
+        // default-creds / standard-OAuth-token-path lists, no per-app data.
+        String origin;
+        try { java.net.URI su = URI.create(seedUrl); origin = su.getScheme() + "://" + su.getAuthority(); }
+        catch (Exception e) { return null; }
+        String[] regPaths = {
+                "/register", "/register.php", "/signup", "/signup.php", "/sign-up", "/sign_up", "/registration",
+                "/registration.php", "/user_new.php", "/users/new", "/user/new", "/account/register",
+                "/accounts/register", "/users/sign_up", "/join", "/create-account", "/createaccount", "/new-user"
+        };
+        for (String p : regPaths) {
+            String u = origin + p;
+            HttpRequestResponse rr;
+            try { rr = s.get(u); } catch (Throwable t) { continue; }
+            String body = bodyOf(rr);
+            int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
+            int pw = body == null ? -1 : countMatches(PW_INPUT, body);
+            if (st == 200 || pw > 0) scanLog.debug("register-probe " + p + " → HTTP " + st + ", pw-inputs=" + pw
+                    + ", len=" + (body == null ? 0 : body.length()));
+            if (body == null || body.isEmpty()) continue;
+            String f = firstFormWith(body, 2);
+            if (f == null) f = firstFormWith(body, 1);   // a register-named URL → its password form IS the register form
+            if (f != null) {
+                scanLog.debug("register: found a sign-up form at the conventional path " + p + " (not linked pre-auth).");
+                return new String[]{f, urlOf(rr, u)};
+            }
+        }
         return null;
     }
 
@@ -1270,6 +1443,7 @@ public final class AutonomousAuth {
     private String buildBody(String form, String user, String pass, boolean forLogin, String[] forceSelect) {
         LinkedHashMap<String, String> fields = new LinkedHashMap<>();
         int pwSeen = 0;
+        boolean submitAdded = false;   // include only the FIRST positive submit (the one a browser click would send)
         Matcher m = TAG.matcher(form);
         while (m.find()) {
             String tag = m.group();
@@ -1285,9 +1459,17 @@ public final class AutonomousAuth {
                 if (chosen != null) fields.put(name, chosen);
                 continue;
             }
-            if (tagName.equals("button")) {                       // submit-like
-                if (forceSelect != null || RESET_BTN.matcher(value == null ? "" : value).find() || RESET_BTN.matcher(stripTags(tag)).find())
+            if (tagName.equals("button")) {                       // submit-like <button name=… value=…>
+                // A browser submits the name=value of the CLICKED button, and many apps GATE the action on its
+                // presence (bWAPP registration: <button name="action" value="create"> — no `action` param, no
+                // account). Include the FIRST positive submit (skip cancel/reset/back), plus the DB-setup buttons
+                // RESET_BTN already covers. Generic — mirrors clicking the form's primary button.
+                boolean cancelish = "reset".equals(type) || CANCEL_BTN.matcher((value == null ? "" : value) + " " + stripTags(tag)).find();
+                if (forceSelect != null || RESET_BTN.matcher(value == null ? "" : value).find() || RESET_BTN.matcher(stripTags(tag)).find()
+                        || (!cancelish && !submitAdded)) {
                     fields.put(name, value == null ? "" : value);
+                    if (!cancelish) submitAdded = true;
+                }
                 continue;
             }
             // <input ...>
@@ -1301,6 +1483,14 @@ public final class AutonomousAuth {
                     fields.put(name, value == null ? "" : value);
                     break;
                 case "checkbox":
+                    // Leave an activation / verification / newsletter checkbox UNCHECKED (omit it): ticking it makes
+                    // the new account require email/SMS confirmation before it can log in (bWAPP's user_new.php
+                    // `mail_activation` — ticked ⇒ the account stays inactive ⇒ the post-signup login fails), or opts
+                    // into a flow that blocks immediate use. A browser submits an unchecked box as ABSENT. Tick
+                    // everything else (terms/agree are often REQUIRED to proceed). Generic — keyed on the field name.
+                    if (name.toLowerCase().matches("(?i).*(activation|activate|verif|newsletter|subscri|notif|opt.?in|remember|sms).*")) break;
+                    fields.put(name, value == null || value.isBlank() ? "on" : value);
+                    break;
                 case "radio":
                     fields.put(name, value == null || value.isBlank() ? "on" : value);
                     break;
@@ -1308,12 +1498,16 @@ public final class AutonomousAuth {
                 case "image":
                 case "button":
                 case "reset":
-                    // Include a submit's name=value when it TRIGGERS the action: a data-reset submit
-                    // (RESET_BTN), OR a forced-select config submit. Many apps gate the change on
-                    // isset($_POST[submitName]) — e.g. DVWA's seclev_submit: without it the security
-                    // level never changes and the whole audit silently runs at the default (impossible).
-                    if (forceSelect != null || RESET_BTN.matcher(value == null ? "" : value).find())
+                    // Include a submit's name=value when it TRIGGERS the action. Many apps gate the change on
+                    // isset($_POST[submitName]) — DVWA's seclev_submit (RESET_BTN), bWAPP login's form=submit,
+                    // a register form's Create. Send the FIRST positive submit (skip cancel/reset), OR a forced-
+                    // select / data-reset submit. Generic — a browser sends the clicked button's name=value.
+                    boolean cancelish = "reset".equals(type) || CANCEL_BTN.matcher((value == null ? "" : value)).find();
+                    if (forceSelect != null || RESET_BTN.matcher(value == null ? "" : value).find()
+                            || (!cancelish && !submitAdded)) {
                         fields.put(name, value == null ? "" : value);
+                        if (!cancelish) submitAdded = true;
+                    }
                     break;
                 default:  // text / email / tel / number / url / etc.
                     // Fill EVERY text-ish field with a valid value — never leave a required field empty. A

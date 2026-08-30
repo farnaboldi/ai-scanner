@@ -23,10 +23,7 @@ import java.util.regex.Pattern;
  * sends no new requests. Recurses one level into arrays/objects so a challenge nested in a wrapper object
  * (or a list of challenges) is still caught, but requires the pair to be SIBLINGS in the same object.
  */
-public final class ResponseSecretExposureProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class ResponseSecretExposureProbe extends Probe {
 
     // The answer/solution to a challenge. NOT generic secrets (token/password) — those have legitimate
     // owner-scoped uses and would FP; only a field literally naming the *solution* is self-defeating.
@@ -59,8 +56,7 @@ public final class ResponseSecretExposureProbe {
             "(?i).*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
     public ResponseSecretExposureProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host) {
@@ -232,5 +228,5 @@ public final class ResponseSecretExposureProbe {
     }
 
     private static String trunc(String s) { return s == null ? "" : (s.length() <= 40 ? s : s.substring(0, 40) + "…"); }
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

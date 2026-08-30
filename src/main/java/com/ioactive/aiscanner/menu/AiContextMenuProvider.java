@@ -61,6 +61,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // + the login NoSQLi's pass-only variant, which needs a KNOWN valid username).
             {"admin@snyk.io", "SuperSecretPassword"}   // snyk-labs/nodejs-goof (auto-seeded)
     };
+
     // A hidden field that carries a SINGLE-USE CSRF token (phpMyAdmin `token`, DVWA `user_token`, Rails
     // `authenticity_token`, WordPress `_wpnonce`) — such a token is consumed per POST, so every credential
     // attempt needs its OWN fresh token (a reused one is rejected → the real cred looks like a failure).
@@ -86,6 +87,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     }
     private static final Pattern SESSION_COOKIE = Pattern.compile("(?i).*(sess|sid|jsession|auth|token|logged_in|wordpress|remember).*");
 
+    private com.ioactive.aiscanner.ui.SettingsTab settingsTab;
+    public void setSettingsTab(com.ioactive.aiscanner.ui.SettingsTab st) { this.settingsTab = st; }
+
     public AiContextMenuProvider(MontoyaApi api, ScanLog scanLog, SessionStore session, AiScanner scanner,
                                  ScanScope scope,
                                  java.util.function.Function<String, String> repoForHost,
@@ -108,13 +112,38 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
 
         String host = hostSeed(selected.get(0));
         if (host == null) return null;
+        final HttpRequestResponse seedRr = selected.get(0);   // the request you right-clicked — adopt its live session
 
         // Single entry: the full autonomous flow (crawl → default-creds login → explore → audit).
         JMenuItem crawlScan = new JMenuItem("Crawl and scan this host");
-        crawlScan.addActionListener(e -> { maybePromptForScanInputs(host); crawlAndScan(host); });
+        crawlScan.addActionListener(e -> { adoptRequestSession(seedRr); maybePromptForScanInputs(host); crawlAndScan(host); });
         List<Component> items = new ArrayList<>();
         items.add(crawlScan);
         return items;
+    }
+
+    /** Adopt the session of the request the user right-clicked so "Crawl and scan this host" runs AS the already
+     *  authenticated user instead of logging in from scratch. Lifts the request's Cookie header (session + CSRF
+     *  cookies) and any Authorization: Bearer token into the shared SessionStore — which also pushes the cookies
+     *  into Burp's cookie jar (the native crawl + active audit then send them). With a real session already present
+     *  the whole auth phase (default-creds / registration / OAuth) is gated off, so it won't clobber it. SessionStore's
+     *  downgrade guard + mutatesOwnAccount fencing then keep the session from being lost mid-scan. Generic — reads
+     *  only standard HTTP auth headers, no app-specific knowledge. */
+    private void adoptRequestSession(HttpRequestResponse rr) {
+        if (rr == null || rr.request() == null || session == null) return;
+        var req = rr.request();
+        String cookie = req.headerValue("Cookie");
+        String authz  = req.headerValue("Authorization");
+        boolean bearer = authz != null && authz.regionMatches(true, 0, "Bearer ", 0, 7);
+        boolean haveCookie = cookie != null && !cookie.isBlank();
+        if (!haveCookie && !bearer) return;   // nothing to adopt → leave the autonomous auth flow to do its thing
+        if (haveCookie) session.set(cookie.trim());
+        if (bearer)     session.setBearer(authz.substring(7).trim());
+        session.setAdopted(true);   // operator-provided session → suppress auto-registration (no account creation on your target)
+        session.setLandingUrl(req.url());
+        scanLog.log("adopted the session from the selected request ("
+                + (haveCookie ? "Cookie" : "") + (bearer ? (haveCookie ? " + Bearer" : "Bearer") : "")
+                + ") — scanning as your authenticated user; login/registration skipped.");
     }
 
     /**
@@ -128,6 +157,11 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
      * Best-effort and idempotent — a no-op if the app has no self-registration or B turns out identical to A.
      */
     private void mintSecondIdentity(String host, String seed) {
+        if (session != null && session.adopted()) {
+            scanLog.log("second-identity registration skipped — scanning with the session you provided; "
+                    + "not creating accounts on your target. Cross-user (BOLA/BFLA) probes run single-session.");
+            return;
+        }
         try {
             SessionStore sessionB = new SessionStore();
             AutonomousAuth authB = new AutonomousAuth(api, sessionB, scanLog, host, seed).withEngine(scanner.engine());
@@ -186,7 +220,9 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 new javax.swing.JLabel("Password:"), passField,
                 new javax.swing.JLabel("Source repo  (local path OR Git URL — drives SAST-assisted testing):"), repoField,
         };
-        javax.swing.JOptionPane.showOptionDialog(null, body, "AI Scanner — scan inputs",
+        // Parent the dialog to Burp's main frame (BApp Store GUI rule) so it centres on Burp and stays modal to it.
+        java.awt.Component parent = api.userInterface().swingUtils().suiteFrame();
+        javax.swing.JOptionPane.showOptionDialog(parent, body, "AI Scanner — scan inputs",
                 javax.swing.JOptionPane.DEFAULT_OPTION, javax.swing.JOptionPane.QUESTION_MESSAGE,
                 null, new Object[]{ "OK" }, "OK");
 
@@ -577,9 +613,8 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     /** Programmatic entry (CLI auto-scan): start the full crawl-and-scan on a seed URL. */
     public void startScan(String seedUrl) {
         if (seedUrl == null || seedUrl.isBlank()) return;
-        scanLog.setLastTarget(seedUrl);
         scanLog.log("auto-scan launching on " + seedUrl);
-        crawlAndScan(seedUrl);
+        crawlAndScan(seedUrl);   // sets lastTarget itself
     }
 
     /** Like {@link #startScan} but BLOCKS until the scan's worker thread finishes — used to chain multiple
@@ -593,6 +628,8 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
 
     private Thread crawlAndScan(String seed) {
         final String host = hostOf(seed);
+        scanLog.setLastTarget(seed);   // register the target for the Rescan button on EVERY path (menu/CLI/batch),
+                                       // and even if the run is later skipped (credit gate) — so Rescan stays usable
         scope.add(host);
         restrictScopeToTarget(seed);   // Burp scans only the target host, not incidental third-party traffic
         Thread t = new Thread(() -> {
@@ -605,12 +642,26 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 com.ioactive.aiscanner.engine.LlmTiming.reset();   // per-scan LLM latency for the benchmark speed column
                 com.ioactive.aiscanner.engine.LocalAiEngine.resetSeed();   // per-scan deterministic seed sequence (reproducible + cache-proof)
                 com.ioactive.aiscanner.scan.EndpointDiscovery.resetScanBudget();   // per-scan LLM discovery-call ceiling → discovery can't grind ~100 calls across re-crawls and stall before the attack battery
-                // Record the exact LLM sampling config in EVERY run (GUI or headless) — temperature drives the
-                // discovery variance, so it must be visible in the log/report without needing -D launch flags.
+                // CLI override: -Daiscanner.scanMode or AISCANNER_SCAN_MODE env var overrides the Settings UI.
+                // Must happen BEFORE the mode is logged so the log reflects the effective mode.
+                {
+                    String modeStr = System.getProperty("aiscanner.scanMode");
+                    if (modeStr == null || modeStr.isBlank()) modeStr = System.getenv("AISCANNER_SCAN_MODE");
+                    if (modeStr != null && !modeStr.isBlank()) {
+                        try {
+                            scanner.config().scanMode = com.ioactive.aiscanner.scan.ScanConfig.ScanMode.valueOf(modeStr.trim().toUpperCase());
+                            if (settingsTab != null) settingsTab.syncScanModeFromConfig();
+                        } catch (Exception ignore) {
+                            scanLog.log("[warn] unknown AISCANNER_SCAN_MODE='" + modeStr + "' — keeping " + scanner.config().scanMode);
+                        }
+                    }
+                }
+                // Record the exact LLM sampling config in EVERY run.
                 {
                     com.ioactive.aiscanner.engine.AiEngine e0 = scanner.engine();
                     scanLog.log("engine: " + (e0 == null ? "none (no-ai / deterministic only)" : e0.paramSummary())
-                            + "  |  discovery rounds=" + com.ioactive.aiscanner.scan.EndpointDiscovery.discoveryRoundsPublic());
+                            + "  |  discovery rounds=" + com.ioactive.aiscanner.scan.EndpointDiscovery.discoveryRoundsPublic()
+                            + "  |  scan mode=" + scanner.config().scanMode.name());
                 }
                 // Burp AI is PAID — show the REAL credit balance UP FRONT (Burp caches it in WorkspaceConfig.json;
                 // this is the true pre-scan number, before any prompt bills). end-of-scan logAiUsage() prints the
@@ -636,25 +687,32 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     scanner.exitIfRequested();
                     return;
                 }
+                boolean isSastMode = scanner.config().scanMode == com.ioactive.aiscanner.scan.ScanConfig.ScanMode.SAST;
+                // In SAST mode the probe battery doesn't run — cap the status-bar denominator to just the
+                // lifecycle phases (Crawling, Source analysis, SAST audit, Idle) so it shows e.g. 2/4, not 2/46.
+                if (isSastMode) scanLog.setPhaseTotal(com.ioactive.aiscanner.scan.ScanPhases.lifecycleCount());
                 boolean wasAuthed = session.authenticated();
-                // Global session propagation: push any captured session (now AND on every future re-capture) into
-                // Burp's cookie jar, so the NATIVE crawler + active audit run authenticated — not just our own
-                // withSessionCookie() requests. Fixes auth-gated pages coming back as empty 302s to the crawl (labs
-                // behind login never discovered) and POSTs 403'ing for a missing session/CSRF cookie.
+                // Global session propagation
                 session.setOnCookieUpdate(c -> pushSessionToCookieJar(c, host));
                 if (session.has()) pushSessionToCookieJar(session.cookieHeader(), host);
-                excludeLogoutFromScope(seed);   // fence off *logout* BEFORE any crawl — never visited
+                excludeLogoutFromScope(seed);
+
                 scanLog.phase("Crawling " + host);
-                scanLog.log("crawling " + seed + " …");
                 burp.api.montoya.scanner.Crawl crawl = null;
-                if (scanner.communityEdition()) {
-                    scanLog.log("Burp Community edition: native crawler unavailable — using the "
-                            + "extension's own authenticated explorer + JS/OpenAPI discovery for the attack surface.");
+                if (isSastMode) {
+                    // SAST mode: skip crawl — IterativeRouteScanner reads the source repo, no browser needed.
+                    scanLog.log("SAST mode — skipping crawl, source analysis drives discovery.");
                 } else {
-                    crawl = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed));
-                    waitForCrawl(crawl);
-                    logCrawlInventory(host, crawl.requestCount());
-                    stopTask(crawl, "crawl");   // don't let Burp keep crawling while we audit (site map is kept)
+                    scanLog.log("crawling " + seed + " …");
+                    if (scanner.communityEdition()) {
+                        scanLog.log("Burp Community edition: native crawler unavailable — using the "
+                                + "extension's own authenticated explorer + JS/OpenAPI discovery for the attack surface.");
+                    } else {
+                        crawl = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed));
+                        waitForCrawl(crawl);
+                        logCrawlInventory(host, crawl.requestCount());
+                        stopTask(crawl, "crawl");
+                    }
                 }
                 // Prime the site map with the seed page when the crawler didn't populate it — Community has no
                 // native crawler, and some SPAs yield a 0-request crawl. All downstream discovery (auth mining,
@@ -937,9 +995,14 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 }
 
                 // Now that the authenticated audit is done, audit login/signin separately for
-                // login-injection coverage — its self-logout no longer costs us anything.
-                scanLog.phase("Auditing login/signin (separate, session no longer needed)");
-                scanner.summarize(scanner.auditAuthPages(host), host);
+                // login-injection coverage — its self-logout no longer costs us anything. SKIP in SAST-only mode:
+                // auditAuthPages() drives the extension's OWN probes (blind-sqli et al.), which SAST mode must not
+                // run ("source routes → Burp native audit only") — running it also surfaced the extension blind-
+                // sqli battery and spiked the status bar to a post-attack phase (44/10).
+                if (!isSastMode) {
+                    scanLog.phase("Auditing login/signin (separate, session no longer needed)");
+                    scanner.summarize(scanner.auditAuthPages(host), host);
+                }
                 // ALL audits finished → NOW honor -Daiscanner.exitOnComplete (headless/Docker run). Exiting
                 // after an earlier summarize() would kill Burp while the login audit was still sending.
                 scanner.exitIfRequested();
@@ -1681,6 +1744,19 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             String sc = buildCookieHeader(resp);
             scanLog.log("re-login → HTTP " + status(resp) + locSuffix(resp)
                     + "  | Set-Cookie: " + (sc.isBlank() ? "(none)" : sc));
+            // A FAILED re-login (bad/empty remembered creds, or a stale CSRF token) BOUNCES to an auth page and
+            // hands back a LOGGED-OUT cookie. Adopting it silently CLOBBERS the working session — the railsgoat
+            // failure mode: re-login 302→/signup → dead _railsgoat_session → every authenticated probe then 302s
+            // and finds nothing. Only adopt the new cookie when the re-login did NOT bounce back to login/signup/
+            // register (i.e. it actually authenticated). Otherwise keep the session we already have. Generic.
+            int rlSt = status(resp);
+            String rlLoc = (rlSt >= 300 && rlSt < 400 && resp.response() != null) ? resp.response().headerValue("Location") : null;
+            boolean bouncedToAuth = rlLoc != null && rlLoc.matches("(?i).*/(log[io]n|sign-?in|sign-?up|signup|register|users/new)(/|\\?|#|$).*");
+            if (bouncedToAuth) {
+                scanLog.log("re-login bounced to " + rlLoc + " (login failed) — KEEPING the existing session; "
+                        + "not adopting the logged-out cookie.");
+                return;   // do NOT clobber the working session with a dead cookie
+            }
             if (!sc.isBlank()) {
                 session.set(sc);
                 // keep Burp's cookie jar in sync — a stale (post-logout) JSESSIONID there can otherwise

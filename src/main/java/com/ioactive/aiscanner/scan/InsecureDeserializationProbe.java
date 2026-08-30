@@ -43,10 +43,7 @@ import java.util.regex.Pattern;
  * A finding is emitted ONLY when this dynamic delta is observed (near-zero FP); the passive magic-byte match alone
  * is not reported, so we never claim a vuln we couldn't trigger.
  */
-public final class InsecureDeserializationProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class InsecureDeserializationProbe extends Probe {
 
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io|sockjs-node)(\\b.*)?$"
@@ -57,8 +54,7 @@ public final class InsecureDeserializationProbe {
     private static final Pattern PHP_SER = Pattern.compile("(?s)^(O:\\d+:\"[^\"]+\":\\d+:\\{.*|a:\\d+:\\{.*)");
 
     public InsecureDeserializationProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** @param candidates discovered GET endpoints to try as the deserialization sink (e.g. a public REST read). */
@@ -167,7 +163,7 @@ public final class InsecureDeserializationProbe {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("GET")
                     .withHeader("Cookie", name + "=" + value);
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(req);
         } catch (Throwable t) { return null; }
     }
 
@@ -277,7 +273,7 @@ public final class InsecureDeserializationProbe {
         try { return Base64.getDecoder().decode(b); } catch (Throwable t) { return null; }
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
     private static String originOf(String url) {
         try { URI u = URI.create(url); return u.getScheme() + "://" + u.getAuthority() + "/"; } catch (Exception e) { return url; }
     }

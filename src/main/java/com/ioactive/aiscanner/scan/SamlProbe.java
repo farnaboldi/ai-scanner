@@ -54,14 +54,10 @@ import java.util.regex.Pattern;
  * <p>TODO (deliberately skipped — need a captured valid assertion / too niche for a zero-FP generic probe):
  * NameID comment-injection (XML canonicalization truncation) and HTTP-Artifact-binding SSRF via ArtifactResolve.
  */
-public final class SamlProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class SamlProbe extends Probe {
 
     public SamlProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     // --- SAML protocol signals (all case-insensitive, no vendor/path hardcoding) ---
@@ -558,9 +554,10 @@ public final class SamlProbe {
                 .withBody(body.toString());
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
+    protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): decompresses the response
+        politeness();   // ScanConfig politeness delay
         try {
-            return AiScanner.decompress(api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(15000L)));
+            return AiScanner.decompress(api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
         } catch (Throwable t) { return null; }
     }
 
@@ -687,7 +684,6 @@ public final class SamlProbe {
         return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
     private static String urlEnc(String s) { return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8); }
-    private static String pathOf(String url) { try { String p = URI.create(url).getPath(); return p == null ? "" : p; } catch (Exception e) { return url; } }
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) / pathOf(String) inherited from Probe.
     private static String yn(boolean b) { return b ? "yes" : "no"; }
 }

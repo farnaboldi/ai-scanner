@@ -34,10 +34,9 @@ import java.util.regex.Pattern;
  * near-dupes {@link SamlProbe}'s SAML-route finding. Non-destructive (a single malformed read per endpoint). Generic:
  * detection is by response shape and endpoint shape only — no vendor/app-specific paths.
  */
-final class VerboseErrorProbe {
+final class VerboseErrorProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
 
     /** ASP.NET page-method / service-handler shapes whose error path a malformed JSON body reliably trips. */
     private static final Pattern PAGE_METHOD = Pattern.compile("(?i)\\.(aspx|asmx|ashx)/[a-z][\\w]*$");
@@ -51,7 +50,7 @@ final class VerboseErrorProbe {
     private static final int MAX_ACTIVE = 60;    // cap active malformed sends per host (a big site map is bounded)
     private static final int MAX_EVIDENCE = 10;  // cap request/response tabs attached to the one host-wide issue
 
-    VerboseErrorProbe(MontoyaApi api, ScanLog scanLog) { this.api = api; this.scanLog = scanLog; }
+    VerboseErrorProbe(MontoyaApi api, ScanLog scanLog) { super(api, scanLog); }
 
     /** Run once per host. Returns the finding count (0 or 1 — one systemic issue per host). */
     int probe(String host, UnaryOperator<HttpRequest> withSession) {
@@ -150,9 +149,10 @@ final class VerboseErrorProbe {
 
     // ------------------------------------------------------------------ helpers (mirror SamlProbe idioms)
 
-    private HttpRequestResponse send(HttpRequest req) {
+    protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): decompresses the response
+        politeness();   // ScanConfig politeness delay
         try {
-            return AiScanner.decompress(api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(15000L)));
+            return AiScanner.decompress(api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
         } catch (Throwable t) { return null; }
     }
 
@@ -186,6 +186,5 @@ final class VerboseErrorProbe {
         String s = String.join(", ", items.subList(0, n));
         return items.size() > n ? s + " (+" + (items.size() - n) + " more)" : s;
     }
-    private static String hostOf(String url) { return Net.authority(url); }
-    private static String pathOf(String url) { try { String p = URI.create(url).getPath(); return p == null ? "" : p; } catch (Exception e) { return url; } }
+    // hostOf(String) / pathOf(String) inherited from Probe.
 }

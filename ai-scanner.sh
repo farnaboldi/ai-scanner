@@ -275,6 +275,10 @@ exec "$JAVA" \
   ${AISCANNER_SQLI_SLEEP_SEC:+-Daiscanner.sqliSleepSec="${AISCANNER_SQLI_SLEEP_SEC}"} \
   "-Daiscanner.discoveryOnly=${AISCANNER_DISCOVERY_ONLY:-false}" \
   "-Daiscanner.nativeOnly=${AISCANNER_NATIVE_ONLY:-false}" \
+  ${AISCANNER_SCAN_MODE:+-Daiscanner.scanMode="${AISCANNER_SCAN_MODE}"} \
+  ${AISCANNER_LLM_RESPONSE_TIMEOUT_MS:+-Daiscanner.llmResponseTimeoutMs="${AISCANNER_LLM_RESPONSE_TIMEOUT_MS}"} \
+  ${AISCANNER_LLM_HARD_DEADLINE_MS:+-Daiscanner.llmHardDeadlineMs="${AISCANNER_LLM_HARD_DEADLINE_MS}"} \
+  ${AISCANNER_LLM_HARD_DEADLINE_CAP_MS:+-Daiscanner.llmHardDeadlineCapMs="${AISCANNER_LLM_HARD_DEADLINE_CAP_MS}"} \
   "-Daiscanner.noAi=${AISCANNER_NO_AI:-false}" \
   "-Daiscanner.logLevel=${AISCANNER_LOG_LEVEL:-INFO}" \
   "-Daiscanner.wafEvasion=${AISCANNER_WAF_EVASION:-false}" \

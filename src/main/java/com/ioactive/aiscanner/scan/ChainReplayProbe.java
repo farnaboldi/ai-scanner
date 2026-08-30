@@ -28,15 +28,14 @@ import java.util.regex.Pattern;
  * host-root resolution gets wrong). Reached sinks are handed to the deterministic oracles (blind-SQLi,
  * body-mutation, NoSQL); no verdict here.
  */
-public final class ChainReplayProbe {
+public final class ChainReplayProbe extends Probe {
 
     private static final int MAX_CANDIDATE_SINKS = 32;   // resolved sink URLs to consumption-test
     private static final int MAX_SINKS = 8;              // consumers we hand to the (heavier) oracles
     private static final int MAX_LEAKS = 4;
     private static final int MAX_FRAGMENTS = 400;
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private final Function<HttpRequest, HttpRequest> sessionizer;   // AiScanner::withSession (Cookie + Bearer)
     private final List<String> leaks;
 
@@ -49,8 +48,7 @@ public final class ChainReplayProbe {
 
     public ChainReplayProbe(MontoyaApi api, ScanLog scanLog,
                             Function<HttpRequest, HttpRequest> sessionizer, List<String> leaks) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
         this.sessionizer = sessionizer;
         this.leaks = leaks;
     }
@@ -228,10 +226,7 @@ public final class ChainReplayProbe {
         return out.toArray(new String[0]);
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

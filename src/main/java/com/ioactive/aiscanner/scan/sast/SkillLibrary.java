@@ -128,6 +128,15 @@ public final class SkillLibrary {
                     case "settings.py":    if (readSmall(p).contains("INSTALLED_APPS")) found.add("django"); break;
                     case "gemfile":        if (readSmall(p).toLowerCase().contains("rails")) found.add("rails"); break;
                     case "composer.json":  if (readSmall(p).toLowerCase().contains("laravel")) found.add("laravel"); break;
+                    case "wp-config.php":
+                    case "wp-config-sample.php": found.add("wordpress"); break;
+                    default:
+                        if (name.endsWith(".php") && !found.contains("wordpress")) {
+                            String c = readSmall(p);
+                            if (c.contains("Plugin Name:") || c.contains("add_action") && c.contains("wp_ajax"))
+                                found.add("wordpress");
+                        }
+                        break;
                     case "pom.xml":
                     case "build.gradle":
                     case "build.gradle.kts":
@@ -146,7 +155,6 @@ public final class SkillLibrary {
                         if (c.contains("graphql") || c.contains("apollo")) found.add("graphql");
                         break;
                     }
-                    default: /* not a marker */
                 }
             }
         } catch (Exception ignore) { }

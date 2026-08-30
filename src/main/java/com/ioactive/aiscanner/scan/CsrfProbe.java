@@ -32,10 +32,7 @@ import java.util.regex.Pattern;
  * a token error, so it never fires there. Zero-FP: the acceptance of a genuinely-forgeable request IS the proof.
  * Intrusive by nature (it re-issues the state-changing action) — for authorized targets.
  */
-public final class CsrfProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class CsrfProbe extends Probe {
 
     private static final Pattern CSRF_TOKEN = Pattern.compile(
             "(?i)(csrf|xsrf|authenticity_?token|__requestverificationtoken|anti.?forgery|request.?verification|nonce|_token$|(^|_)token$)");
@@ -51,7 +48,7 @@ public final class CsrfProbe {
     private static final Pattern STRIP_HDR = Pattern.compile(
             "(?i)^(origin|referer|sec-fetch-.*|x-.*|x-requested-with|x-csrf-token|x-xsrf-token)$");
 
-    public CsrfProbe(MontoyaApi api, ScanLog scanLog) { this.api = api; this.scanLog = scanLog; }
+    public CsrfProbe(MontoyaApi api, ScanLog scanLog) { super(api, scanLog); }
 
     /** {@code sessionApplier}: the SAME live-session accessor every other authed probe uses (attaches the current
      *  session cookie/bearer to a request). Applying it fresh per forge — instead of a cookie string snapshotted
@@ -219,13 +216,10 @@ public final class CsrfProbe {
         return false;
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
     private static boolean hasHeader(HttpRequest r, String n) { try { return r.hasHeader(n); } catch (Throwable t) { return false; } }
     private static String headerValue(HttpRequest r, String n) { try { return r.hasHeader(n) ? r.headerValue(n) : null; } catch (Throwable t) { return null; } }
     private static String ctLower(HttpRequest r) { String c = headerValue(r, "Content-Type"); return c == null ? "" : c.toLowerCase(); }
     private static int status(HttpRequestResponse rr) { return rr != null && rr.response() != null ? rr.response().statusCode() : -1; }
-    private static String hostOf(String u) { return Net.authority(u); }
+    // hostOf(String) inherited from Probe.
 }

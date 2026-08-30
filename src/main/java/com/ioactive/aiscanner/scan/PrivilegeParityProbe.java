@@ -28,18 +28,16 @@ import java.util.regex.Pattern;
  * The confirming request is a normal GET to a legitimate path (no attack signature), so it passes a WAF
  * unchanged and cannot crash a target the way an injection payload can.
  */
-public final class PrivilegeParityProbe {
+public final class PrivilegeParityProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
 
     private static final Pattern PRIV_SEG = Pattern.compile("(?i)^(admin|administrator|manage|management|internal|superuser|staff)$");
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
     public PrivilegeParityProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host, String cookieHeader, String bearer) {
@@ -52,7 +50,7 @@ public final class PrivilegeParityProbe {
                 if (rr.response() == null || !"GET".equalsIgnoreCase(rr.request().method())) continue;
                 String url = rr.request().url();
                 if (!host.equalsIgnoreCase(hostOf(url)) || SKIP.matcher(url).matches()) continue;
-                String path = pathOf(url);
+                String path = normPath(url);
                 if (path == null) continue;
                 int st = rr.response().statusCode();
                 Integer prev = statusByPath.get(path);
@@ -136,7 +134,7 @@ public final class PrivilegeParityProbe {
             HttpRequest g = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
             if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-            return api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(g);
         } catch (Throwable t) { return null; }
     }
 
@@ -146,7 +144,7 @@ public final class PrivilegeParityProbe {
         catch (Exception e) { return null; }
     }
 
-    private static String pathOf(String url) {
+    private static String normPath(String url) {
         try {
             String p = URI.create(url).getPath();
             if (p == null || p.isEmpty()) return "/";
@@ -155,5 +153,5 @@ public final class PrivilegeParityProbe {
         } catch (Exception e) { return null; }
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

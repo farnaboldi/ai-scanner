@@ -24,10 +24,8 @@ import com.ioactive.aiscanner.ui.ScanLog;
  * Covers Jinja2/Twig/Nunjucks ({@code {{}}}), FreeMarker/JSP-EL/Thymeleaf/Velocity/JS ({@code ${}}), Ruby/Thymeleaf
  * ({@code #{}}), ERB/EJS ({@code <%= %>}) and bare-brace engines.</p>
  */
-public final class SstiProbe {
+public final class SstiProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
     private SourceFindings sourceHints;
 
     // Distinctive operands (separate from CommandInjectionProbe's so findings don't collide); the product is
@@ -69,8 +67,7 @@ public final class SstiProbe {
     };
 
     public SstiProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
@@ -149,10 +146,7 @@ public final class SstiProbe {
         return req.withUpdatedParameters(HttpParameter.parameter(name, value, type));
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
     /** Provenance suffix when a source-analysis SSTI/template sink matches this url (else empty). */
     private String prov(String url) {

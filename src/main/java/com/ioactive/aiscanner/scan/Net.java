@@ -41,6 +41,43 @@ public final class Net {
         return q < 0 ? url : url.substring(0, q);
     }
 
+    /**
+     * Percent-encode the characters a strict server (Tomcat / Jetty / most Java stacks) rejects with 400 when they
+     * appear RAW in a URL query value — chiefly the SPACE, plus the RFC-3986 "unwise"/delimiter set. Montoya places
+     * a URL/form parameter value onto the wire literally (it does NOT auto-encode), so an injection payload with a
+     * space (nearly every SQLi/blind/time payload) or an angle bracket (reflected-XSS) is dropped as a malformed
+     * request BEFORE the app ever parses it — silently zeroing injection coverage on Java targets. We encode only
+     * the wire-unsafe set and deliberately leave {@code & = % + '} untouched: those are query-structural or already
+     * handled, and encoding them here would double-encode / change insertion semantics. Idempotent for the payloads
+     * we send (they contain none of the encoded chars pre-encoded). Generic — no app or server fingerprint. */
+    public static String encQuery(String v) {
+        if (v == null || v.isEmpty()) return v;
+        StringBuilder out = new StringBuilder(v.length() + 8);
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            switch (c) {
+                case ' ':  out.append("%20"); break;
+                case '\n': out.append("%0A"); break;
+                case '\r': out.append("%0D"); break;
+                case '\t': out.append("%09"); break;
+                case '"':  out.append("%22"); break;
+                case '<':  out.append("%3C"); break;
+                case '>':  out.append("%3E"); break;
+                case '#':  out.append("%23"); break;
+                case '{':  out.append("%7B"); break;
+                case '}':  out.append("%7D"); break;
+                case '|':  out.append("%7C"); break;
+                case '\\': out.append("%5C"); break;
+                case '^':  out.append("%5E"); break;
+                case '`':  out.append("%60"); break;
+                case '[':  out.append("%5B"); break;
+                case ']':  out.append("%5D"); break;
+                default:   out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
     /** Bare hostname (no port) — for eTLD/registrable-domain and cookie-domain logic where the port is irrelevant. */
     public static String hostName(String url) {
         if (url == null) return "";

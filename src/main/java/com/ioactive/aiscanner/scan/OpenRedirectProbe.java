@@ -19,10 +19,9 @@ import java.util.regex.Pattern;
  * {@code location=}). The canary is an invented host that cannot occur naturally, so a match is
  * definitive; nothing about the payload or the oracle is target-specific.
  */
-public final class OpenRedirectProbe {
+public final class OpenRedirectProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
 
     private static final String CANARY = "aisc-redirect-canary.example";
     // Generic redirect payloads: absolute, scheme-relative, malformed-scheme, backslash and
@@ -50,8 +49,7 @@ public final class OpenRedirectProbe {
             "(?i).*(redirect|return|returnurl|next|dest|destination|goto|continue|url|uri|link|target|forward|callback|success|cancel|back|out|redir|ref|referer|referrer|location).*");
 
     public OpenRedirectProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public boolean probe(HttpRequest req) {
@@ -117,10 +115,7 @@ public final class OpenRedirectProbe {
             || n.matches("(?i)^https?:/+" + canary + "([/:?#].*)?$");        // http(s):/canary…  (malformed-scheme)
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
     /** A parameter plausibly carries a redirect target: redirect-ish name, or a URL/path-looking value. */
     private static boolean redirecty(ParsedHttpParameter p) {

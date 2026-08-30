@@ -36,10 +36,7 @@ import java.util.regex.Pattern;
  * FIRE iff R2 denied AND R3 not-denied AND R3-shape != control-shape. That triple means an authenticated,
  * per-route, admin-tier function executed for a non-privileged user — real missing function-level authz.
  */
-public final class BflaProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class BflaProbe extends Probe {
 
     private static final int MAX_CANDIDATES = 24;
     private static final String BOGUS_ID = "999999999";
@@ -55,8 +52,7 @@ public final class BflaProbe {
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
     public BflaProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host, String cookieHeader, String bearer) {
@@ -225,7 +221,7 @@ public final class BflaProbe {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod(method);
             if (cookie != null && !cookie.isBlank()) r = r.withHeader("Cookie", cookie);
             if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            return api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(r);
         } catch (Throwable t) { return null; }
     }
 
@@ -256,5 +252,5 @@ public final class BflaProbe {
         catch (Exception e) { return ""; }
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

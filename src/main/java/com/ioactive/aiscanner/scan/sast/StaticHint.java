@@ -130,7 +130,17 @@ public final class StaticHint {
         List<String> params = new ArrayList<>();
         JSONArray pa = o.optJSONArray("params");
         if (pa != null) for (int i = 0; i < pa.length(); i++) {
-            String s = pa.optString(i, "").trim();
+            // Params may arrive as bare strings (["name"]) OR as descriptor objects ([{"name":"name","location":"query"}]).
+            // JSONArray.optString(i) on an object returns its raw JSON toString(), which then got seeded as the literal
+            // URL/body param name ("?{"name":...}=1") — so Burp audited a garbage param and missed the real sink. Pull
+            // the name out of the object form; fall back to the string form.
+            Object el = pa.opt(i);
+            String s;
+            if (el instanceof JSONObject po) {
+                s = po.optString("name", po.optString("param", po.optString("paramName", ""))).trim();
+            } else {
+                s = pa.optString(i, "").trim();
+            }
             if (!s.isBlank()) params.add(s);
         }
         return new StaticHint(

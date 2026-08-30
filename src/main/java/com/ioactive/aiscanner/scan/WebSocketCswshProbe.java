@@ -50,10 +50,7 @@ import java.util.regex.Pattern;
  * authenticated by that ambient cookie — the finding text states this conditionally rather than claiming a proven
  * session hijack. Reported once per host:port. Uses only {@code burp.api.montoya.websocket} (no external deps).</p>
  */
-public final class WebSocketCswshProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class WebSocketCswshProbe extends Probe {
 
     // Cross-origin sentinel: a scheme+host no legitimate app is served from, so it is ALWAYS off-origin to any
     // victim. This is an attack MARKER (like an XSS canary), not a computed oracle value.
@@ -62,8 +59,7 @@ public final class WebSocketCswshProbe {
     private static final int MAX_CANDIDATES = 25;
 
     public WebSocketCswshProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** A WS endpoint to test + the legitimate Origin to baseline it with (null ⇒ use the request's own Origin). */
@@ -100,12 +96,12 @@ public final class WebSocketCswshProbe {
                 if (rr == null || rr.response() == null) continue;
                 String body = safeBody(rr.response());
                 if (body == null || !body.toLowerCase().contains("ws")) continue;
-                String pageHost = hostOf(safeUrl(rr.request()));
+                String pageHost = bareHost(safeUrl(rr.request()));
                 String pageOrigin = originOf(safeUrl(rr.request()));
                 Matcher m = WS_URL.matcher(body);
                 while (m.find() && byKey.size() < MAX_CANDIDATES) {
                     String wsUrl = trimTrailing(m.group());
-                    String wsHost = hostOf(wsUrl);
+                    String wsHost = bareHost(wsUrl);
                     if (wsHost == null || pageHost == null || !wsHost.equalsIgnoreCase(pageHost)) continue; // same-host only (stay in authorised scope)
                     String key = keyOf(wsUrl);
                     if (key == null || byKey.containsKey(key)) continue;   // dedup; prefer an already-observed handshake
@@ -145,7 +141,7 @@ public final class WebSocketCswshProbe {
         HttpRequest hs = withSession.apply(c.handshake);
         String url = safeUrl(hs);
         if (url == null) return;
-        String host = hostOf(url);
+        String host = bareHost(url);
         // Authorised-scope gate: the WebSocket's HOST must appear in an in-scope request. A WS may legitimately run on
         // a DIFFERENT PORT than the HTTP surface (Burp's host+port scope would drop it), but we must NEVER open a
         // handshake to a host outside the operator's target scope (e.g. a third-party/CDN host the crawl merely touched).
@@ -205,7 +201,7 @@ public final class WebSocketCswshProbe {
         try {
             for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                 String u = safeUrl(rr == null ? null : rr.request());
-                String hh = hostOf(u);
+                String hh = bareHost(u);
                 if (hh == null) continue;
                 try { if (api.scope().isInScope(u)) hosts.add(hh.toLowerCase()); } catch (Throwable ignore) {}
             }
@@ -232,14 +228,14 @@ public final class WebSocketCswshProbe {
         // 1) a Cookie header the crawl sent to this host
         for (HttpRequestResponse rr : map) {
             HttpRequest r = rr == null ? null : rr.request();
-            if (r == null || !h.equalsIgnoreCase(hostOf(safeUrl(r)))) continue;
+            if (r == null || !h.equalsIgnoreCase(bareHost(safeUrl(r)))) continue;
             try { String c = r.headerValue("Cookie"); if (c != null && !c.isBlank()) return c; } catch (Throwable ignore) {}
         }
         // 2) Set-Cookie(s) the host issued (name=value only)
         StringBuilder sb = new StringBuilder();
         java.util.Set<String> seen = new java.util.HashSet<>();
         for (HttpRequestResponse rr : map) {
-            if (rr == null || rr.response() == null || !h.equalsIgnoreCase(hostOf(safeUrl(rr.request())))) continue;
+            if (rr == null || rr.response() == null || !h.equalsIgnoreCase(bareHost(safeUrl(rr.request())))) continue;
             try {
                 for (burp.api.montoya.http.message.HttpHeader hd : rr.response().headers()) {
                     if (hd.name() == null || !hd.name().equalsIgnoreCase("Set-Cookie") || hd.value() == null) continue;
@@ -274,7 +270,7 @@ public final class WebSocketCswshProbe {
         while (end > 0 && ".,;:)]}>\"'".indexOf(u.charAt(end - 1)) >= 0) end--;
         return u.substring(0, end);
     }
-    private String hostOf(String url) {
+    private String bareHost(String url) {
         try { return java.net.URI.create(url).getHost(); } catch (Throwable t) { return null; }
     }
     /** scheme://host[:port] of an HTTP(S)/WS(S) URL as a browser serialises an Origin (default ports 80/443 omitted). */

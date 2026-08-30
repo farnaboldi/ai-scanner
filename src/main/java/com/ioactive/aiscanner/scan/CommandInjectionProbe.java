@@ -34,15 +34,12 @@ import java.util.regex.Pattern;
  * Both are differential and self-evidencing. Hints only steer WHICH endpoint/param/value; the oracle alone
  * decides — a wrong hint costs a couple of requests, never a false finding.
  */
-public final class CommandInjectionProbe {
+public final class CommandInjectionProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
     private SourceFindings sourceHints;
 
     public CommandInjectionProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
@@ -196,7 +193,8 @@ public final class CommandInjectionProbe {
         return null;
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
+    protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): custom sleep-tied timeout
+        politeness();   // ScanConfig politeness delay
         // Response timeout must exceed the injected sleep so a successful delay is OBSERVED, not cut off.
         try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout((SLEEP_S + 8) * 1000L)); }
         catch (Throwable t) { return null; }

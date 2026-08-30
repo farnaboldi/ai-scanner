@@ -33,10 +33,8 @@ import java.util.regex.Pattern;
  * referenced by the client the crawler sees — is still reached. Every candidate is live-probed; a 404/HTML/
  * signature-rejection simply doesn't fire.
  */
-public final class WebhookAuthProbe {
+public final class WebhookAuthProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
 
     /** A path that is (or claims to be) an inbound webhook/callback — where a signature MUST be enforced. */
     private static final Pattern WEBHOOK_PATH = Pattern.compile(
@@ -54,8 +52,7 @@ public final class WebhookAuthProbe {
     private static final String BOGUS_SIG = "00000000000000000000000000000000000000000000000000000000000000ff";
 
     public WebhookAuthProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host) {
@@ -100,7 +97,7 @@ public final class WebhookAuthProbe {
             try {
                 String url = rr.request().url();
                 if (!host.equalsIgnoreCase(hostOf(url))) continue;
-                String path = pathOf(url);
+                String path = rawPath(url);
                 if (WEBHOOK_PATH.matcher(path).matches()) out.add(base(url) + path);
                 // record API path-prefixes (…/api/v1/<seg>/) to synthesise webhook leaves under
                 java.util.regex.Matcher m = API_PREFIX.matcher(path);
@@ -129,7 +126,7 @@ public final class WebhookAuthProbe {
                          .withHeader("X-Hub-Signature-256", "sha256=" + BOGUS_SIG)
                          .withHeader("X-Webhook-Signature", BOGUS_SIG);
             }
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(req);
         } catch (Throwable t) { return null; }
     }
 
@@ -150,9 +147,9 @@ public final class WebhookAuthProbe {
     private static String base(String url) {
         try { URI u = URI.create(url); return u.getScheme() + "://" + u.getAuthority(); } catch (Exception e) { return ""; }
     }
-    private static String pathOf(String url) {
+    private static String rawPath(String url) {
         try { String p = URI.create(url).getRawPath(); return p == null || p.isEmpty() ? "/" : p; }
         catch (Exception e) { int q = url.indexOf('?'); return q < 0 ? url : url.substring(0, q); }
     }
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

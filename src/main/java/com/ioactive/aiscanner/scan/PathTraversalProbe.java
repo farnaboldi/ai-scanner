@@ -22,10 +22,7 @@ import java.util.regex.Pattern;
  * {@code boot.ini}. Signature + differential gated → effectively zero false positives, and the
  * signatures are properties of the OS, not of any target application.
  */
-public final class PathTraversalProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class PathTraversalProbe extends Probe {
 
     // Generic traversal payloads: depth-saturated, filter-bypass (....//), URL-encoded, absolute,
     // null-byte truncation, and Windows separators. No target-specific filenames beyond OS staples.
@@ -46,8 +43,7 @@ public final class PathTraversalProbe {
     private SourceFindings sourceHints;   // optional SAST directives — used only to tag finding provenance
 
     public PathTraversalProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
@@ -94,10 +90,7 @@ public final class PathTraversalProbe {
         return m.find();
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
     private static String body(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().bodyToString() : ""; }

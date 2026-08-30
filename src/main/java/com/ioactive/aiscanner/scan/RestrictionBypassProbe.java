@@ -28,10 +28,9 @@ import java.util.regex.Pattern;
  * baseline lacked. No app knowledge, no field names, no per-target payloads. (On lesson/challenge apps
  * the acceptance is also recorded server-side, which is what the benchmark counts.)
  */
-public final class RestrictionBypassProbe {
+public final class RestrictionBypassProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
 
     // A value a client would block yet is safe server-side: long + mixed-charset + special char, so it
     // violates length<=5, ^[a-z]{3}$, ^[0-9]{3}$, ^[a-zA-Z0-9 ]*$ (the '!'), fixed option/on/off/"change"
@@ -49,8 +48,7 @@ public final class RestrictionBypassProbe {
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
     public RestrictionBypassProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** Probe one form (already carrying the authenticated session). Returns true if the server accepted a restricted submission. */
@@ -180,10 +178,7 @@ public final class RestrictionBypassProbe {
     }
     private static String safe(String s) { return s == null ? "" : s; }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
     private static String body(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().bodyToString() : ""; }

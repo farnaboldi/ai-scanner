@@ -1,17 +1,18 @@
 package com.ioactive.aiscanner.scan.sast;
 
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.http.RequestOptions;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
+
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.io.ByteArrayInputStream;
 import java.io.OutputStream;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,7 +24,8 @@ import java.util.zip.ZipInputStream;
 /**
  * Resolves a source repo to a LOCAL directory for the SAST pass — WITHOUT git or any subprocess. A value that
  * is already a local directory is returned as-is; a git/GitHub/GitLab URL is downloaded as an archive .zip over
- * HTTP and extracted with the JDK's {@link ZipInputStream} (zip-slip- and size-guarded, top-level dir stripped).
+ * Burp's own HTTP engine (api.http()) and extracted with the JDK's {@link ZipInputStream} (zip-slip- and
+ * size-guarded, top-level dir stripped).
  * This lets the extension "clone" a URL itself while staying pure-Java / no-subprocess. Cached per-URL per run.
  * A private repo can be reached with a token via -Daiscanner.gitToken / AISCANNER_GIT_TOKEN.
  */
@@ -39,7 +41,7 @@ public final class RepoFetcher {
     private static final int  MAX_FILE_BYTES  = 5 * 1024 * 1024;      // skip files larger than this
 
     /** A local directory for {@code repoOrPath} (URL → downloaded+extracted). null if it can't be resolved. */
-    public static String ensureLocal(String repoOrPath, ScanLog log) {
+    public static String ensureLocal(MontoyaApi api, String repoOrPath, ScanLog log) {
         if (repoOrPath == null || repoOrPath.isBlank()) return null;
         String r = repoOrPath.trim();
         // Optional MONOREPO SUBPATH: "<repo-url>#<subdir>" scopes SAST to ONE lab inside a monorepo — download the
@@ -56,7 +58,7 @@ public final class RepoFetcher {
         String cacheKey = subpath == null ? r : r + "#" + subpath;
         String cached = CACHE.get(cacheKey);
         if (cached != null) { try { if (Files.isDirectory(Paths.get(cached))) return cached; } catch (Exception ignore) { } }
-        String local = fetch(r, log);
+        String local = fetch(api, r, log);
         if (local == null) return null;
         String scoped = subDir(local, subpath, log);
         CACHE.put(cacheKey, scoped);
@@ -87,10 +89,10 @@ public final class RepoFetcher {
         return s.matches("(?i)^(https?|git|ssh|git\\+https?)://.*") || s.startsWith("git@");
     }
 
-    private static String fetch(String url, ScanLog log) {
+    private static String fetch(MontoyaApi api, String url, ScanLog log) {
         for (String zipUrl : archiveUrls(url)) {
             try {
-                byte[] zip = httpGet(zipUrl);
+                byte[] zip = httpGet(api, zipUrl);
                 if (zip == null || zip.length < 64) continue;
                 log.log("fetched source archive over HTTP (no git): " + zipUrl + " (" + zip.length + " bytes)");
                 Path dir = extract(zip);
@@ -134,20 +136,43 @@ public final class RepoFetcher {
         return out;
     }
 
-    private static byte[] httpGet(String url) throws Exception {
-        // Pin HTTP/1.1: the JDK HttpClient defaults to HTTP/2, and some auth/reverse proxies mishandle it
-        // (dropped bodies on POST, occasional GET quirks). This is a plain GET so the body-drop bug doesn't
-        // apply, but forcing 1.1 keeps every JDK-transport path in this project consistent and proxy-safe.
-        HttpClient hc = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .connectTimeout(Duration.ofSeconds(20)).build();
-        HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(120))
-                .header("User-Agent", "ai-scanner")
-                .header("Accept", "application/zip, application/octet-stream, */*");
+    private static final int MAX_REDIRECTS = 6;
+
+    /** GET {@code url} through Burp's own HTTP engine (api.http()), NOT java.net.http — so source-archive downloads
+     *  honour the user's upstream proxy + TLS config and appear in Burp's Logger, per the BApp Store networking rules.
+     *  Montoya does not auto-follow redirects and GitHub's zipball endpoint 302s to codeload/S3, so Location hops are
+     *  followed manually (the auth token is sent ONLY to the original host and dropped on any cross-host hop, matching
+     *  java.net's NORMAL redirect policy). Returns the 200 body bytes, or null on non-200 / no response / redirect loop. */
+    private static byte[] httpGet(MontoyaApi api, String url) throws Exception {
         String tok = System.getProperty("aiscanner.gitToken", System.getenv("AISCANNER_GIT_TOKEN"));
-        if (tok != null && !tok.isBlank()) b.header("Authorization", "token " + tok.trim());
-        HttpResponse<byte[]> resp = hc.send(b.GET().build(), HttpResponse.BodyHandlers.ofByteArray());
-        return resp.statusCode() == 200 ? resp.body() : null;
+        String originHost = hostOf(url);
+        String current = url;
+        for (int hop = 0; hop < MAX_REDIRECTS; hop++) {
+            HttpRequest req = HttpRequest.httpRequestFromUrl(current)
+                    .withMethod("GET")
+                    .withAddedHeader("User-Agent", "ai-scanner")
+                    .withAddedHeader("Accept", "application/zip, application/octet-stream, */*");
+            if (tok != null && !tok.isBlank() && hostOf(current).equalsIgnoreCase(originHost))
+                req = req.withAddedHeader("Authorization", "token " + tok.trim());
+            HttpRequestResponse rr = api.http().sendRequest(req,
+                    RequestOptions.requestOptions().withResponseTimeout(120_000L));
+            if (rr.response() == null) return null;
+            int code = rr.response().statusCode();
+            if (code == 200) return rr.response().body().getBytes();
+            if (code >= 300 && code < 400) {                       // follow the redirect (GitHub zipball → codeload/S3)
+                String loc = rr.response().headerValue("Location");
+                if (loc == null || loc.isBlank()) return null;
+                current = URI.create(current).resolve(loc.trim()).toString();
+                continue;
+            }
+            return null;                                            // 4xx/5xx → caller tries the next candidate archive URL
+        }
+        return null;                                               // too many redirects
+    }
+
+    private static String hostOf(String url) {
+        try { String h = URI.create(url).getHost(); return h == null ? "" : h; }
+        catch (Exception e) { return ""; }
     }
 
     /** Extract an archive zip to a temp dir, stripping the single top-level dir; zip-slip + size guarded. */

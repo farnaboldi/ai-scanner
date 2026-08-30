@@ -37,10 +37,9 @@ import java.util.regex.Pattern;
  * <p>Zero-FP by construction: an unguessable marker matched as a RAW substring — an encoded reflection ({@code
  * &lt;svg …}) never counts. Generic: no per-app field/route knowledge.</p>
  */
-public final class StoredXssProbe {
+public final class StoredXssProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private static final AtomicInteger SEQ = new AtomicInteger();
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
@@ -58,8 +57,7 @@ public final class StoredXssProbe {
     private static final Pattern F_TYPE     = Pattern.compile("(?is)\\btype\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
 
     public StoredXssProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** A server-rendered POST form: where it submits, its fields (name→current value), and the free-text fields
@@ -310,11 +308,12 @@ public final class StoredXssProbe {
         } catch (Throwable ignore) { }
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
+    protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): syncs the open-redirect jar first
+        politeness();   // ScanConfig politeness delay
         try {
             syncJar(req);
             return AiScanner.decompress(
-                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
         } catch (Throwable t) { return null; }
     }
 

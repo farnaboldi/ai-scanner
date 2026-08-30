@@ -16,7 +16,7 @@ import java.util.stream.Stream;
 final class SastFiles {
     private SastFiles() {}
 
-    private static final int MAX_DEPTH = 12;
+    static final int MAX_DEPTH = 12;
     private static final long MAX_FILES = 30_000;   // candidate PATHS enumerated (reads stay budget-bounded by callers)
 
     static final Pattern INTERESTING_EXT = Pattern.compile(
@@ -26,7 +26,7 @@ final class SastFiles {
             + "\\.idea|\\.gradle|coverage|bower_components|migrations|\\.next|\\.nuxt)(/|$)");
     private static final Pattern ROUTEY_PATH = Pattern.compile(
             "(?i)(controller|route|handler|\\bapi\\b|view|rest|endpoint|servlet|\\burls?\\b|\\broutes?\\b|"
-            + "index\\.php|main\\.|/app\\.|/server|vuln)");
+            + "index\\.php|main\\.|/app\\.|/server|vuln|\\bschema\\b|\\bmodel\\b|\\bserializ)");
     private static final Pattern SERVER_EXT = Pattern.compile("(?i)\\.(java|kt|py|rb|php|go|rs|cs|scala|c|cc|cpp|jsp)$");
 
     /** Interesting code files under {@code root}, route/sink-bearing server files first. Never throws. */
