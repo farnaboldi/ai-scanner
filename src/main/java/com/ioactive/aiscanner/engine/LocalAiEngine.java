@@ -104,10 +104,11 @@ public final class LocalAiEngine extends PromptAiEngine {
                 if (u.length() > 300) u = u.substring(0, 300) + "…";
                 logger.accept("LLM → " + u);
             }
+            final long callTimeoutMs = cfg.timeoutSeconds * 1000L;   // Settings-tab connection timeout → transport deadline
             long t0 = System.currentTimeMillis();
             String raw;
             try {
-                raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+                raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers, callTimeoutMs);
             } catch (Exception transport) {
                 // Transport failure (hard-deadline hit / HTTP 0 / connection reset under load) — retry ONCE with a
                 // fresh seed so a single blip doesn't silently drop a discovery/payload call. If the retry also
@@ -121,7 +122,7 @@ public final class LocalAiEngine extends PromptAiEngine {
                         + " (" + transport.getClass().getSimpleName()
                         + (transport.getMessage() == null ? "" : ": " + transport.getMessage()) + ") — retrying once");
                 body.put("seed", SEED_SEQ.incrementAndGet());
-                raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+                raw = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers, callTimeoutMs);
             }
             String content = extractContent(raw);
             // Retry ONCE on an empty reply. Thinking models (qwen/vLLM) intermittently return empty content even with
@@ -134,7 +135,7 @@ public final class LocalAiEngine extends PromptAiEngine {
                         + " seed=" + seed + " — retrying once with fresh seed + temp bump");
                 body.put("seed", SEED_SEQ.incrementAndGet());
                 body.put("temperature", Math.min(1.0, cfg.temperature + 0.3));
-                String raw2 = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers);
+                String raw2 = http.postJson(cfg.chatCompletionsUrl(), body.toString(), headers, callTimeoutMs);
                 String c2 = extractContent(raw2);
                 if (!c2.isBlank()) { raw = raw2; content = c2; }
             }

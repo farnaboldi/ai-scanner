@@ -23,10 +23,8 @@ import java.util.regex.Pattern;
  * boolean-true breakout returns more rows) or a failed→succeeded status flip. Its natural effect
  * (e.g. an id filter that now matches everything) is what trips NoSQL challenges, without us hardcoding.
  */
-public final class NoSqlProbe {
+public final class NoSqlProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
     private java.util.List<String> leakSink;            // records JSON records an injection bypass leaks
 
     /** Collect the JSON records the {@code $ne}/breakout bypass leaks, so a downstream chain can replay
@@ -47,8 +45,7 @@ public final class NoSqlProbe {
     private SourceFindings sourceHints;   // optional SAST directives — used only to tag finding provenance
 
     public NoSqlProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
@@ -184,11 +181,33 @@ public final class NoSqlProbe {
     private static final Pattern LOGIN_FAIL = Pattern.compile(
             "(?i)(bad cred|invalid|incorrect|denied|unauthor|wrong (pass|user|cred)|failed|no such (user|account)|"
             + "not found|try again|login error)");
+    // POSITIVE logged-in markers — required by the body-only oracle so it fires on a REAL authenticated page, not
+    // merely a DIFFERENT error page. Without this, a register/other non-login endpoint whose two error responses
+    // simply differ (e.g. dvoauth POST /users: "name is required" vs a cast error) false-positived as an auth bypass.
+    private static final Pattern AUTH_SUCCESS = Pattern.compile(
+            "(?i)(log\\s*out|sign\\s*out|logout|signout|welcome|dashboard|my account|my profile|signed in|"
+            + "logged in|/profile|/account|/dashboard)");
 
     private String knownUser = "";
     /** A username we KNOW is valid (the account our auth flow registered) — lets the auth-bypass check use a
      *  password-only operator with a real user (clean, never triggers user-object app crashes). Optional. */
     public void setKnownUser(String u) { this.knownUser = u == null ? "" : u.trim(); }
+
+    /** True only when the whole app is unreachable — its ORIGIN root also returns no HTTP response. Distinguishes a
+     *  genuine crash (worth a brief recovery wait) from a single endpoint that merely drops this request shape, so
+     *  the crash-recovery poll can never stall the scan on a healthy-but-fussy app (e.g. a single-threaded dev
+     *  server that answers "/" fine but returns HTTP 0 for a concurrent probe request). */
+    private boolean appLooksDown(HttpRequest req) {
+        try {
+            var svc = req.httpService();
+            if (svc == null) return false;
+            String origin = (svc.secure() ? "https://" : "http://") + svc.host() + ":" + svc.port() + "/";
+            HttpRequestResponse rr = send(HttpRequest.httpRequestFromUrl(origin));
+            return rr == null || rr.response() == null || rr.response().statusCode() == 0;
+        } catch (Throwable t) {
+            return false;   // can't determine → assume up, don't poll
+        }
+    }
 
     /**
      * NoSQL authentication-bypass check. Many MongoDB logins run findOne({user,pass}) on unsanitized input
@@ -206,11 +225,19 @@ public final class NoSqlProbe {
             // but still an unhandled throw — kills the process); with a container restart policy they recover, but the
             // restart window (Node boot + Mongo reconnect) can be tens of seconds. If the baseline is DOWN (HTTP 0),
             // POLL for recovery (this is the load-free last phase) so the auth-bypass check isn't lost to a crash window.
-            for (int r = 0; r < 8 && (base == null || base.response() == null || base.response().statusCode() == 0); r++) {
-                try { Thread.sleep(4000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
-                base = send(req);
+            if (base == null || base.response() == null || base.response().statusCode() == 0) {
+                // Distinguish a genuine app crash (worth briefly waiting out) from a single endpoint that simply
+                // won't answer THIS request shape — a single-threaded dev server (Django runserver, Flask) drops
+                // concurrent requests as HTTP 0. Without this gate the recovery poll fired on EVERY dead endpoint
+                // and stalled the whole scan for minutes (watchdog thread-dump). Only wait when the app's ORIGIN is
+                // also down, and keep it short (4×2s) so a real restart is ridden out without freezing the scan.
+                if (!appLooksDown(req)) return false;
+                for (int r = 0; r < 4 && (base == null || base.response() == null || base.response().statusCode() == 0); r++) {
+                    try { Thread.sleep(2000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return false; }
+                    base = send(req);
+                }
+                if (base == null || base.response() == null || base.response().statusCode() == 0) return false;
             }
-            if (base == null || base.response() == null || base.response().statusCode() == 0) return false;
             java.util.List<String[]> fields = new java.util.ArrayList<>();  // {name, baselineValue}
             String pwField = null, userField = null;
             for (ParsedHttpParameter p : req.parameters()) {
@@ -332,6 +359,7 @@ public final class NoSqlProbe {
             String bb = base.response().bodyToString(), ib = inj.response().bodyToString();
             if (bb != null && ib != null && !ib.isBlank()
                     && LOGIN_FAIL.matcher(bb).find() && !LOGIN_FAIL.matcher(ib).find()
+                    && AUTH_SUCCESS.matcher(ib).find()          // POSITIVE logged-in signal, not just a different error
                     && Math.abs(ib.length() - bb.length()) > 8)
                 return true;
         } catch (Throwable ignore) { }
@@ -398,24 +426,9 @@ public final class NoSqlProbe {
         } catch (Exception e) { return null; }
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
-    private static boolean isJson(HttpRequest req) {
-        try {
-            String b = req.bodyToString();
-            if (b == null || b.isBlank()) return false;
-            String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
-            if (ct != null && ct.toLowerCase().contains("json")) return true;
-            // Fall back to body SHAPE: SPAs/fetch sometimes send a JSON body without a json Content-Type,
-            // and captured/replayed requests can lose the header — so treat a {...}/[...] body as JSON too
-            // (matches how AiScanner counts "N JSON field(s)" when selecting the target).
-            String t = b.trim();
-            return (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"));
-        } catch (Throwable t) { return false; }
-    }
+    // isJson(HttpRequest) is inherited from Probe.
     private static String query(HttpRequest req) {
         String u = req.url(); int i = u.indexOf('?'); return i < 0 ? "" : u.substring(i);
     }

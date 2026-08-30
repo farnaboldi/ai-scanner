@@ -35,18 +35,16 @@ import java.util.regex.Pattern;
  * unforgeable by a non-traversal endpoint → zero-FP. Injects URL/BODY params and JSON string fields, matching
  * how {@link BlindSqliProbe} reaches a JSON API's insertion points.
  */
-public final class PathReflectionProbe {
+public final class PathReflectionProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
 
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
     private static final Pattern JSON_STR = Pattern.compile("\"([^\"]+)\"\\s*:\\s*\"([^\"\\\\]*(?:\\\\.[^\"\\\\]*)*)\"");
 
     public PathReflectionProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public boolean probe(HttpRequest req) {
@@ -142,8 +140,5 @@ public final class PathReflectionProbe {
         return m.find() ? m.group(1).replace("\\\"", "\"").replace("\\\\", "\\") : null;
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 }

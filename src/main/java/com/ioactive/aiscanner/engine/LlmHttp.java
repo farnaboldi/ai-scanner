@@ -14,4 +14,14 @@ public interface LlmHttp {
      * @param headers extra headers as "Name: value" lines (Content-Type is added by the impl)
      */
     String postJson(String url, String jsonBody, List<String> headers) throws Exception;
+
+    /**
+     * Same, but with a per-call timeout budget in milliseconds (the caller's configured
+     * {@code EngineConfig.timeoutSeconds}). {@code <= 0} means "use the impl's built-in default".
+     * The default implementation ignores the budget and delegates to the 3-arg form, so a stub
+     * transport stays trivial; {@link MontoyaLlmHttp} honours it.
+     */
+    default String postJson(String url, String jsonBody, List<String> headers, long callTimeoutMs) throws Exception {
+        return postJson(url, jsonBody, headers);
+    }
 }

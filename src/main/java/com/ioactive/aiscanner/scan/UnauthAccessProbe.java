@@ -27,10 +27,7 @@ import java.util.regex.Pattern;
  * </ul>
  * Depends on the site-map bridge: discovered authenticated endpoints must be in the site map to be seen.
  */
-public final class UnauthAccessProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class UnauthAccessProbe extends Probe {
 
     // Never treat STATIC or dev-server assets as "protected endpoints": they are legitimately public and
     // identical for every user, so authed==unauthed is expected, not a vuln (e.g. CRA's /manifest.json, a
@@ -44,8 +41,7 @@ public final class UnauthAccessProbe {
             + "|.*\\.(css|js|mjs|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf|webmanifest)(\\?.*)?$");
 
     public UnauthAccessProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host) {
@@ -71,6 +67,11 @@ public final class UnauthAccessProbe {
                 String bt = baseBody.trim();
                 if (bt.length() < 40 || bt.toLowerCase().contains("\"error\"")) continue;
                 if (!bt.startsWith("{") && !bt.startsWith("[")) continue;                   // JSON data endpoint
+                // API spec documents (OpenAPI/Swagger) are public API documentation by design; any token/JWT
+                // inside them is a placeholder EXAMPLE, not a live secret "served to a caller". Skip them
+                // (generic: by spec URL name, or by a spec-shaped body carrying an "openapi"/"swagger" version
+                // key alongside "paths") — else every spec-exposing API trips a false positive.
+                if (isApiSpec(url, bt)) continue;
                 // CRITICAL: our scanner attaches the session credential to EVERY request, so "carried a
                 // credential" no longer proves the endpoint is private, and authed==anon==identical actually
                 // proves the endpoint is PUBLIC (the credential was irrelevant). So we do NOT claim generic
@@ -83,8 +84,8 @@ public final class UnauthAccessProbe {
 
                 // re-send the SAME request WITHOUT any credential
                 HttpRequest anon = HttpRequest.httpRequestFromUrl(url).withMethod(method);
-                HttpRequestResponse ar = api.http().sendRequest(
-                        anon, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                HttpRequestResponse ar = send(
+                        anon);
                 if (ar == null || ar.response() == null) continue;
                 int anonSt = ar.response().statusCode();
                 if (anonSt < 200 || anonSt >= 300) continue;                                // properly denied → correct
@@ -130,6 +131,22 @@ public final class UnauthAccessProbe {
         return findSecret(body) != null;
     }
 
+    // An OpenAPI/Swagger spec document — public documentation whose embedded tokens are examples, not
+    // served secrets. Generic detection: well-known spec URL names, OR a spec-shaped body (an "openapi" or
+    // "swagger" version key alongside a top-level "paths" object). No app-specific paths.
+    private static final Pattern SPEC_URL = Pattern.compile(
+            "(?i).*/(openapi|swagger)(\\.json|\\.yaml|\\.yml)?$"
+            + "|.*/(v\\d+/)?api-docs(\\.json)?$"
+            + "|.*/swagger/.*/swagger\\.json$"
+            + "|.*/swagger-ui\\b.*");
+    private static boolean isApiSpec(String url, String body) {
+        if (url != null && SPEC_URL.matcher(Net.stripQuery(url)).matches()) return true;
+        if (body == null) return false;
+        String head = body.length() > 8192 ? body.substring(0, 8192) : body;
+        String lb = head.toLowerCase();
+        return (lb.contains("\"openapi\"") || lb.contains("\"swagger\"")) && lb.contains("\"paths\"");
+    }
+
     /** The leaked secret + its position in the body (field name, value, and [start,end) offsets), or null. */
     private static final class Secret {
         final String field, value; final int start, end;
@@ -165,5 +182,5 @@ public final class UnauthAccessProbe {
     }
 
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

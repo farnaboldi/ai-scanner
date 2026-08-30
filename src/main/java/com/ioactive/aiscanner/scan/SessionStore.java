@@ -62,6 +62,14 @@ public final class SessionStore {
      *  {@link #has()} is true even for a csrftoken-only "session" (set on unauth GETs), which isn't real auth. */
     public boolean hasRealSession() { return hasBearer() || hasRealSessionCookie(this.cookieHeader); }
 
+    // Set when the session was PROVIDED by the operator (adopted from the request you right-clicked, or a launch
+    // -Daiscanner.cookie/.bearer) rather than obtained by our own login. Suppresses ALL auto-registration — the
+    // second-identity minting + its disposable-mailbox signup — because when you hand us a session for a real
+    // target we must NOT go create accounts on it.
+    private volatile boolean adopted;
+    public boolean adopted() { return adopted; }
+    public void setAdopted(boolean v) { this.adopted = v; }
+
     // ---- SECOND identity B (a distinct registered user) — enables TRUE cross-user access-control differentials
     // (BOLA/BFLA/mass-assignment/GraphQL-authz): "A reads/writes B's exact object" instead of a single-session
     // distinctness+PII heuristic. Populated by a second registration pass; empty when only one identity was minted.
@@ -131,7 +139,7 @@ public final class SessionStore {
     /** Clear ALL captured session state — call between targets in a batch run so one host's auth (cookie/
      *  bearer/login) never bleeds into the next scan. */
     public void reset() {
-        cookieHeader = ""; landingUrl = ""; bearer = ""; signingKey = "";
+        cookieHeader = ""; landingUrl = ""; bearer = ""; signingKey = ""; adopted = false;
         loginPageUrl = ""; loginUser = ""; loginPass = "";
         cookieHeaderB = ""; bearerB = ""; signingKeyB = ""; ownIdentity = ""; identityB = "";
     }

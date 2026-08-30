@@ -23,10 +23,9 @@ import java.util.regex.Pattern;
  * A mutated create/update that the server ACCEPTS (2xx) is reported; the acceptance is what the
  * server-side challenge keys off. Intrusive by nature (creates/updates data) — for authorized test targets.
  */
-public final class BodyMutatorProbe {
+public final class BodyMutatorProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private int baseStatus = -1, baseLen = -1;   // baseline for the request currently being probed
     private String baseBody = "";                 // baseline response body (for the balance-grew oracle)
     // A balance/wallet-like field in a RESPONSE. Sending a NEGATIVE quantity/amount that makes one of these
@@ -56,8 +55,7 @@ public final class BodyMutatorProbe {
             Pattern.compile("eyJ[A-Za-z0-9_-]{6,}\\.eyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]*");
 
     public BodyMutatorProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** Run the four mutation families over one discovered write request (already session-wrapped). */
@@ -74,7 +72,7 @@ public final class BodyMutatorProbe {
             if (body == null || !body.trim().startsWith("{")) return;
             // baseline the ORIGINAL body: only report a mutation whose response DIVERGES (real effect),
             // so endpoints that 200 on anything (web3 stubs) don't create false positives.
-            HttpRequestResponse b = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse b = send(req);
             this.baseStatus = b != null && b.response() != null ? b.response().statusCode() : -1;
             this.baseLen = b != null && b.response() != null ? b.response().body().length() : -1;
             this.baseBody = b != null && b.response() != null ? b.response().bodyToString() : "";
@@ -222,14 +220,11 @@ public final class BodyMutatorProbe {
         return null;
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 
     private void accepted(HttpRequest req, String url, String family, boolean checkMoney) {
         try {
-            HttpRequestResponse r = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse r = send(req);
             if (r == null || r.response() == null) return;
             int st = r.response().statusCode();
             if (st < 200 || st >= 300) return;

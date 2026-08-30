@@ -21,10 +21,7 @@ import java.util.regex.Pattern;
  * returns a valid, DIFFERENT record, that's cross-tenant access (IDOR) — and its natural effect trips
  * "access another user's resource" challenges (e.g. viewing another basket). Read-only (GET only).
  */
-public final class IdorGetProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class IdorGetProbe extends Probe {
     private static final Pattern NUM_TAIL = Pattern.compile("^(.*/)(\\d{1,7})$");
     /** A page-route tail (…/x.mvc, /x.lesson, /x.jsp, /x.php, /x.aspx, /x.action, …) is a ROUTE to a page, NOT an
      *  object reference. Treating one as an opaque object handle causes BOLA false positives on shared/public
@@ -61,6 +58,23 @@ public final class IdorGetProbe {
     private static final Pattern TENANT_DATA = Pattern.compile("(?i)(\"?e-?mail\"?|\"?owner\"?|\"?user(name)?\"?|\\bvin\\b|first_?name|last_?name|address|phone|ssn|credit|is_?admin|\"admin\"|superuser|is_?staff|creator_?id|author_?id|owner_?id|money_?made|account_?balance|\\bsalary\\b)");
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
+    // Static assets + API-spec documents are NOT per-user ownable objects — they are byte-identical for EVERY
+    // authenticated caller by design, and specs embed EXAMPLE emails/owner fields. A slug-shaped filename like
+    // openapi.json otherwise matches OPAQUE_TAIL and its example email matches TENANT_DATA → a bogus cross-user
+    // "BOLA" (observed: GET /static/openapi.json flagged for two merchant identities). NOT a blanket .json ban
+    // (real IDOR can live on a `.json` API route) — only asset DIRS, spec-named files, and spec-shaped bodies.
+    private static final Pattern STATIC_OR_SPEC = Pattern.compile(
+            "(?i)(^|/)(static|assets?|public|dist|build|_next|node_modules|vendor)(/|$)"     // asset directories
+            + "|/(openapi|swagger|api-?docs)(\\.json|\\.ya?ml)?($|[/?#])"                    // API-spec docs by name
+            + "|\\.(js|mjs|css|map|xml|txt|ico|wasm|woff2?|ttf|eot|svg|png|jpe?g|gif)($|[?#])"); // static file exts
+    private static boolean isStaticOrSpec(String url, String body) {
+        if (url != null && STATIC_OR_SPEC.matcher(url).find()) return true;
+        if (body != null) {                                    // an OpenAPI/Swagger spec served off a plain path
+            String head = body.length() > 400 ? body.substring(0, 400) : body;
+            if (head.matches("(?s).*\"(openapi|swagger)\"\\s*:.*")) return true;
+        }
+        return false;
+    }
     // Auth-flow pages are NOT ownable objects: an id-style tail like /Account/Login or /account/register must
     // never be treated as a per-tenant object, else the cross-identity read flags the SHARED public login page as
     // BOLA (observed: WebGoatCore /Account/Login). Skipped for every IDOR/BOLA branch.
@@ -78,8 +92,7 @@ public final class IdorGetProbe {
     private SourceFindings sourceHints;   // optional SAST directives — only ADD coverage / provenance, never remove
 
     public IdorGetProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** Optional source-analysis directives: widen enumeration on source-flagged object-refs + tag provenance. */
@@ -124,6 +137,11 @@ public final class IdorGetProbe {
                 if (!host.equalsIgnoreCase(hostOf(url)) || SKIP.matcher(url).matches()) continue;
                 String base = url.split("\\?")[0];
                 if (AUTH_FLOW.matcher(base).find()) continue;   // login/register/logout are not ownable objects
+                // Static assets + API-spec docs (/static/…, openapi.json, swagger.json) are byte-identical for
+                // EVERY authenticated caller by design and embed EXAMPLE emails/owner fields — a slug-shaped
+                // filename matches OPAQUE_TAIL and the example email matches TENANT_DATA → a bogus cross-user
+                // "BOLA" (observed: GET /static/openapi.json flagged for two merchant identities). Not ownable.
+                if (isStaticOrSpec(base, rr.response().bodyToString())) continue;
 
                 // (A00) RIGOROUS provably-owned cross-user read — runs BEFORE the A0 heuristic because it is the
                 // STRONGEST (it rules out an intended public directory). For a string/handle-keyed endpoint, read B's
@@ -152,7 +170,7 @@ public final class IdorGetProbe {
                                 HttpRequest g = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
                                 if (cookieB != null && !cookieB.isBlank()) g = g.withHeader("Cookie", cookieB);
                                 if (bearerB != null && !bearerB.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearerB);
-                                HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                                HttpRequestResponse r = send(g);
                                 if (r != null && r.response() != null && r.response().statusCode() == 200) {
                                     String bBody = r.response().bodyToString();
                                     if (bBody != null && bBody.contains(token) && !publiclyReadable(base)) {
@@ -196,7 +214,7 @@ public final class IdorGetProbe {
                                         HttpParameter.parameter(p.name(), String.valueOf(other), HttpParameterType.URL));
                                 if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
                                 if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-                                HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                                HttpRequestResponse r = send(g);
                                 if (r == null || r.response() == null || r.response().statusCode() != 200) continue;
                                 String b = r.response().bodyToString();
                                 if (b == null || b.length() < 40 || b.toLowerCase().contains("\"error\"")) continue;
@@ -234,7 +252,7 @@ public final class IdorGetProbe {
                                 HttpRequest g = HttpRequest.httpRequestFromUrl(root + other).withMethod("GET");
                                 if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
                                 if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-                                HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                                HttpRequestResponse r = send(g);
                                 if (r == null || r.response() == null) continue;
                                 String b = r.response().bodyToString();
                                 if (r.response().statusCode() == 200 && b != null && b.length() > 20 && !b.equals(selfBody)
@@ -271,7 +289,7 @@ public final class IdorGetProbe {
                         HttpRequest g = HttpRequest.httpRequestFromUrl(target).withMethod("GET");
                         if (cookieHeader != null && !cookieHeader.isBlank()) g = g.withHeader("Cookie", cookieHeader);
                         if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-                        HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                        HttpRequestResponse r = send(g);
                         if (r == null || r.response() == null) continue;
                         String b = r.response().bodyToString();
                         // valid (200), non-trivial, DIFFERENT from our own record, AND carrying ownership/PII
@@ -281,6 +299,7 @@ public final class IdorGetProbe {
                         // an object id) returns different text per value but has no tenant data. Zero-FP.
                         if (r.response().statusCode() == 200 && b.length() > 20 && !b.equals(origBody)
                                 && !b.toLowerCase().contains("error") && TENANT_DATA.matcher(b).find()
+                                && !sameOwnerObject(origBody, b)   // neighbor owned by the SAME principal (your own object) → not IDOR
                                 && !publiclyReadable(base)) {
                             scanLog.found("Insecure Direct Object Reference (IDOR)", base,
                                     "id " + id + " → " + other + " returned a different record with tenant/PII data "
@@ -310,7 +329,7 @@ public final class IdorGetProbe {
             HttpRequest g = HttpRequest.httpRequestFromUrl(listUrl).withMethod("GET");
             if (cookie != null && !cookie.isBlank()) g = g.withHeader("Cookie", cookie);
             if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-            HttpRequestResponse r = api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse r = send(g);
             if (r != null && r.response() != null && r.response().statusCode() == 200) {
                 String body = r.response().bodyToString();
                 if (body != null) {
@@ -350,10 +369,40 @@ public final class IdorGetProbe {
      *  pages whose prose merely contains words like "user"/"owner"/"address"; a public /Product/Details catalogue).
      *  CONSERVATIVE — returns false (⇒ KEEP the finding) on any error / non-2xx / empty body / login-or-deny page,
      *  so a genuinely access-controlled object is never suppressed. */
+    // Owner-object comparison for the single-identity numeric tier: does the neighbor belong to the SAME principal
+    // as the base record (the caller's OWN sequential object), rather than a different tenant? Compares only
+    // OWNER-identifying fields (merchant_id/owner_id/user_id/account_id/tenant_id/*_email/*_name) — NOT the bare
+    // id/email a "looked_up_by"/debug echo of the CALLER also carries. Every owner field present in BOTH holding
+    // the SAME value → same owner → suppress; any owner field DIFFERS → genuine cross-tenant read → flag. Fixes
+    // the FP where /payments/812 and /payments/813 are both the caller's own (merchant_id 53).
+    private static final Pattern OWNER_KV = Pattern.compile(
+            "(?i)\"((?:merchant|owner|user|account|tenant|creator|author|customer)_?(?:id|email|name|number))\"\\s*:\\s*\"?([^\",}\\s]{1,128})");
+    private static java.util.Map<String, String> ownerKv(String body) {
+        java.util.Map<String, String> m = new java.util.HashMap<>();
+        java.util.regex.Matcher mm = OWNER_KV.matcher(body);
+        while (mm.find()) {
+            String k = mm.group(1).toLowerCase().replace("_", ""), v = mm.group(2);
+            if (v != null && !v.isBlank() && !"null".equalsIgnoreCase(v)) m.putIfAbsent(k, v);
+        }
+        return m;
+    }
+    private static boolean sameOwnerObject(String a, String b) {
+        if (a == null || b == null) return false;
+        java.util.Map<String, String> oa = ownerKv(a), ob = ownerKv(b);
+        boolean anyCommon = false;
+        for (java.util.Map.Entry<String, String> e : oa.entrySet()) {
+            String bv = ob.get(e.getKey());
+            if (bv == null) continue;
+            anyCommon = true;
+            if (!bv.equalsIgnoreCase(e.getValue())) return false;   // an owner field differs → different principal
+        }
+        return anyCommon;   // shared owner field(s), all equal → same principal
+    }
+
     private boolean publiclyReadable(String url) {
         try {
             HttpRequest bare = HttpRequest.httpRequestFromUrl(url).withMethod("GET");   // NO Cookie / Authorization
-            HttpRequestResponse r = api.http().sendRequest(bare, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse r = send(bare);
             if (r == null || r.response() == null) return false;
             int sc = r.response().statusCode();
             if (sc < 200 || sc >= 300) return false;               // unauth denied / redirected → access-controlled → real
@@ -399,7 +448,7 @@ public final class IdorGetProbe {
             HttpRequest g = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (cookie != null && !cookie.isBlank()) g = g.withHeader("Cookie", cookie);
             if (bearer != null && !bearer.isBlank()) g = g.withHeader("Authorization", "Bearer " + bearer);
-            return api.http().sendRequest(g, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(g);
         } catch (Throwable t) { return null; }
     }
 
@@ -408,5 +457,5 @@ public final class IdorGetProbe {
         return "{" + id.substring(0, 5) + "…}";
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

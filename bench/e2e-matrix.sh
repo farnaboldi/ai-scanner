@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end benchmark matrix: run AI Scanner against the vulnerable-target registry and score each cell.
+# End-to-end benchmark: run it against the vulnerable-target registry and score each cell.
 #
 # Usage:
 #   bench/e2e-matrix.sh --verify                              # pre-flight only (build jar, check LLM + Burp); scans nothing
@@ -7,8 +7,6 @@
 #   TARGETS="dvwa juice" bench/e2e-matrix.sh                  # explicit subset
 #   TARGETS=all NO_CACHE=1 bench/e2e-matrix.sh 2>/dev/null    # sweep every containerized target from scratch, one at a time
 #   WEB_SRC=both TARGETS="snapstore" bench/e2e-matrix.sh      # per-target A/B: black-box vs +source (DAST vs DAST+SAST)
-#   bench/e2e-matrix.sh pair goof nodevuln                    # scan N targets concurrently in ONE Burp
-#   AISCANNER_NO_AI=1 bench/e2e-matrix.sh pair goof nodevuln  # deterministic-only (no LLM endpoint needed)
 #
 # Env knobs: CONFIGS (default "pro-ext"; also "pro-bare" = Burp-native crawl+audit, no extension) · WEB_SRC (off|on|both,
 #   the source-repo dimension) · SAST_MODE (agentic|coarse) · NO_CACHE=1 (ignore cached reports) · PRO_WATCHDOG_MIN /
@@ -41,7 +39,6 @@ ALL_TARGETS=(
   "juice|docker|bkimminich/juice-shop|3000|3000|/|https://github.com/juice-shop/juice-shop"
   "dvga|running|aisc-dvga|5013|5013|/|https://github.com/dolevf/Damn-Vulnerable-GraphQL-Application"
   "vampi|running|aisc-vampi|5001|5000|/|https://github.com/erev0s/VAmPI"
-  "pygoat|running|aisc-pygoat|8002|8000|/|https://github.com/adeyosemanputra/pygoat"
   "dvcsharp|running|aisc-dvcsharp|5500|5000|/|https://github.com/appsecco/dvcsharp-api"
   "nodegoat|running|aisc-nodegoat-web-1|4000|4000|/|https://github.com/OWASP/NodeGoat"
   "railsgoat|running|aisc-railsgoat-web-1|3300|3000|/|https://github.com/OWASP/railsgoat"
@@ -49,6 +46,7 @@ ALL_TARGETS=(
   "snapstore|docker|snapstore:dast|0|8080|/|https://github.com/robertelee78/r2c-mock-polyglot"
   "dvwa|docker|vulnerables/web-dvwa|4280|80|/|https://github.com/digininja/DVWA"
   "webgoat|docker|webgoat/webgoat:v2025.3|8090|8080|/WebGoat/|https://github.com/WebGoat/WebGoat"
+  "bwapp|docker|raesene/bwapp|8088|80|/|https://github.com/raesene/bWAPP"
   "vapi|docker|aiscanner-vapi:local|9000|8081|/|https://github.com/jorritfolmer/vulnerable-api"
   "sqli-labs|docker|acgpiano/sqli-labs:latest|0|80|/|https://github.com/Audi-1/sqli-labs"
   "mutillidae|docker|citizenstig/nowasp:latest|0|80|/|https://github.com/webpwnized/mutillidae"
@@ -58,16 +56,15 @@ ALL_TARGETS=(
   "tiredful|docker|aiscanner-tiredful:local|0|8000|/api/v1/|https://github.com/payatu/Tiredful-API"
   "vulnerableapp|running|aisc-vulnerableapp|9090|9090|/VulnerableApp/|https://github.com/SasanLabs/VulnerableApp"
   "log4shell|running|aisc-log4shell|8901|8080|/|"
-  "crapi|running|crapi-web|8888|80|/|https://github.com/OWASP/crAPI"
+  "crapi|compose|crapi-web|8889|80|/|https://github.com/OWASP/crAPI"
   "dvws|running|dvws-node-web-1|8180|80|/|https://github.com/snoopysecurity/dvws-node"
-  "dvoauth|running|gallery|3005|3005|/|https://github.com/koenbuyens/Vulnerable-OAuth-2.0-Applications"
-  "reactvulna|running|javulna|8080|8080|/rest/movie|https://github.com/vulnerable-apps/vulnerable-react-app"
+  "dvoauth|running|gallery|3005|3005|/|https://github.com/farnaboldi/Vulnerable-OAuth-2.0-Applications"
   "sstipy|running|aisc-ti-python|5056|13375|/Jinja2|https://github.com/Hackmanit/template-injection-playground"
   "dvwssock|running|DVWS_WEB|8888|8888|/csrf.php|https://github.com/interference-security/DVWS"
   "vulnlab|running|aisc-vulnlab|1337|80|/|https://github.com/Yavuzlar/VulnLab"
   "webgoatnet|running|aisc-webgoatnet|9500|8080|/|https://github.com/tobyash86/WebGoat.NET"
-  "goof|running|aisc-goof|3011|3001|/|https://github.com/snyk-labs/nodejs-goof"
   "nodevuln|running|nodevuln-vulnerable_node-1|4290|3000|/|https://github.com/cr0hn/vulnerable-node"
+  "vulnbank|docker|aiscanner-vulnbank:local|7010|5000|/|https://github.com/Commando-X/vuln-bank"
   "zero|external||||http://zero.webappsecurity.com/|"
   "pentestground|external||||https://pentest-ground.com:9000/|"
 )
@@ -86,6 +83,28 @@ breakdown(){   # <report> → tab-separated  DET  HIGH  MED  LOW  counts
 }
 fmt_dur(){ local s="${1:-0}"; printf '%dm%02ds' $((s/60)) $((s%60)); }   # <seconds> → "Xm Ys" (the TIME column)
 have(){ command -v "$1" >/dev/null 2>&1; }
+
+# --- SAST model-effectiveness metrics ------------------------------------------------------
+# The SAST-only sweep is a PROXY for LLM quality: given the same source, which model extracts more REAL routes?
+# Every column below is verified against the running app, so it measures the model, not the attack surface:
+#   proposed  = routes the model claimed from source (raw recall attempt)
+#   live      = those that ping-verified (non-404/502/503) → the endpoint ACTUALLY EXISTS (real working routes)
+#   precision = live/proposed (= 1 − hallucination rate) → how much the model makes up
+#   audited   = live routes that also carried a real param/insertion point Burp then exercised
+#   findings  = genuine native-audit HITs on them (folded black-box baseline excluded)
+#   avg_llm   = mean per-call latency (ms) → the "faster for us" axis
+sast_metrics(){   # <celllog> <report> → TAB: proposed  live  precision%  audited  findings  avg_llm_ms
+  local cl="$1" rp="$2" prop=0 live=0 aud=0 fnd=0 prec=0 avg=0 pl
+  pl=$(grep -oE 'SAST: [0-9]+/[0-9]+ route\(s\) verified live' "$cl" 2>/dev/null | tail -1 | grep -oE '[0-9]+/[0-9]+' | tail -1)
+  [ -n "$pl" ] && { live="${pl%/*}"; prop="${pl#*/}"; }
+  aud=$(grep -oE 'SAST: submitted [0-9]+ live route' "$cl" 2>/dev/null | tail -1 | grep -oE '[0-9]+' | head -1)
+  # Real vulns only (VULNERABILITY+HIGH+MED, matching metric()); the "Unencrypted communications" LOW is constant
+  # localhost noise on every target and doesn't differentiate models, so it's excluded from the headline count.
+  fnd=$(grep -E '^VULNERABILITY:|^HIGH |^MED ' "$rp" 2>/dev/null | grep -vc 'additive: black-box baseline')
+  [ "${prop:-0}" -gt 0 ] 2>/dev/null && prec=$(( live * 100 / prop ))
+  avg=$(grep -oE 'in [0-9]+ms' "$cl" 2>/dev/null | grep -oE '[0-9]+' | awk '{s+=$1;n++} END{if(n>0)printf "%d",s/n; else print 0}')
+  printf '%s\t%s\t%s\t%s\t%s\t%s' "${prop:-0}" "${live:-0}" "${prec:-0}" "${aud:-0}" "${fnd:-0}" "${avg:-0}"
+}
 
 # ---- pre-flight verification --------------------------------------------------------------
 verify(){   # build the ext jar, confirm the AI backend + docker + on-demand target images + the Burp Pro jar
@@ -107,7 +126,7 @@ verify(){   # build the ext jar, confirm the AI backend + docker + on-demand tar
     say "  [ok] AI backend = Burp AI (api.ai()); cached credit balance = ${bal:-unknown}  (local-LLM endpoint check skipped)"
   else
   local m; m=$(curl -s -m 15 -H "Authorization: Bearer $AISCANNER_API_KEY" -H 'ngrok-skip-browser-warning: 1' "${AISCANNER_BASE_URL%/}/models" 2>/dev/null | grep -o "$AISCANNER_MODEL" | head -1)
-  local c; c=$(curl -s -m 40 -H "Authorization: Bearer $AISCANNER_API_KEY" -H 'Content-Type: application/json' -H 'ngrok-skip-browser-warning: 1' -d "{\"model\":\"$AISCANNER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"reply OK\"}],\"max_tokens\":8,\"stream\":false,\"chat_template_kwargs\":{\"enable_thinking\":false}}" "${AISCANNER_BASE_URL%/}/chat/completions" 2>/dev/null | grep -o '"content":"[^"]*"' | head -1)
+  local c; c=$(curl -s -m 60 -H "Authorization: Bearer $AISCANNER_API_KEY" -H 'Content-Type: application/json' -H 'ngrok-skip-browser-warning: 1' -d "{\"model\":\"$AISCANNER_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"reply OK\"}],\"max_tokens\":64,\"stream\":false,\"chat_template_kwargs\":{\"enable_thinking\":false}}" "${AISCANNER_BASE_URL%/}/chat/completions" 2>/dev/null | grep -o '"content":"[^"]*"' | head -1)
   if [ "$m" = "$AISCANNER_MODEL" ] && [ -n "$c" ]; then say "  [ok] LLM reachable ($AISCANNER_MODEL, chat=$c)"; else say "  [FAIL] LLM not reachable (model='$m' chat='$c')"; ok=0; fi
   fi
   # 3) docker + benchnet
@@ -209,19 +228,107 @@ setup_dvwa(){   # $1=base → login admin/password, create DB, security=low
   rm -f "$jar"
 }
 setup_webgoat(){ curl -s -m 20 -X POST "${1%/}/register.mvc" -d "username=aisc&password=aiscpass&matchingPassword=aiscpass&agree=agree" >/dev/null 2>&1 || true; }   # $1=base → register aisc/aiscpass (idempotent)
-setup_dvoauth(){   # $1=base → deterministically reseed the fragile hand-rolled OAuth server (mongo-first), gate on koen login
+setup_bwapp(){   # $1=base → wait for MySQL to be ready, then init the bWAPP schema via install.php; idempotent
+  local base="${1%/}" i body
+  # bWAPP bundles MySQL inside the container; it takes 10-30s after docker start before Apache can reach it.
+  # Hitting /install.php before MySQL is up returns "Could not connect to the database" (43 bytes) and does nothing.
+  for i in $(seq 1 20); do
+    body=$(curl -s -m 10 "$base/install.php?install=yes" 2>/dev/null)
+    case "$body" in
+      *"already exists"*|*"bWAPP installed"*|*"Installation complete"*) say "  bwapp: DB installed (i=$i)"; return 0;;
+      *"Connection failed"*|*"Can't connect"*|*"mysqld.sock"*|"") sleep 3; continue;;  # MySQL not ready yet
+    esac
+    sleep 2   # got some other response; retry once more
+  done
+  say "  [warn] bwapp: DB install did not confirm (MySQL slow); continuing anyway"
+}
+setup_crapi(){   # OWASP crAPI (10-container stack: web+identity+community+workshop+chatbot+postgres+mongo+chroma+mailhog+dealer)
+  # Owns full bring-up + teardown like setup_dvoauth — NOT started with start_running (too many containers; needs compose).
+  local dir="/tmp/crapi-src" i
+  if [ ! -d "$dir/.git" ]; then
+    say "  crapi: cloning OWASP/crAPI (shallow)…"
+    git clone --depth 1 -q https://github.com/OWASP/crAPI "$dir" 2>>"$LOG" \
+      || { say "  [FAIL] crapi git clone"; return 1; }
+  fi
+  local compose="$dir/deploy/docker"
+  # Remove any stale named containers from a previous run so `compose up` recreates cleanly.
+  docker rm -f crapi-identity crapi-community crapi-workshop crapi-chatbot crapi-web \
+    postgresdb mongodb chromadb mailhog "api.mypremiumdealership.com" >/dev/null 2>&1 || true
+  say "  crapi: docker compose up -d (10 services, pulling images…)"
+  ( cd "$compose" && LISTEN_IP=127.0.0.1 docker compose up -d 2>>"$LOG" ) \
+    || { say "  [FAIL] crapi compose up"; return 1; }
+  # Wait for crapi-web to become reachable — identity+DB services start in parallel and take 60-120s.
+  for i in $(seq 1 40); do
+    curl -s -o /dev/null -m5 "http://localhost:8889/" 2>/dev/null && { say "  crapi: web reachable (i=$i)"; return 0; }
+    sleep 5
+  done
+  say "  [warn] crapi: web not reachable after ~200s — scan may be empty"
+}
+teardown_crapi(){   # stop the full compose stack cleanly so the next cell doesn't hit Docker-mac memory limits
+  local dir="/tmp/crapi-src/deploy/docker"
+  [ -d "$dir" ] && ( cd "$dir" && docker compose down -v --remove-orphans >/dev/null 2>&1 ) || true
+}
+
+setup_dvrestaurant(){
+  local base="${1%/}"   # e.g. http://localhost:8091
+  local dir="/tmp/dvrestaurant-src"
+  [ -d "$dir/.git" ] || git clone --depth 1 -q https://github.com/theowni/Damn-Vulnerable-RESTaurant-API-Game "$dir" >/dev/null 2>&1 || true
+  ( cd "$dir" && docker compose up -d --build >/dev/null 2>&1 ) || true
+  for i in $(seq 1 40); do curl -s -m5 -o /dev/null "$base/docs" 2>/dev/null && break; sleep 3; done
+  # Register a scanner user (idempotent — 422 if already exists)
+  curl -s -m10 -X POST "$base/register" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"aisc","password":"aiscpass","first_name":"AI","last_name":"Scanner","phone_number":"555-0100"}' >/dev/null 2>&1 || true
+  # Obtain initial token
+  local token
+  token=$(curl -s -m10 -X POST "$base/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=aisc&password=aiscpass" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+  [ -z "$token" ] && return
+  # Exploit L3 (broken auth — no caller check on update_role) to escalate aisc to Employee.
+  # This unlocks PUT /menu/{id} (SSRF surface) and POST /orders.
+  curl -s -m10 -X PUT "$base/users/update_role" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -d '{"username":"aisc","role":"Employee"}' >/dev/null 2>&1 || true
+  # Refresh token so the scanner session carries the Employee role.
+  token=$(curl -s -m10 -X POST "$base/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=aisc&password=aiscpass" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null)
+  [ -n "$token" ] && export AISCANNER_BEARER="$token" || true
+}
+setup_dvoauth(){
   local b="${1%/}"
-  docker start mongodb >/dev/null 2>&1; sleep 4
-  docker exec gallery node -e 'const c=require("/usr/src/app/config/config.json");const {MongoClient}=require("mongodb");MongoClient.connect(c.mongodb.url,{useNewUrlParser:true,useUnifiedTopology:true},async(e,x)=>{if(e)process.exit(0);try{await x.db().dropDatabase();}catch(_){}process.exit(0);});' >/dev/null 2>&1 || true
-  docker restart mongoseed >/dev/null 2>&1; sleep 12   # restores the dump (koen + photoprint/maliciousclient clients)
-  docker start gallery photoprint attacker >/dev/null 2>&1
-  local i loc
+  local url="https://github.com/farnaboldi/Vulnerable-OAuth-2.0-Applications"
+  local dir="/tmp/dvoauth-src"   # transient working clone (re-cloned if missing) — same /tmp/<target>-src convention setup_nodevuln uses
+  if [ ! -d "$dir/.git" ]; then
+    say "  dvoauth: cloning fork $url"; rm -rf "$dir"
+    git clone --depth 1 "$url" "$dir" >/dev/null 2>&1 || { say "  [FAIL] dvoauth git clone"; return 1; }
+  else ( cd "$dir" && git pull --ff-only >/dev/null 2>&1 || true ); fi
+  local app="$dir/insecureapplication" i loc
+  # The compose uses FIXED container_names (gallery/mongodb/…); a stale stack from a different compose project (or a
+  # hand-wired dvo-mongo) collides on those names → remove them first so `up` recreates cleanly from this clone.
+  docker rm -f gallery mongodb mongoseed photoprint attacker dvo-mongo >/dev/null 2>&1 || true
+  say "  dvoauth: docker compose up --build (mongo:3.6 + register-fixed gallery)…"
+  ( cd "$app" && docker compose up -d --build >/dev/null 2>&1 ) || { say "  [FAIL] dvoauth compose up"; return 1; }
+  # compose depends_on waits for START, not READINESS → the one-shot mongoseed races mongod; wait, re-seed, restart gallery.
+  for i in $(seq 1 30); do docker exec mongodb mongo --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 && break; sleep 2; done
+  ( cd "$app" && docker compose up -d --no-deps --force-recreate mongoseed >/dev/null 2>&1 ); sleep 10
+  # verify the dump actually restored (the mongoseed tools MUST match the server version, else it silently seeds nothing);
+  # the OAuth-vuln surface needs the seeded clients (photoprint/maliciousclient) + koen's refresh tokens.
+  docker exec mongodb mongo gallery2 --quiet --eval 'quit(db.clients.count()>0?0:1)' >/dev/null 2>&1 \
+    || say "  [warn] dvoauth: seed EMPTY (clients=0) — OAuth-vuln coverage degraded (check mongoseed vs mongo version)"
+  docker restart gallery >/dev/null 2>&1
+  # Readiness gate — CREDENTIAL-FREE: register a throwaway user (exactly what the scanner does) and expect the 302→/
+  # that a successful signup returns. Proves app-up + DB-up + the register fix, without hardcoding anyone's password.
+  local u
   for i in $(seq 1 25); do
-    loc=$(curl -s -i -m6 -X POST -d 'username=koen&password=password' "$b/login" 2>/dev/null | grep -iE '^location:' | tr -d '\r')
-    printf '%s' "$loc" | grep -qiE 'location: /[[:space:]]*$' && { say "  dvoauth: STABLE (koen/password login → /)"; return 0; }
+    u="aiscgate$$$i"
+    loc=$(curl -s -i -m6 -X POST -d "username=$u&email=$u@x.com&password=Aa1aiscpw" "$b/users" 2>/dev/null | grep -iE '^location:' | tr -d '\r')
+    printf '%s' "$loc" | grep -qiE 'location: /[[:space:]]*$' && { say "  dvoauth: STABLE (generic self-registration → session; no hardcoded creds)"; return 0; }
     sleep 3
   done
-  say "  [warn] dvoauth: koen login not confirmed after ~75s (gallery flaky) — scan may run degraded"
+  say "  [warn] dvoauth: self-registration not confirmed after ~75s — scan may run degraded"
 }
 setup_aspgoat(){   # start the Ollama→OpenAI shim on host :11434 so AspGoat's LLM labs reuse our qwen (idempotent)
   curl -s -m3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && { say "  aspgoat: Ollama shim already up on :11434"; return; }
@@ -285,6 +392,27 @@ setup_nodevuln(){   # cr0hn/vulnerable-node (Express/EJS/Postgres): clone+patch(
   done
   say "  [warn] nodevuln: login not confirmed (pg/node bring-up flaky)"
 }
+
+setup_vulnbank(){   # Commando-X/vuln-bank (Flask+Postgres): build local image + compose up on host :7010
+  if ! docker image inspect aiscanner-vulnbank:local >/dev/null 2>&1; then
+    local src=/tmp/vulnbank-src
+    [ -d "$src/.git" ] || git clone -q --depth 1 https://github.com/Commando-X/vuln-bank "$src" 2>>"$LOG"
+    docker build -q -t aiscanner-vulnbank:local "$src" >>"$LOG" 2>&1 || { say "  [warn] vulnbank: image build failed"; return 1; }
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -q vulnbank; then
+    # Override the compose port to 7010 (7000 = macOS AirPlay/ControlCenter; 5000 = vampi)
+    docker run -d --name aisc-vulnbank-db --network benchnet \
+      -e POSTGRES_DB=vulnerable_bank -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+      postgres:13 >>"$LOG" 2>&1 || true
+    docker run -d --name aisc-vulnbank --network benchnet -p 7010:5000 \
+      -e DB_NAME=vulnerable_bank -e DB_USER=postgres -e DB_PASSWORD=postgres \
+      -e DB_HOST=aisc-vulnbank-db -e DB_PORT=5432 \
+      --health-cmd='python3 -c "import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:5000/healthz\",timeout=5)"' \
+      --health-interval=10s --health-retries=5 --health-start-period=20s \
+      aiscanner-vulnbank:local >>"$LOG" 2>&1 || say "  [warn] vulnbank: container start failed"
+  else docker start aisc-vulnbank-db aisc-vulnbank >/dev/null 2>&1; fi
+  wait_http "http://localhost:7010/" && say "  vulnbank: up on :7010" || say "  [warn] vulnbank: not reachable"
+}
 wait_http(){ local u="$1" i; for i in $(seq 1 30); do curl -s -o /dev/null -m 5 "$u" && return 0; sleep 2; done; return 1; }
 
 # ---- run one cell -------------------------------------------------------------------------
@@ -293,12 +421,19 @@ run_pro(){   # $1=url $2=repfile $3=ext(true/false) $4=repo(optional SAST source
   local celllog="${rep%.report.txt}.log"; : > "$celllog"   # per-cell log (the extension logs "localhost", not the target name)
   { echo "==== $(basename "${rep%.report.txt}")  url=$url  ext=$ext  repo=${repo:-<none>}  audit=${PRO_AUDIT_MIN:-40}min ===="; } >> "$celllog"
   say "    log → $celllog"
-  local SRC="$repo" SMODE="${SAST_MODE:-agentic}"
-  # Bound the audit deadline BELOW the watchdog cap so the extension finalizes + writes the report before we kill Burp.
-  local dl="${PRO_AUDIT_MIN:-40}"
+  # Effective scan mode: SAST_ONLY=1 → SAST; else preserve AISCANNER_SCAN_MODE from the outer env (default DAST_SAST).
+  local _SM; [ "${SAST_ONLY:-0}" = 1 ] && _SM=SAST || _SM="${AISCANNER_SCAN_MODE:-DAST_SAST}"
+  # When scan mode is SAST, the analyzer is always iterative (SAST_MODE is redundant — force it).
+  local SRC="$repo" SMODE; [ "$_SM" = SAST ] && SMODE=iterative || SMODE="${SAST_MODE:-agentic}"
+  local dl="${PRO_AUDIT_MIN:-40}"; [ "$_SM" = SAST ] && dl=12
   if [ "$ext" = true ]; then
+    # AISCANNER_LOG_FILE makes the EXTENSION own the cell log (its live file sink) → the same path the Settings
+    # "Log to file" box reflects (checked + path), so a CLI-parametrised log is visible + consistent in the UI.
+    # The extension mirrors every line there (autoflush), so raw Burp/launcher stdout goes to a .raw sibling to
+    # avoid duplicating each line; the salvage grep + human tail both read the clean $celllog.
     AISCANNER_SOURCE_REPO="$SRC" AISCANNER_SAST_MODE="$SMODE" \
-    AISCANNER_EXIT_ON_COMPLETE=true AISCANNER_AUDIT_MINUTES="$dl" AISCANNER_LOG_LEVEL="${AISCANNER_LOG_LEVEL:-DEBUG}" AISCANNER_REPORT_DIR="$dir" ./ai-scanner.sh "$url" >>"$celllog" 2>&1 &
+    AISCANNER_SCAN_MODE="$_SM" \
+    AISCANNER_EXIT_ON_COMPLETE=true AISCANNER_AUDIT_MINUTES="$dl" AISCANNER_LOG_LEVEL="${AISCANNER_LOG_LEVEL:-DEBUG}" AISCANNER_LOG_FILE="$celllog" AISCANNER_REPORT_DIR="$dir" ./ai-scanner.sh "$url" >>"${celllog}.raw" 2>&1 &
   else   # pro-bare: Burp-native crawl+audit, extension NOT loaded
     AISCANNER_EXIT_ON_COMPLETE=true AISCANNER_AUDIT_MINUTES="$dl" AISCANNER_REPORT_DIR="$dir" AISCANNER_NATIVE_ONLY=true EXT_JAR=/dev/null ./ai-scanner.sh "$url" >>"$celllog" 2>&1 &
   fi
@@ -324,14 +459,16 @@ run_pair(){   # $@ = target names → bring each up + stabilize, ONE Burp scanni
     IFS='|' read -r name kind image hostport cport path repo <<< "$spec"
     base="http://localhost:$hostport$path"
     case "$t" in   # self-bootstrapping targets own their bring-up; everything else = generic start_running + optional setup
-      goof)       setup_goof;;
       nodevuln)   setup_nodevuln;;
+      vulnbank)   setup_vulnbank;;
       dvwssock)   setup_dvwssock;;
+      dvoauth)      setup_dvoauth "$base";;   # fork clone + compose up (owns bring-up; no redundant start_running first)
+      crapi)        setup_crapi;;             # 10-container stack; compose up + own teardown via teardown_crapi
       *) [ "$kind" = running ] && start_running "$image" "$base"
          case "$t" in
-           dvoauth) setup_dvoauth "$base";;
            dvwa)    setup_dvwa "http://localhost:$hostport";;
            webgoat) setup_webgoat "$base";;
+           bwapp)   setup_bwapp "$base";;
            aspgoat) setup_aspgoat;;
          esac;;
     esac
@@ -381,13 +518,22 @@ for tname in $PRIORITY; do
     # web-src (WEB_SRC): the target's SOURCE-repo dimension. off → black-box only; on → source only; both → both cells (A/B).
     # Only *-ext configs can use source (a bare Burp has no extension). Empty repo → no source cell.
     srcvariants=("")
-    case "${WEB_SRC:-off}" in
+    # AISCANNER_SCAN_MODE=SAST implies the source repo is required AND that this is a SAST-ONLY run — route it
+    # through the 'only' variant so the cell is labelled '+sast-only' (its OWN report file + TSV row), never
+    # colliding with or overwriting the DAST+SAST '+websrc' cache.
+    _effective_web_src="${WEB_SRC:-off}"
+    [ "${AISCANNER_SCAN_MODE:-}" = SAST ] && _effective_web_src=only
+    case "$_effective_web_src" in
       on)   { [ -n "$repo" ] && [[ "$cfg" == *-ext ]]; } && srcvariants=("$repo");;
       both) { [ -n "$repo" ] && [[ "$cfg" == *-ext ]]; } && srcvariants=("" "$repo");;
+      only) { [ -n "$repo" ] && [[ "$cfg" == *-ext ]]; } && srcvariants=("$repo") && SAST_ONLY=1 || SAST_ONLY=0;;
     esac
 
     for src in "${srcvariants[@]}"; do
-      local_label="$cfg"; [ -n "$src" ] && local_label="${cfg}+websrc"
+      local_label="$cfg"
+      if [ -n "$src" ]; then
+        [ "${SAST_ONLY:-0}" = 1 ] && local_label="${cfg}+sast-only" || local_label="${cfg}+websrc"
+      fi
       rep="$RES/${tname}__${local_label}.report.txt"
       if [ -s "$rep" ] && [ "${NO_CACHE:-0}" != 1 ]; then mc=$(metric "$rep"); say "  SKIP $tname/$local_label (cached: $mc)"; echo "$tname,$local_label,$mc,cached">>"$CSV"; printf '%s\t%s\t%s\t%s\t%s\n' "$tname" "$local_label" "$mc" "$(breakdown "$rep")" cached | tee -a "$TSV"; continue; fi
       cell_t0=$(date +%s)   # per-target wall-clock start (bring-up + scan)
@@ -398,13 +544,20 @@ for tname in $PRIORITY; do
         read -r cname hp <<< "$(spin "$name" "$image" "$cport" "$safe_tag")"
         base="http://localhost:$hp"; [ "$path" != "/" ] && base="$base${path%/}"
         say "  spun $cname on :$hp — waiting…"; wait_http "$base/" || say "  [warn] $tname slow to start"
-        case "$tname" in dvwa) setup_dvwa "http://localhost:$hp";; webgoat) setup_webgoat "$base";; sqli-labs) setup_sqlilabs "http://localhost:$hp";; mutillidae) setup_mutillidae "http://localhost:$hp";; aspgoat) setup_aspgoat;; esac
+        case "$tname" in dvwa) setup_dvwa "http://localhost:$hp";; webgoat) setup_webgoat "$base";; bwapp) setup_bwapp "$base";; sqli-labs) setup_sqlilabs "http://localhost:$hp";; mutillidae) setup_mutillidae "http://localhost:$hp";; aspgoat) setup_aspgoat;; esac
         curl_url="$base/"
+      elif [ "$kind" = compose ]; then
+        # compose-kind: target owns its full multi-container bring-up via a setup_<name> function and must also own teardown.
+        case "$tname" in
+          crapi)       setup_crapi;;
+          *) say "  [warn] no setup_$tname for compose-kind target — skipping bring-up";;
+        esac
+        curl_url="http://localhost:$hostport$path"
       elif [ "$kind" = running ]; then
         case "$tname" in   # self-bootstrapping targets own their full bring-up; others just start the pre-built container
-          goof)       setup_goof;;
           nodevuln)   setup_nodevuln;;
           dvwssock)   setup_dvwssock;;
+          dvoauth)      setup_dvoauth "http://localhost:$hostport$path";;   # fork clone + compose up (owns bring-up; no start_running)
           *) start_running "$image" "http://localhost:$hostport$path";;
         esac
         curl_url="http://localhost:$hostport$path"
@@ -418,6 +571,12 @@ for tname in $PRIORITY; do
         nodegoat) export AISCANNER_LOGIN_EMAIL=admin AISCANNER_LOGIN_PASSWORD=Admin_123;;
         *)        unset AISCANNER_LOGIN_EMAIL AISCANNER_LOGIN_PASSWORD;;
       esac
+      case "$tname" in   # per-target module scoping: skip the full battery for single-purpose targets
+        sstipy)   export AISCANNER_ONLY=ssti;;         # template-injection playground only
+        dvwssock) export AISCANNER_ONLY=cswsh;;        # WebSocket CSRF target only
+        log4shell) export AISCANNER_ONLY=log4shell;;   # log4shell target only
+        *)        unset AISCANNER_ONLY;;
+      esac
       case "$cfg" in
         pro-ext)  run_pro "$curl_url" "$rep" true "$src";;
         pro-bare) run_pro "$curl_url" "$rep" false "";;
@@ -425,7 +584,10 @@ for tname in $PRIORITY; do
       # Additive invariant: SAST is a strict superset of black-box (hints only steer probes; oracles alone decide). But
       # OOB/Collaborator findings are stochastic, so fold any black-box finding missing from the +websrc run into it
       # (host:port normalized) → +websrc >= black-box, always.
-      if [ -n "$src" ]; then
+      # NOT for SAST-ONLY: that mode runs NO extension probes/oracles — it is a NARROWER measurement (source routes →
+      # Burp native audit), NOT a superset of black-box. Folding black-box findings into it would report vulns the
+      # SAST run never found, destroying the DeepSeek-vs-Qwen signal. Only genuine SAST findings count here.
+      if [ -n "$src" ] && [ "${SAST_ONLY:-0}" != 1 ]; then
         base_rep="$RES/${tname}__${cfg}.report.txt"
         if [ -s "$base_rep" ] && [ -s "$rep" ]; then
           _nf(){ grep -E '^VULNERABILITY:|^HIGH |^MED ' "$1" 2>/dev/null | sed -E 's#(://[^/ ]+):[0-9]+#\1#g' | sort -u; }
@@ -438,6 +600,16 @@ for tname in $PRIORITY; do
       fi
       n=$(metric "$rep"); say "  DONE $tname/$local_label: $n finding(s)"; echo "$tname,$local_label,$n,done">>"$CSV"
       printf '%s\t%s\t%s\t%s\t%s\n' "$tname" "$local_label" "$n" "$(breakdown "$rep")" "$(fmt_dur $(( $(date +%s) - cell_t0 )))" | tee -a "$TSV"
+      # SAST-only: also emit the model-effectiveness row (verified-live routes + precision + audited + findings).
+      # This is the headline for the DeepSeek-vs-Qwen comparison — each column is verified against the running app.
+      if [ "${SAST_ONLY:-0}" = 1 ]; then
+        _cl="${rep%.report.txt}.log"; _sm="$RES/sast-metrics.tsv"
+        [ -s "$_sm" ] || printf 'TARGET\tMODEL\tPROPOSED\tLIVE\tPREC%%\tAUDITED\tFINDINGS\tAVG_LLM_ms\tTIME\n' > "$_sm"
+        IFS=$'\t' read -r _prop _live _prec _aud _fnd _avg <<<"$(sast_metrics "$_cl" "$rep")"
+        printf '%s\t%s\t%s\t%s\t%s%%\t%s\t%s\t%s\t%s\n' "$tname" "${AISCANNER_MODEL:-?}" \
+          "$_prop" "$_live" "$_prec" "$_aud" "$_fnd" "$_avg" "$(fmt_dur $(( $(date +%s) - cell_t0 )))" >> "$_sm"
+        say "  SAST-metrics $tname [${AISCANNER_MODEL:-?}]: live=$_live/$_prop (${_prec}% prec)  audited=$_aud  findings=$_fnd  avg-llm=${_avg}ms"
+      fi
       # Delta-teardown: stop everything THIS cell started (prefix-agnostic), cancelling restart policies first so
       # crashed --restart containers (goof/nodevuln) don't respawn. Pre-existing unrelated containers are untouched.
       newly="$(docker ps -q 2>/dev/null | sort | comm -13 <(printf '%s\n' "$cell_pre_containers") -)"
@@ -446,6 +618,8 @@ for tname in $PRIORITY; do
         printf '%s\n' "$newly" | xargs -P4 -n1 -I{} docker stop -t 3 {} >/dev/null 2>&1
       fi
       [ "$kind" = docker ] && [ -n "$cname" ] && teardown "$cname"   # rm the fresh-spun instance (avoids name reuse)
+      # compose-kind targets own their teardown to free memory before the next cell (critical for crAPI's 10 containers).
+      [ "$kind" = compose ] && case "$tname" in crapi) teardown_crapi;; esac
     done
   done
 done
@@ -464,3 +638,20 @@ say "===== MATRIX (findings/cell) ====="
     printf "\n"
   done
 } | tee "$RES/e2e-matrix.txt" | tee -a "$LOG"
+
+# ---- SAST model-effectiveness headline (SAST-only sweeps) ----------------------------------
+# The proxy scorecard for "which LLM is better for us": per-target verified-live routes + precision + audited +
+# findings, then an aggregate line. Both model runs append to sast-metrics.tsv (tagged by MODEL), so after the
+# DeepSeek run AND the Qwen run this file holds both — the cross-model comparison reads straight from it.
+if [ "${AISCANNER_SCAN_MODE:-}" = SAST ] && [ -s "$RES/sast-metrics.tsv" ]; then
+  say "===== SAST MODEL-EFFECTIVENESS  (model=${AISCANNER_MODEL:-?}) ====="
+  {
+    # This run's rows (current model), aligned into a table.
+    awk -F'\t' -v m="${AISCANNER_MODEL:-?}" 'NR==1 || $2==m' "$RES/sast-metrics.tsv" | (have column && column -t -s $'\t' || cat)
+    echo
+    awk -F'\t' -v m="${AISCANNER_MODEL:-?}" '
+      NR>1 && $2==m { p+=$3; l+=$4; a+=$6; f+=$7; gsub(/%/,"",$5); ps+=$5; gsub(/ms/,"",$8); ms+=$8; n++ }
+      END { if(n>0) printf "AGGREGATE %s: targets=%d  proposed=%d  live=%d  precision=%d%% (mean %d%%)  audited=%d  findings=%d  avg-llm=%dms\n",
+            m, n, p, l, (p>0?l*100/p:0), ps/n, a, f, ms/n }' "$RES/sast-metrics.tsv"
+  } | tee "$RES/sast-metrics.txt" | tee -a "$LOG" >&2
+fi

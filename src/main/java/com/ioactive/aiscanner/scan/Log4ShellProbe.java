@@ -36,10 +36,8 @@ import java.util.function.UnaryOperator;
  * classic sink (logged regardless of route/auth). Each header/param carries a UNIQUE Collaborator subdomain so
  * an interaction attributes back to the exact injection point. Generic: no per-app header/route knowledge.</p>
  */
-public final class Log4ShellProbe {
+public final class Log4ShellProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
     // Daemon pool used ONLY to bound a single collab.getAllInteractions() call — Montoya's Collaborator polling has
     // no client timeout, so a slow/unreachable Collaborator server can block each poll ~50s (17 min over 20 rounds).
     private static final ExecutorService POLL_POOL = Executors.newCachedThreadPool(r -> {
@@ -55,8 +53,7 @@ public final class Log4ShellProbe {
     private static final int MAX_ENDPOINTS = 8;   // bound request volume: base URL + up to 7 distinct target paths
 
     public Log4ShellProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /**
@@ -139,9 +136,10 @@ public final class Log4ShellProbe {
     }
 
     private HttpRequestResponse send(HttpRequest req, UnaryOperator<HttpRequest> withSession) {
+        politeness();   // ScanConfig politeness delay
         HttpRequest s = withSession != null ? withSession.apply(req) : req;
         try {
-            return api.http().sendRequest(s, RequestOptions.requestOptions().withResponseTimeout(15000L));
+            return api.http().sendRequest(s, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
         } catch (Throwable t) {
             try { return HttpRequestResponse.httpRequestResponse(s, null); } catch (Throwable ignore) { return null; }
         }

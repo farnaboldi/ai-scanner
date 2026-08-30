@@ -52,10 +52,7 @@ import java.util.regex.Pattern;
  * not on any one app. If the authenticated account cannot yet see any rooms (the agent is gated behind deeper
  * onboarding), the probe reports that honestly rather than silently skipping the surface.
  */
-public final class AgentFlowProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class AgentFlowProbe extends Probe {
     private final AiEngine engine;   // optional — used ONLY to plan a generic unlock when the surface is gated
     // State-changing agent requests we drove (run-create, turn-post, LLM-unlock writes) — exposed so the caller
     // adds them to `targets`, so the Burp active audit + targets-iterating probes fuzz the agent surface too.
@@ -74,8 +71,7 @@ public final class AgentFlowProbe {
     public AgentFlowProbe(MontoyaApi api, ScanLog scanLog) { this(api, scanLog, null); }
 
     public AgentFlowProbe(MontoyaApi api, ScanLog scanLog, AiEngine engine) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
         this.engine = engine;
     }
 
@@ -339,7 +335,7 @@ public final class AgentFlowProbe {
             if (jsonBody != null) req = req.withBody(jsonBody).withHeader("Content-Type", "application/json");
             req = req.withHeader("Accept", "application/json");
             req = withSession.apply(req);   // adds Cookie / Authorization: Bearer / X-Signature last
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(req);
         } catch (Throwable t) {
             scanLog.debug("  agent-flow: send " + method + " " + url + " failed: " + t);
             return null;
@@ -351,7 +347,7 @@ public final class AgentFlowProbe {
         try {
             if (!req.hasHeader("Accept")) req = req.withHeader("Accept", "application/json");
             req = withSession.apply(req);   // sign LAST — covers final method/path/body
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(req);
         } catch (Throwable t) {
             scanLog.debug("  agent-flow: sendReq failed: " + t);
             return null;
@@ -385,7 +381,7 @@ public final class AgentFlowProbe {
         return null;
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 
     private static String pathOnly(String url) {
         try { String p = URI.create(url).getRawPath(); return p == null || p.isEmpty() ? "/" : p; }

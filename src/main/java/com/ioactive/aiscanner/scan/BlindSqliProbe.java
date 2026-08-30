@@ -34,10 +34,7 @@ import java.util.regex.Pattern;
  * fields, so a JSON API's insertion points are otherwise skipped — the same gap that hid NoSQL). No
  * app-specific payloads or paths — the SQL is generic and the decision is a response differential.
  */
-public final class BlindSqliProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class BlindSqliProbe extends Probe {
     // Shared adaptive throttle (set once before a parallel run; null = no throttling). Thread-safe; every send
     // feeds its response status so a 429 from ANY worker shrinks the whole pool. Volatile: published before the
     // worker threads start.
@@ -94,8 +91,7 @@ public final class BlindSqliProbe {
     private SourceFindings sourceHints;   // optional SAST directives — used only to tag finding provenance
 
     public BlindSqliProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
@@ -164,32 +160,43 @@ public final class BlindSqliProbe {
     public boolean probe(HttpRequest req, long deadlineMs) {
         try {
             if (SKIP.matcher(req.url()).matches()) return false;
+            // Strip the internal routing-param skip tag (set by AiScanner.synthesizeHintTargets for SAST-hinted
+            // requests). Routing params (e.g. action=ajaxTrigger) are not injection targets — mutating them just
+            // breaks server-side routing and returns 500, wasting budget and polluting the log.
+            java.util.Set<String> skipParams = new java.util.HashSet<>();
+            for (burp.api.montoya.http.message.HttpHeader hdr : req.headers()) {
+                if ("X-AI-Skip".equalsIgnoreCase(hdr.name())) {
+                    for (String pn : hdr.value().split(",")) if (!pn.isBlank()) skipParams.add(pn.trim().toLowerCase());
+                }
+            }
+            final HttpRequest fReq = skipParams.isEmpty() ? req : req.withRemovedHeader("X-AI-Skip");
             long t0 = System.nanoTime();
-            HttpRequestResponse base = send(req);
+            HttpRequestResponse base = send(fReq);
             long baseMs = (System.nanoTime() - t0) / 1_000_000;
             if (base == null || base.response() == null) return false;
 
             // 1) URL/BODY params — inject via Montoya's parameter model.
-            for (ParsedHttpParameter p : req.parameters()) {
+            for (ParsedHttpParameter p : fReq.parameters()) {
                 if (System.currentTimeMillis() > deadlineMs) return false;
                 if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;
                 if (AuthenticatedExplorer.isCsrfParam(p.name())) continue;   // mutating a CSRF token → 403, never a sink
+                if (skipParams.contains(p.name().toLowerCase())) continue;   // routing constant — not an injection point
                 String orig = p.value() == null ? "" : p.value();
-                if (runChannels(req, v -> inject(req, p, v),
+                if (runChannels(fReq, v -> inject(fReq, p, v),
                         p.name() + " (" + p.type() + ")", orig, seeds(orig), baseMs)) return true;
             }
 
             // 2) JSON body string fields — Montoya doesn't expose these as parameters, so inject into the
             //    raw body. This is what reaches JSON APIs (e.g. a coupon_code posted as {"coupon_code":…}).
-            if (isJson(req)) {
-                String body = req.bodyToString();
+            if (isJson(fReq)) {
+                String body = fReq.bodyToString();
                 Matcher m = JSON_STR.matcher(body);
                 Set<String> keys = new LinkedHashSet<>();
                 while (m.find()) keys.add(m.group(1));       // collect first so injection can't disturb iteration
                 for (String key : keys) {
                     if (System.currentTimeMillis() > deadlineMs) return false;
                     String cur = currentJsonValue(body, key);
-                    if (runChannels(req, v -> req.withBody(setJsonString(body, key, v)),
+                    if (runChannels(fReq, v -> fReq.withBody(setJsonString(body, key, v)),
                             key + " (JSON)", cur, seeds(cur), baseMs)) return true;
                 }
                 // Numeric JSON fields — the ORDER BY / LIMIT / paging sink that string-only harvesting misses (a grid's
@@ -201,7 +208,7 @@ public final class BlindSqliProbe {
                 for (String key : numKeys) {
                     if (System.currentTimeMillis() > deadlineMs) return false;
                     String cur = currentJsonNumber(body, key);
-                    if (runChannels(req, v -> req.withBody(setJsonNumber(body, key, v)),
+                    if (runChannels(fReq, v -> fReq.withBody(setJsonNumber(body, key, v)),
                             key + " (JSON#)", cur, seeds(cur), baseMs)) return true;
                 }
             }
@@ -211,8 +218,8 @@ public final class BlindSqliProbe {
             //    headers. Cookie is skipped (replacing it would clobber the session). Generic standard header set.
             for (String h : HEADER_POINTS) {
                 if (System.currentTimeMillis() > deadlineMs) return false;
-                String cur = req.hasHeader(h) ? req.headerValue(h) : "Mozilla/5.0";
-                if (fastSqli(req, v -> req.withHeader(h, v), h + " (header)", cur)) return true;
+                String cur = fReq.hasHeader(h) ? fReq.headerValue(h) : "Mozilla/5.0";
+                if (fastSqli(fReq, v -> fReq.withHeader(h, v), h + " (header)", cur)) return true;
             }
 
             // 4) PARAM MINING for a parameterless GET page — the injectable param may be a documented text hint
@@ -220,17 +227,17 @@ public final class BlindSqliProbe {
             //    small GENERIC corpus of ubiquitous query-param names; the SQLi oracle IS the gate (a name that
             //    isn't a real param just echoes the baseline and never separates → zero-FP), so this is generic,
             //    not a rule hardcoded to any app. Fast channel only, bounded corpus.
-            if ("GET".equalsIgnoreCase(req.method())
-                    && req.parameters().stream().noneMatch(p -> p.type() == HttpParameterType.URL)) {
+            if ("GET".equalsIgnoreCase(fReq.method())
+                    && fReq.parameters().stream().noneMatch(p -> p.type() == HttpParameterType.URL)) {
                 for (String name : COMMON_PARAMS) {
                     if (System.currentTimeMillis() > deadlineMs) return false;
                     Function<String, HttpRequest> build =
-                            v -> req.withAddedParameters(HttpParameter.parameter(name, v, HttpParameterType.URL));
-                    if (fastSqli(req, build, name + " (mined URL param)", "1")) return true;   // error-based (cheap)
+                            v -> fReq.withAddedParameters(HttpParameter.parameter(name, Net.encQuery(v), HttpParameterType.URL));
+                    if (fastSqli(fReq, build, name + " (mined URL param)", "1")) return true;   // error-based (cheap)
                     // blind boolean/time — only when the value actually drives the response (Less-8 boolean,
                     // Less-9/10 time), so the 5s time sleeps never run on a param name the page ignores.
                     if (paramInfluences(build)
-                            && blindChannels(req, build, name + " (mined URL param)", "1",
+                            && blindChannels(fReq, build, name + " (mined URL param)", "1",
                                     java.util.Collections.singleton("1"), baseMs)) return true;
                 }
             }
@@ -244,7 +251,7 @@ public final class BlindSqliProbe {
     private static final String[] HEADER_POINTS = { "User-Agent", "Referer", "X-Forwarded-For", "X-Real-IP", "Client-IP" };
     // Ubiquitous query-param names (generic wordlist, NOT app-specific) — tried only on parameterless GET pages.
     private static final String[] COMMON_PARAMS = {
-            "id", "cat", "page", "item", "pid", "uid", "user", "name", "q", "search", "query",
+            "id", "cat", "page", "item", "pid", "uid", "user", "name", "q", "s", "search", "query",
             "view", "file", "order", "sort", "artist", "report_id", "cid", "tid", "num" };
 
     /** Seeds to try: the discovered value AND a generic likely-valid id "1". The AND channel needs a value
@@ -361,6 +368,11 @@ public final class BlindSqliProbe {
             "psqlexception", "syntax error at or near", "sqlite3::", "sqlite error", "microsoft ole db provider",
             "odbc sql server driver", "supplied argument is not a valid mysql", "mysql_fetch", "mysql_num_rows",
             "org.hibernate", "com.microsoft.sqlserver.jdbc",
+            // H2 (embedded Java DB — VulnerableApp/WebGoat) + Spring JDBC's exception wrappers, which surface the
+            // DB error verbatim in the body ("bad SQL grammar […]; JdbcSQLSyntaxErrorException: Syntax error in SQL
+            // statement"). Absent these, a live H2/Spring error-based SQLi returns its error yet goes unmatched.
+            "org.h2.jdbc", "jdbcsqlsyntaxerrorexception", "jdbcsqlexception", "syntax error in sql statement",
+            "bad sql grammar", "org.springframework.jdbc", "sqlgrammarexception", "hsql database engine",
             // MS SQL Server (T-SQL) — an ASP.NET/MSSQL app (like this one) emits these on a broken injection. Note
             // "conversion failed when converting" is the CANONICAL tell for a string spliced into a NUMERIC context
             // (our numeric-JSON ORDER BY/paging injection) — without it, a real numeric SQLi is triggered yet unmatched.
@@ -461,7 +473,12 @@ public final class BlindSqliProbe {
     }
 
     private static HttpRequest inject(HttpRequest req, ParsedHttpParameter p, String value) {
-        return req.withUpdatedParameters(HttpParameter.parameter(p.name(), value, p.type()));
+        // Percent-encode wire-unsafe chars (space, …) for URL/form params: Montoya sends the value raw, so a payload
+        // with a space is 400'd by a strict server (Tomcat/Java) BEFORE the app parses it — silently zeroing SQLi
+        // coverage on Java targets. JSON-body fields go through withBody() and are untouched. See Net.encQuery.
+        boolean queryish = p.type() == HttpParameterType.URL || p.type() == HttpParameterType.BODY;
+        return req.withUpdatedParameters(
+                HttpParameter.parameter(p.name(), queryish ? Net.encQuery(value) : value, p.type()));
     }
 
     /** A SQL-injection finding's identity is (path, injected parameter) — the parameter is already in the
@@ -539,16 +556,7 @@ public final class BlindSqliProbe {
                 .replace("\"", "&quot;").replace("'", "&#039;");
     }
 
-    private static boolean isJson(HttpRequest req) {
-        try {
-            String b = req.bodyToString();
-            if (b == null || b.isBlank()) return false;
-            String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
-            if (ct != null && ct.toLowerCase().contains("json")) return true;
-            String t = b.trim();   // fall back to body SHAPE — captured/replayed reqs can lose the header
-            return (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"));
-        } catch (Throwable t) { return false; }
-    }
+    // isJson(HttpRequest) is inherited from Probe.
 
     // Burp's own send can block FOREVER in Socket.read() when a target accepts the connection but never completes
     // the response (e.g. a crashed Node handler holding the socket) — RequestOptions.withResponseTimeout does NOT
@@ -569,8 +577,9 @@ public final class BlindSqliProbe {
 
     private static final long SLOW_SEND_MS = SLEEP_SEC * 1000L + 3_000L;   // sleep + 3s margin = stalling threshold
 
-    private HttpRequestResponse send(HttpRequest req) {
+    protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): circuit-breaker + hard Future cap
         if (targetHanging) return null;   // circuit open: this target stalls responses → stop hammering it
+        politeness();                     // ScanConfig politeness delay (after the circuit-open guard)
         sends.incrementAndGet();
         long t0 = System.nanoTime();
         HttpRequestResponse rr = null;

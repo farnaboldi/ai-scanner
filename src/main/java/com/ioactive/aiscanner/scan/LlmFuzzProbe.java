@@ -44,10 +44,9 @@ import java.util.regex.Pattern;
  * markers are routed to the soft judge, never the hard tier. Only canary-gated injection disclosure and real
  * server errors are hard.
  */
-public final class LlmFuzzProbe {
+public final class LlmFuzzProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private final AiEngine engine;
 
     private static final int MAX_ENDPOINTS = 6;          // CONFIRMED LLM endpoints fuzzed (failed-confirmation tries are free)
@@ -98,8 +97,7 @@ public final class LlmFuzzProbe {
     public record Reply(String text, int status, String rawBody, HttpRequestResponse rr) {}
 
     public LlmFuzzProbe(MontoyaApi api, ScanLog scanLog, AiEngine engine) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
         this.engine = engine;
     }
 
@@ -123,7 +121,7 @@ public final class LlmFuzzProbe {
                 String url = req.url();
                 if (!seen.add(req.method() + " " + Net.stripQuery(url))) continue;
                 Function<String, Reply> sender = msg -> sendChat(withSession, req, field, msg);
-                int f = fuzz("chat " + pathOf(url), url, sender);
+                int f = fuzz("chat " + rawPath(url), url, sender);
                 if (f >= 0) done++;
                 hits += Math.max(f, 0);
             } catch (Throwable ignore) { }
@@ -190,7 +188,7 @@ public final class LlmFuzzProbe {
             scanLog.log("  llm-fuzz: confirming JS-discovered candidate POST " + url + " {" + field + "}"
                     + (sink.isEmpty() ? "" : " [reply→" + sink + " sink]"));
             Function<String, Reply> sender = msg -> sendSynth(withSession, url, field, msg);
-            int f = fuzz("chat " + pathOf(url), url, sender);
+            int f = fuzz("chat " + rawPath(url), url, sender);
             if (f < 0) continue;                                  // not an LLM — skip (confirmation gated it)
             done++;
             hits += f;
@@ -238,7 +236,7 @@ public final class LlmFuzzProbe {
                     .withBody(withField("{}", field, msg))
                     .withHeader("Content-Type", "application/json");
             req = withSession.apply(req);
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(LLM_TIMEOUT_MS));
+            HttpRequestResponse rr = send(req, LLM_TIMEOUT_MS);
             String raw = rr != null && rr.response() != null ? rr.response().bodyToString() : "";
             int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);
@@ -449,7 +447,7 @@ public final class LlmFuzzProbe {
             HttpRequest req = template.withBody(body);
             if (!req.hasHeader("Content-Type")) req = req.withHeader("Content-Type", "application/json");
             req = withSession.apply(req);
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(LLM_TIMEOUT_MS));
+            HttpRequestResponse rr = send(req, LLM_TIMEOUT_MS);
             String raw = rr != null && rr.response() != null ? rr.response().bodyToString() : "";
             int st = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             return new Reply(LlmEndpointDetector.extractReply(raw), st, raw, rr);
@@ -489,6 +487,6 @@ public final class LlmFuzzProbe {
         return true;
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
-    private static String pathOf(String url) { try { String p = URI.create(url).getRawPath(); return p == null ? url : p; } catch (Exception e) { return url; } }
+    // hostOf(String) inherited from Probe.
+    private static String rawPath(String url) { try { String p = URI.create(url).getRawPath(); return p == null ? url : p; } catch (Exception e) { return url; } }
 }

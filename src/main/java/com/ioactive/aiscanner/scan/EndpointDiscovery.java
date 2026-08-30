@@ -80,6 +80,11 @@ public final class EndpointDiscovery {
      *  converges → reproducible). Default 3; override -Daiscanner.discoveryRounds / AISCANNER_DISCOVERY_ROUNDS.
      *  At temp=0 the early-stop collapses this to 1 round (greedy = identical each pass). Clamped to [1,10]. */
     private static int discoveryRounds() {
+        // SAST-only mode is SOURCE-driven: routes come from IterativeRouteScanner reading the repo, so the
+        // expensive live-JS LLM endpoint-mining is pure overhead (it dominated the per-cell budget on a slow
+        // local model). Skip it entirely — 0 rounds — while the deterministic regex + /api/vN/ harvest floor
+        // (which runs BEFORE the LLM loop) still contributes any literal routes the live JS exposes.
+        if ("SAST".equalsIgnoreCase(System.getProperty("aiscanner.scanMode", ""))) return 0;
         String v = System.getProperty("aiscanner.discoveryRounds");
         if (v == null || v.isBlank()) v = System.getenv("AISCANNER_DISCOVERY_ROUNDS");
         if (v == null || v.isBlank()) return 3;
@@ -412,6 +417,23 @@ public final class EndpointDiscovery {
             "(?i)(https?://[^/\"'\\s]+(?:/[A-Za-z0-9_-]+)*?/(?:rest|api)(?:/v\\d+)?)/");
     private static final String READ_SEED = "1";
 
+    // ---- Self-declared parameter vocabulary --------------------------------------------------------------
+    // The injectable query-param name is rarely in an HTML <form> or a JSON response body; on a JS-driven app it
+    // lives in the CLIENT CODE — the query string the app's OWN script builds (url + "?id=" + value), a
+    // URLSearchParams/params setter, etc. Harvest that self-declared vocabulary straight from the target's own
+    // scripts (NO wordlist), then hand each name to the endpoint it configures. Generic: the names come from the
+    // app itself, per-target; association is by shared path structure — no app-specific rule.
+    private static final Pattern JS_QUERY_PARAM = Pattern.compile("[?&]([A-Za-z_][A-Za-z0-9_]{0,32})=");
+    private static final Pattern JS_PARAM_SETTER = Pattern.compile(
+            "(?i)\\.(?:set|append)\\s*\\(\\s*[\"']([A-Za-z_][A-Za-z0-9_]{0,32})[\"']");
+    // Path segments that do NOT identify an endpoint (framework mounts + universal static-hosting conventions).
+    // Excluded when matching a script's path to the endpoint it drives, so co-location keys on distinctive nouns.
+    private static final Set<String> GENERIC_SEG = Set.of(
+            "api", "rest", "v1", "v2", "v3", "app", "web", "templates", "template", "static", "js", "css",
+            "scss", "assets", "public", "dist", "build", "src", "main", "html", "bundle", "vendor");
+    // Query-string names that are cache-busters / transport noise, never a real injectable param.
+    private static final Set<String> PARAM_NOISE = Set.of("_", "v", "t", "ts", "cb", "cache", "nocache", "rand", "_dc");
+
     /**
      * Reach API resources the SPA never CALLS but whose noun it exposes as a client-side ROUTE. Single-page apps
      * name routes after resources (/movies, /orders, /users) and the REST API mirrors them (/rest/movie(s),
@@ -570,6 +592,59 @@ public final class EndpointDiscovery {
                 + " param-seeded read(s) from " + collections + " reached JSON/XML collection(s) → active audit (SQLi/XSS surface).");
     }
 
+    // A same-host URL appearing as a VALUE in a server response — a catalog / index / HATEOAS link the app
+    // publishes (an endpoint list, {_links:{…}}, a JSON sitemap). responseKeys turns a response's KEYS into query
+    // params; this turns its URL VALUES into ENDPOINTS to probe, reaching handlers no <a>/fetch literal linked.
+    // Generic: any app serving an index/links JSON exposes its surface this way (VulnerableApp: /scanner and
+    // /allEndPointJson; a REST API: HATEOAS). Oracle-gated + bounded, so junk URLs are filtered by reality.
+    private static final Pattern EMBEDDED_URL = Pattern.compile("\"(https?://[^\"\\s]{1,200})\"");
+
+    /**
+     * Harvest same-host URL VALUES published in reached JSON/XML responses (an endpoint catalog / index / HATEOAS
+     * links block) and probe each — a live handler the crawler never linked to becomes an audit target. This is
+     * the mirror of {@link #responseKeys}: a response's KEYS are its query params, its same-host URL VALUES are
+     * endpoints. Fully generic (no app rule): an app that answers "here are my endpoints" in a JSON document is
+     * telling us its surface, exactly as a human reading that document would then test each link. Oracle-gated
+     * (2xx, not the HTML shell, not a soft-404) and bounded per the BApp large-project budget.
+     */
+    private void harvestCatalogUrls(String host, List<HttpRequest> live, Set<String> seen) {
+        int found = 0, probed = 0;
+        try {
+            LinkedHashSet<String> urls = new LinkedHashSet<>();
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (urls.size() >= 250) break;
+                if (rr == null || rr.request() == null || rr.response() == null) continue;
+                String u = rr.request().url();
+                if (u == null || !host.equalsIgnoreCase(hostOf(u))) continue;
+                if (!respIsStructured(rr)) continue;                       // a JSON/XML document, not the HTML shell
+                String body = rr.response().bodyToString();
+                if (body == null) continue;
+                Matcher m = EMBEDDED_URL.matcher(body);
+                while (m.find() && urls.size() < 250) {
+                    String abs = m.group(1);
+                    if (!host.equalsIgnoreCase(hostOf(abs))) continue;     // same-host only — stay in scope
+                    if (STATIC.matcher(abs).matches() || abs.toLowerCase().contains(".js")) continue;
+                    urls.add(Net.stripQuery(abs));
+                }
+            }
+            for (String abs : urls) {
+                if (probed >= 160) break;
+                if (!seen.add("GET " + abs)) continue;
+                HttpRequestResponse rr = probe(jsonGet(abs));
+                probed++;
+                int st = statusOf(rr);
+                if (st < 200 || st >= 400 || isHtmlShell(rr) || isSoftNotFound(rr)) continue;
+                found++;
+                live.add(jsonGet(abs));
+                keep(rr, host);   // bridge to site map for the param-seeding + IDOR/BFLA probes
+            }
+        } catch (Throwable t) {
+            scanLog.debug("catalog URL harvest failed: " + t);
+        }
+        if (found > 0) scanLog.log("catalog URL harvest: " + found + " live endpoint(s) from same-host URL value(s)"
+                + " published in reached JSON/XML response(s) (" + probed + " probes).");
+    }
+
     /** True when a 2xx body is structured data (JSON or XML) a handler produced — not the SPA HTML shell. */
     private static boolean respIsStructured(HttpRequestResponse rr) {
         if (respIsJson(rr)) return true;
@@ -597,6 +672,128 @@ public final class EndpointDiscovery {
             while (m.find() && out.size() < max) { String k = m.group(1); if (!out.contains(k)) out.add(k); }
         } catch (Throwable ignore) { }
         return out;
+    }
+
+    /** A query-param name the app's own client code declares, tagged with the distinctive path tokens of the
+     *  script it was harvested from (used to attach the param to the endpoint that script configures). */
+    private static final class ParamHint {
+        final String name; final Set<String> tokens;
+        ParamHint(String name, Set<String> tokens) { this.name = name; this.tokens = tokens; }
+    }
+
+    /** Endpoint-identifying lowercase path tokens of a URL: segments minus framework/static noise, pure numbers
+     *  and file names (anything with a dot). Two resources "about" the same endpoint share these tokens. */
+    private static Set<String> distinctiveTokens(String url) {
+        Set<String> out = new LinkedHashSet<>();
+        try {
+            String path = URI.create(url).getPath();
+            if (path == null) return out;
+            for (String seg : path.split("/")) {
+                String s = seg.toLowerCase();
+                if (s.isEmpty() || s.contains(".") || s.matches("\\d+") || GENERIC_SEG.contains(s)) continue;
+                out.add(s);
+            }
+        } catch (Exception ignore) { }
+        return out;
+    }
+
+    /** A same-host, GET, not-yet-parameterized, non-static endpoint's path (query stripped) — a seedable target;
+     *  null when the request isn't eligible. */
+    private String paramSeedBase(HttpRequest ep, String host) {
+        if (ep == null || !"GET".equalsIgnoreCase(ep.method())) return null;
+        String eu = ep.url();
+        if (eu == null || !host.equalsIgnoreCase(hostOf(eu))) return null;
+        if (eu.contains("?")) return null;                                 // already parameterized — audit fuzzes it
+        String lu = eu.toLowerCase();
+        if (STATIC.matcher(eu).matches() || lu.contains(".js") || lu.contains(".html")) return null; // never a static file
+        return Net.stripQuery(eu);
+    }
+
+    /**
+     * SELF-DECLARED PARAMETER VOCABULARY. Harvest the query-param names the target's OWN client code declares
+     * (the {@code ?name=} it concatenates, URLSearchParams / {@code .set("name",…)} setters) from every same-host
+     * script/markup Burp fetched, then register param-seeded reads ({@code endpoint?name=1}) so Burp's active
+     * audit + our probes fuzz the param for SQLi / reflected-XSS / LDAP / command injection. Each name is attached
+     * to the endpoint it configures — primarily by CO-LOCATION (a level's script sits at a path that mirrors the
+     * endpoint it drives, so the script's path tokens cover the endpoint's nouns), falling back to applying the
+     * harvested vocabulary to reached endpoints a form/response left param-less. This closes the gap that the
+     * injectable param lives ONLY in client JS: a modern app names its params in {@code url + "?id=" + …}, never
+     * in a &lt;form&gt; or the JSON response. Fully generic — the names are the app's own, associated by shared
+     * path structure; no wordlist, no per-app rule. Bounded per the BApp large-project budget.
+     */
+    private void seedSelfDeclaredParams(String host, List<HttpRequest> live, Set<String> seen) {
+        try {
+            List<ParamHint> hints = new ArrayList<>();
+            LinkedHashSet<String> vocab = new LinkedHashSet<>();
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (vocab.size() >= 24) break;
+                if (rr == null || rr.request() == null || rr.response() == null) continue;
+                String u = rr.request().url();
+                if (u == null || !host.equalsIgnoreCase(hostOf(u))) continue;
+                String ct = rr.response().headerValue("Content-Type");
+                String lu = u.toLowerCase();
+                boolean scriptish = lu.contains(".js") || lu.contains(".html")
+                        || (ct != null && (ct.toLowerCase().contains("javascript") || ct.toLowerCase().contains("html")));
+                if (!scriptish) continue;
+                String body = rr.response().bodyToString();
+                if (body == null || body.isEmpty()) continue;
+                Set<String> tokens = distinctiveTokens(u);
+                LinkedHashSet<String> names = new LinkedHashSet<>();
+                Matcher m = JS_QUERY_PARAM.matcher(body);
+                while (m.find() && names.size() < 12) names.add(m.group(1));
+                Matcher ms = JS_PARAM_SETTER.matcher(body);
+                while (ms.find() && names.size() < 12) names.add(ms.group(1));
+                for (String n : names) {
+                    if (PARAM_NOISE.contains(n.toLowerCase())) continue;
+                    vocab.add(n);
+                    hints.add(new ParamHint(n, tokens));
+                }
+            }
+            if (vocab.isEmpty()) return;
+
+            int co = 0, fb = 0, budget = 120;
+            Set<String> coLocated = new LinkedHashSet<>();       // endpoint paths a co-located script already seeded
+            List<HttpRequest> snapshot = new ArrayList<>(live);  // append to `live` below; iterate a stable copy
+
+            // Pass 1 — CO-LOCATION: seed only the param(s) whose source script mirrors this endpoint's path
+            // (script tokens ⊇ endpoint tokens). Precise; one-or-few real params per endpoint, no blow-up.
+            for (HttpRequest ep : snapshot) {
+                if (budget <= 0) break;
+                String base = paramSeedBase(ep, host);
+                if (base == null) continue;
+                Set<String> etok = distinctiveTokens(base);
+                if (etok.size() < 2) continue;                   // too generic to co-locate confidently
+                int per = 0;
+                for (ParamHint h : hints) {
+                    if (per >= 8 || budget <= 0) break;
+                    if (!h.tokens.containsAll(etok)) continue;   // the script's path covers every noun of the endpoint
+                    if (!seen.add("GET " + base + "?" + h.name)) continue;
+                    live.add(jsonGet(base + "?" + h.name + "=" + READ_SEED));
+                    coLocated.add(base); budget--; per++; co++;
+                }
+            }
+            // Pass 2 — VOCAB FALLBACK: endpoints no script co-located (their own script wasn't fetched) — try the
+            // app's own harvested vocabulary, tightly bounded. The injection oracle is the gate: a name that isn't
+            // a real param just echoes the baseline and never separates, so this stays zero-FP.
+            int fbBudget = 40;
+            for (HttpRequest ep : snapshot) {
+                if (budget <= 0 || fbBudget <= 0) break;
+                String base = paramSeedBase(ep, host);
+                if (base == null || coLocated.contains(base)) continue;
+                int per = 0;
+                for (String n : vocab) {
+                    if (per >= 4 || budget <= 0 || fbBudget <= 0) break;
+                    if (!seen.add("GET " + base + "?" + n)) continue;
+                    live.add(jsonGet(base + "?" + n + "=" + READ_SEED));
+                    budget--; fbBudget--; per++; fb++;
+                }
+            }
+            if (co + fb > 0) scanLog.log("self-declared param vocab: " + (co + fb) + " param-seeded read(s) ("
+                    + co + " co-located, " + fb + " vocab-fallback) from " + vocab.size()
+                    + " app-declared name(s) → active audit (SQLi/XSS/LDAP surface).");
+        } catch (Throwable t) {
+            scanLog.debug("self-declared param vocab failed: " + t);
+        }
     }
 
     /** True when a response body looks like a handler's structured output (JSON), not the HTML app shell. */
@@ -834,6 +1031,139 @@ public final class EndpointDiscovery {
     }
     private static String urlenc(String s) { try { return java.net.URLEncoder.encode(s, "UTF-8"); } catch (Exception e) { return s; } }
 
+    // A navigation <select>: an app that exposes its pages through a dropdown selector (a "pick a page" menu, a
+    // report/category chooser, bWAPP's bug picker) instead of <a href> links. harvestHtmlForms submits such a form
+    // ONCE with a single seed; this submits it for EACH option value and follows the redirect, reaching pages no
+    // crawler ever linked. Generic — the option VALUES + the form action are the app's OWN navigation, no app rule.
+    private static final Pattern SELECT_BLOCK = Pattern.compile("(?is)<select\\b([^>]*)>(.*?)</select>");
+    private static final Pattern OPTION_VAL   = Pattern.compile("(?is)<option\\b[^>]*\\bvalue\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)");
+
+    /**
+     * SELECT-MENU NAVIGATION. Submit each option of a navigation {@code <select>} and follow the redirect to
+     * discover the target page. Reaches an app whose entire surface hides behind a dropdown + a server-side
+     * id→page map (POST {@code bug=13} → 302 {@code sqli_1.php}) that no {@code <a href>}/JSON link exposes. Each
+     * discovered page is bridged into the site map so {@link #harvestHtmlForms} then synthesizes ITS form params
+     * (the real injection sinks). Bounded (one iteration per distinct action+select; capped submits), same-host,
+     * never a session-reset action. Fully generic — the option values and action are the app's own navigation.
+     */
+    private void harvestSelectNavForms(String host, List<HttpRequest> live, Set<String> seen) {
+        int discovered = 0, submits = 0, pagesWithSelect = 0, menus = 0;
+        int cNoTarget = 0, cSelf = 0, cStatic = 0, cDup = 0, cConfirmFail = 0;
+        final int SUBMIT_BUDGET = 200;
+        try {
+            // Collect distinct same-host pages, then RE-FETCH each AUTHENTICATED and parse the FRESH body. The site
+            // map's stored copy is unreliable on a login-gated MPA: Burp's own crawler finds 0 (everything 302s to
+            // login), and the pages we reached via probes may have a stored body that predates the session or lacks
+            // the post-login menu. A fresh authenticated GET guarantees we see the real dropdown.
+            LinkedHashSet<String> pages = new LinkedHashSet<>();
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (rr.request() == null) continue;
+                String u = rr.request().url();
+                if (u == null || !host.equalsIgnoreCase(hostOf(u)) || !"GET".equalsIgnoreCase(rr.request().method())) continue;
+                String p = Net.stripQuery(u);
+                if (STATIC.matcher(p).matches() || p.toLowerCase().contains(".js")) continue;
+                pages.add(p);
+                if (pages.size() >= 60) break;
+            }
+            for (String pageUrl : pages) {
+                if (submits >= SUBMIT_BUDGET) break;
+                HttpRequestResponse pr = probe(withSessionCookie(HttpRequest.httpRequestFromUrl(pageUrl).withMethod("GET")));
+                if (pr == null || pr.response() == null) continue;
+                String body = pr.response().bodyToString();
+                if (body == null || !body.toLowerCase().contains("<select")) continue;
+                pagesWithSelect++;
+                Matcher fm = FORM_BLOCK.matcher(body);
+                while (fm.find() && submits < SUBMIT_BUDGET) {
+                    String attrs = fm.group(1), inner = fm.group(2);
+                    Matcher sm = SELECT_BLOCK.matcher(inner);
+                    if (!sm.find()) continue;                       // no <select> → not a menu form
+                    String selName = attrOf(F_NAME, sm.group(1));
+                    if (selName == null || selName.isBlank()) continue;
+                    LinkedHashSet<String> values = new LinkedHashSet<>();
+                    Matcher om = OPTION_VAL.matcher(sm.group(2));
+                    while (om.find() && values.size() < SUBMIT_BUDGET) {
+                        String v = om.group(1).trim();
+                        if (v.length() >= 2 && (v.charAt(0) == '"' || v.charAt(0) == '\'')) v = v.substring(1, v.length() - 1);
+                        if (!v.isBlank()) values.add(v);
+                    }
+                    if (values.size() < 4) continue;                // a real menu has several options (a 2-3 toggle isn't nav)
+                    menus++;
+                    String action = attrOf(F_ACTION, attrs);
+                    boolean post = "POST".equalsIgnoreCase(attrOf(F_METHOD, attrs));
+                    String abs;
+                    try { abs = (action == null || action.isBlank()) ? Net.stripQuery(pageUrl) : URI.create(pageUrl).resolve(action).toString(); }
+                    catch (Exception e) { continue; }
+                    if (!host.equalsIgnoreCase(hostOf(abs))) continue;
+                    if (AuthenticatedExplorer.SESSION_RESET.matcher(abs).matches()) continue;   // never a login/logout action
+                    if (!seen.add("SELECTNAV " + Net.stripQuery(abs) + " " + selName)) continue; // iterate each menu ONCE (rendered on every page)
+                    scanLog.debug("select-nav: menu " + (post ? "POST " : "GET ") + Net.stripQuery(abs)
+                            + " select=" + selName + " options=" + values.size());
+                    // Co-submitted fields: preserve inputs/buttons (some apps require the submit button's name, e.g.
+                    // bWAPP form=submit); DON'T co-submit OTHER <select>s/textarea (e.g. a security-level picker we
+                    // must not flip — the seeded session already carries the level).
+                    LinkedHashMap<String, String> baseFields = new LinkedHashMap<>();
+                    Matcher im = F_INPUT.matcher(inner);
+                    while (im.find()) {
+                        String tagName = im.group(1).toLowerCase();
+                        if (tagName.equals("select") || tagName.equals("textarea")) continue;
+                        String tag = im.group(2);
+                        String n = attrOf(F_NAME, tag);
+                        if (n == null || n.isBlank() || n.equals(selName)) continue;
+                        if ("reset".equalsIgnoreCase(attrOf(F_TYPE, tag))) continue;
+                        String val = attrOf(F_VALUE, tag);
+                        baseFields.put(n, val == null ? "1" : val);
+                    }
+                    for (String v : values) {
+                        if (submits >= SUBMIT_BUDGET) break;
+                        submits++;
+                        StringBuilder enc = new StringBuilder();
+                        for (Map.Entry<String, String> e : baseFields.entrySet())
+                            enc.append(enc.length() > 0 ? "&" : "").append(urlenc(e.getKey())).append('=').append(urlenc(e.getValue()));
+                        enc.append(enc.length() > 0 ? "&" : "").append(urlenc(selName)).append('=').append(urlenc(v));
+                        HttpRequest req = post
+                                ? withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs)).withMethod("POST"))
+                                        .withAddedHeader("Content-Type", "application/x-www-form-urlencoded").withBody(enc.toString())
+                                : withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs) + "?" + enc).withMethod("GET"));
+                        HttpRequestResponse resp = probe(req);
+                        // The navigated page: a same-host redirect Location (POST-redirect-GET), else the GET URL itself.
+                        String target = null;
+                        if (resp != null && resp.response() != null) {
+                            int st = resp.response().statusCode();
+                            if (st >= 300 && st < 400) {
+                                String loc = resp.response().headerValue("Location");
+                                if (loc != null && !loc.isBlank()) { try { target = URI.create(abs).resolve(loc).toString(); } catch (Exception ignore) { } }
+                            } else if (!post && st >= 200 && st < 300) {
+                                target = req.url();
+                            }
+                        }
+                        if (target == null || !host.equalsIgnoreCase(hostOf(target))) { cNoTarget++; continue; }
+                        String t2 = Net.stripQuery(target);
+                        if (t2.equalsIgnoreCase(Net.stripQuery(abs))) { cSelf++; continue; }   // separator → redirects to the menu itself
+                        if (STATIC.matcher(t2).matches() || t2.toLowerCase().contains(".js")) { cStatic++; continue; }
+                        if (!seen.add("GET " + t2)) { cDup++; continue; }
+                        // The app's OWN navigation redirect (bug=N → 302 page) already vouches for the page's
+                        // existence, so we DON'T re-apply the strict SPA-shell/soft-404 gate here (it false-rejects
+                        // content-rich server-rendered pages). Just fetch it authenticated to bridge its body for
+                        // form synthesis, and keep it unless it's a hard error/dead.
+                        HttpRequestResponse tr = probe(withSessionCookie(HttpRequest.httpRequestFromUrl(t2).withMethod("GET")));
+                        int tst = statusOf(tr);
+                        if (tst < 200 || tst >= 400) { cConfirmFail++; continue; }
+                        try { api.siteMap().add(tr); } catch (Throwable ignore) { }   // so harvestHtmlForms synthesizes ITS form params
+                        live.add(withSessionCookie(HttpRequest.httpRequestFromUrl(t2).withMethod("GET")));
+                        keep(tr, host);
+                        discovered++;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            scanLog.debug("select-nav harvest failed: " + t);
+        }
+        scanLog.log("select-menu navigation: " + discovered + " page(s) discovered (" + submits + " submit(s), "
+                + menus + " nav-menu(s) over " + pagesWithSelect + " page(s) with a <select>) → site map + audit.");
+        if (submits > 0) scanLog.debug("select-nav breakdown: noTarget=" + cNoTarget + " self=" + cSelf
+                + " static=" + cStatic + " dup=" + cDup + " confirmFail=" + cConfirmFail + " added=" + discovered);
+    }
+
     /**
      * Generic HTML-form → parameterized-request synthesis. Server-rendered apps (DVWA's /vulnerabilities/*,
      * classic MPAs) put their real injectable surface in {@code <form>}s; the crawler records the action URL but
@@ -1025,8 +1355,11 @@ public final class EndpointDiscovery {
             probeWellKnown(host, baseUrl, live, seen);   // standards/infra paths + i18n negative-diff
             probeAiProposedPaths(host, baseUrl, live, seen);   // LLM-proposed UNLINKED sensitive paths (admin/*, etc.)
             discoverClientRouteApis(host, baseUrl, live, seen); // SPA route nouns → API resources (frontend-orphaned endpoints)
+            harvestCatalogUrls(host, live, seen);        // same-host URL VALUES in reached JSON/XML (endpoint catalog/HATEOAS) → endpoints
+            harvestSelectNavForms(host, live, seen);     // dropdown-navigated pages (<select> menu → id→page map) → site map (BEFORE form harvest, so their forms get synthesized)
             harvestHtmlForms(host, live, seen);          // server-rendered <form>s → parameterized GET/POST for the active audit
             synthesizeParamReadsFromJson(host, live, seen); // reached JSON collections → param-seeded reads (response keys ARE the query params)
+            seedSelfDeclaredParams(host, live, seen);        // client-declared query-param vocabulary → param-seeded reads (whole battery)
             scanLog.log("endpoint discovery: " + live.size()
                     + " live endpoint(s) Burp's crawler missed.");
         } catch (Throwable t) {
@@ -1209,26 +1542,37 @@ public final class EndpointDiscovery {
                 bodies.addAll(credentialBodies(uf, pf, extra));
                 for (String b : bodies) {
                     if (tries++ > 80) break;
-                    HttpRequest r = withSessionCookie(HttpRequest.httpRequestFromUrl(url).withMethod("POST"))
-                            .withHeader("Content-Type", "application/json").withBody(b);
-                    HttpRequestResponse rr = probe(r);
-                    if (statusOf(rr) < 200 || statusOf(rr) >= 300 || rr.response() == null) continue;
-                    String resp = rr.response().bodyToString();
-                    boolean jsonBody = resp != null && resp.trim().startsWith("{");
-                    String tok = jsonBody ? extractToken(new JSONObject(resp)) : null;
-                    String src = "body";
-                    if (tok == null) { tok = bearerFromResponseHeaders(rr.response()); src = "Authorization header"; }
-                    if (tok != null) {
-                        apiAuthToken = tok;
-                        // Feed it to the shared session as a bearer so it's injected as `Authorization: Bearer <tok>`
-                        // on every subsequent spec-built request AND every probe (JWT/IDOR/BFLA now run authenticated).
-                        if (session != null) session.setBearer(tok);
-                        String how = b.contains("OR ") ? "SQLi auth-bypass" : b.contains("@x.io") ? "fresh registration" : "default creds";
-                        scanLog.log("  -> API AUTH: obtained a token via " + loginPath + " (" + how
-                                + ", fields " + uf + "/" + pf + (extra.isEmpty() ? "" : " + required" + extra) + ", from " + src
-                                + "); auth header = " + (apiAuthHeader == null ? "Authorization: Bearer" : apiAuthHeader));
-                        if (jsonBody) checkWeakToken(new JSONObject(resp), tok, url, rr);
-                        return;
+                    // Try the body as JSON, then — if that yields no token — as form-encoded. FastAPI's standard
+                    // login (OAuth2PasswordRequestForm on /token) accepts ONLY application/x-www-form-urlencoded and
+                    // returns the JWT in the JSON body; a JSON POST there just 422s. Generic — many token APIs are
+                    // form-encoded, so trying both content types (not only JSON) is the correct default.
+                    String formBody = jsonToForm(b);
+                    String[][] variants = formBody == null
+                            ? new String[][]{ {"application/json", b} }
+                            : new String[][]{ {"application/json", b}, {"application/x-www-form-urlencoded", formBody} };
+                    for (String[] v : variants) {
+                        HttpRequest r = withSessionCookie(HttpRequest.httpRequestFromUrl(url).withMethod("POST"))
+                                .withHeader("Content-Type", v[0]).withBody(v[1]);
+                        HttpRequestResponse rr = probe(r);
+                        if (statusOf(rr) < 200 || statusOf(rr) >= 300 || rr.response() == null) continue;
+                        String resp = rr.response().bodyToString();
+                        boolean jsonBody = resp != null && resp.trim().startsWith("{");
+                        String tok = jsonBody ? extractToken(new JSONObject(resp)) : null;
+                        String src = "body";
+                        if (tok == null) { tok = bearerFromResponseHeaders(rr.response()); src = "Authorization header"; }
+                        if (tok != null) {
+                            apiAuthToken = tok;
+                            // Feed it to the shared session as a bearer so it's injected as `Authorization: Bearer <tok>`
+                            // on every subsequent spec-built request AND every probe (JWT/IDOR/BFLA now run authenticated).
+                            if (session != null) session.setBearer(tok);
+                            String how = b.contains("OR ") ? "SQLi auth-bypass" : b.contains("@x.io") ? "fresh registration" : "default creds";
+                            scanLog.log("  -> API AUTH: obtained a token via " + loginPath + " (" + how
+                                    + ", fields " + uf + "/" + pf + (extra.isEmpty() ? "" : " + required" + extra)
+                                    + ", " + v[0].replace("application/", "") + ", from " + src
+                                    + "); auth header = " + (apiAuthHeader == null ? "Authorization: Bearer" : apiAuthHeader));
+                            if (jsonBody) checkWeakToken(new JSONObject(resp), tok, url, rr);
+                            return;
+                        }
                     }
                 }
             }
@@ -1256,19 +1600,48 @@ public final class EndpointDiscovery {
                 if (regBody.isBlank()) regBody = superCreds(tag, email, pass, rpf);
                 if (logBody.isBlank()) logBody = superCreds(tag, email, pass, lpf);
                 try {
-                    probe(withSessionCookie(HttpRequest.httpRequestFromUrl(regUrl).withMethod("POST"))
-                            .withHeader("Content-Type", "application/json").withBody(regBody));
-                    HttpRequestResponse rr = probe(withSessionCookie(HttpRequest.httpRequestFromUrl(logUrl).withMethod("POST"))
-                            .withHeader("Content-Type", "application/json").withBody(logBody));
-                    if (rr != null && rr.response() != null && statusOf(rr) >= 200 && statusOf(rr) < 300) {
+                    // REGISTER (always BARE / unauthenticated) with adaptive retry: fill the fields the app's OWN
+                    // 400/422 validation errors name (FastAPI/Pydantic detail-array + flat object form) so a strict
+                    // schema (phone_number, first_name, …) doesn't block signup. Register is an UNAUTHENTICATED
+                    // action — a stale session bearer makes some apps reject it ("You're already logged in. You can
+                    // not register", DVRestaurant → 400), so we never attach the session here. Bounded rounds.
+                    String rb = regBody;
+                    for (int round = 0; round < 5; round++) {
+                        HttpRequestResponse rg = probe(HttpRequest.httpRequestFromUrl(regUrl).withMethod("POST")
+                                .withHeader("Content-Type", "application/json").withBody(rb));
+                        int rc = statusOf(rg);
+                        scanLog.debug("  two-step register " + regPath + " round " + round + " → HTTP " + rc);
+                        if (rc >= 200 && rc < 300) break;                    // registered
+                        if (rc != 400 && rc != 422) break;                   // not a fixable validation error
+                        String eb = rg != null && rg.response() != null ? rg.response().bodyToString() : null;
+                        String filled = fillMissingFromErrors(rb, eb, email, pass);
+                        if (filled == null || filled.equals(rb)) break;
+                        rb = filled;
+                    }
+                    // LOGIN: JSON then form-encoded (FastAPI OAuth2PasswordRequestForm /token is form-encoded, JWT-in-body).
+                    String lform = jsonToForm(logBody);
+                    String[][] lv = lform == null
+                            ? new String[][]{ {"application/json", logBody} }
+                            : new String[][]{ {"application/json", logBody}, {"application/x-www-form-urlencoded", lform} };
+                    for (String[] v : lv) {
+                        HttpRequestResponse rr = probe(HttpRequest.httpRequestFromUrl(logUrl).withMethod("POST")
+                                .withHeader("Content-Type", v[0]).withBody(v[1]));
+                        scanLog.debug("  two-step login " + logPath + " (" + v[0].replace("application/", "")
+                                + ") → HTTP " + statusOf(rr));
+                        if (rr == null || rr.response() == null || statusOf(rr) < 200 || statusOf(rr) >= 300) continue;
                         String resp = rr.response().bodyToString();
                         String tok = (resp != null && resp.trim().startsWith("{")) ? extractToken(new JSONObject(resp)) : null;
                         if (tok == null) tok = bearerFromResponseHeaders(rr.response());
                         if (tok != null) {
                             apiAuthToken = tok; if (session != null) session.setBearer(tok);
                             scanLog.log("  -> API AUTH: registered '" + tag + "' on " + regPath
-                                    + " -> logged in via " + logPath + " -> token adopted (register-then-login).");
+                                    + " -> logged in via " + logPath + " (" + v[0].replace("application/", "")
+                                    + ") -> token adopted (register-then-login).");
                             if (resp != null && resp.trim().startsWith("{")) checkWeakToken(new JSONObject(resp), tok, logUrl, rr);
+                            // The recipe that just authenticated A is a PROVEN register→login path for this app —
+                            // replay it with fresh nonce creds to mint identity B, so cross-user authz probes get a
+                            // real second user even when the AutonomousAuth B-path can't (FastAPI form-token /token).
+                            mintSecondaryViaRecipe(regUrl, logUrl, regPath, logPath, rpf, lpf, tok);
                             return;
                         }
                     }
@@ -1278,9 +1651,122 @@ public final class EndpointDiscovery {
         } catch (Throwable t) { scanLog.log("spec auth bootstrap error: " + t); }
     }
 
+    /** Mint a SECOND, distinct identity (B) by replaying the SAME register→login recipe that just authenticated A,
+     *  with FRESH nonce creds, into a throwaway session — then adopt it as the secondary identity for cross-user
+     *  access-control differentials. Generalizes B-minting to every spec-driven two-step app (VAmPI/crAPI/
+     *  DVRestaurant), including the FastAPI form-token /token pattern the AutonomousAuth B-path can't bridge.
+     *  Best-effort and idempotent: no-op if a second identity already exists, on any failure, or if B == A. */
+    private void mintSecondaryViaRecipe(String regUrl, String logUrl, String regPath, String logPath,
+                                        String rpf, String lpf, String aBearer) {
+        try {
+            if (session == null || session.hasSecondIdentity()) return;
+            long n = Math.abs(System.nanoTime());
+            String tag = "aisc" + Long.toString(n, 36), pass = "Aisc!" + (n % 100000) + "Zx", email = tag + "@example.com";
+            String rb = superCreds(tag, email, pass, rpf), logBody = superCreds(tag, email, pass, lpf);
+            for (int round = 0; round < 5; round++) {           // register B (bare, adaptive fill) — same as A
+                HttpRequestResponse rg = probe(HttpRequest.httpRequestFromUrl(regUrl).withMethod("POST")
+                        .withHeader("Content-Type", "application/json").withBody(rb));
+                int rc = statusOf(rg);
+                scanLog.debug("  identity-B register " + regPath + " round " + round + " → HTTP " + rc);
+                if (rc >= 200 && rc < 300) break;
+                if (rc != 400 && rc != 422) break;
+                String eb = rg != null && rg.response() != null ? rg.response().bodyToString() : null;
+                String filled = fillMissingFromErrors(rb, eb, email, pass);
+                if (filled == null || filled.equals(rb)) break;
+                rb = filled;
+            }
+            String lform = jsonToForm(logBody);                 // login B: JSON then form-encoded (OAuth2 /token)
+            String[][] lv = lform == null ? new String[][]{ {"application/json", logBody} }
+                    : new String[][]{ {"application/json", logBody}, {"application/x-www-form-urlencoded", lform} };
+            for (String[] v : lv) {
+                HttpRequestResponse rr = probe(HttpRequest.httpRequestFromUrl(logUrl).withMethod("POST")
+                        .withHeader("Content-Type", v[0]).withBody(v[1]));
+                if (rr == null || rr.response() == null || statusOf(rr) < 200 || statusOf(rr) >= 300) continue;
+                String resp = rr.response().bodyToString();
+                String tok = (resp != null && resp.trim().startsWith("{")) ? extractToken(new JSONObject(resp)) : null;
+                if (tok == null) tok = bearerFromResponseHeaders(rr.response());
+                if (tok != null && !tok.equals(aBearer)) {      // a genuinely different token ⇒ a distinct user
+                    SessionStore b = new SessionStore();
+                    b.setBearer(tok); b.setOwnIdentity(tag);
+                    session.setSecondary(b);
+                    if (session.hasSecondIdentity())
+                        scanLog.log("  -> API AUTH: second identity B '" + tag + "' registered via the same spec "
+                                + "register→login recipe — TRUE cross-user access-control differential enabled.");
+                    return;
+                }
+            }
+            scanLog.debug("  -> API AUTH: second-identity recipe found no distinct token for B.");
+        } catch (Throwable t) { scanLog.debug("  -> API AUTH: second-identity recipe error: " + t); }
+    }
+
     /** Superset JSON credential body: the registered handle (tag) in every common identity field + email + the
      *  spec's password field, so a lenient JSON register/login endpoint finds what it needs regardless of naming.
      *  Log in with tag (username-keyed APIs reject the email); email is present for email-keyed apps. */
+    /** Fill the fields an app's 400/422 validation error names (FastAPI/Pydantic detail-ARRAY {loc:[body,field]},
+     *  or a flat {field:[msgs]} object) into the register body, by field-name heuristic; forces email/password so
+     *  they stay ours. Returns the body unchanged when nothing to add. Generic — no app schema. */
+    private static String fillMissingFromErrors(String body, String errJson, String email, String pass) {
+        try {
+            JSONObject cur = (body != null && body.trim().startsWith("{")) ? new JSONObject(body) : new JSONObject();
+            if (errJson == null || !errJson.trim().startsWith("{")) return body;
+            JSONObject errs = new JSONObject(errJson);
+            java.util.LinkedHashSet<String> missing = new java.util.LinkedHashSet<>();
+            org.json.JSONArray arr = errs.optJSONArray("detail");
+            if (arr == null) arr = errs.optJSONArray("errors");
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject e = arr.optJSONObject(i); if (e == null) continue;
+                    org.json.JSONArray loc = e.optJSONArray("loc");
+                    if (loc != null && loc.length() > 0) {
+                        String f = loc.optString(loc.length() - 1, "");
+                        if (!f.isBlank() && !f.equalsIgnoreCase("body") && !f.equalsIgnoreCase("query")
+                                && !f.equalsIgnoreCase("path")) missing.add(f);
+                    }
+                }
+            } else {
+                JSONObject fields = errs.optJSONObject("detail"); if (fields == null) fields = errs;
+                for (String k : fields.keySet()) if (!k.equalsIgnoreCase("message") && !k.equalsIgnoreCase("status")) missing.add(k);
+            }
+            boolean any = false;
+            for (String f : missing) {
+                if (cur.has(f) && !String.valueOf(cur.opt(f)).isBlank()) continue;
+                String n = f.toLowerCase(); Object val;
+                if (n.contains("email")) val = email;
+                else if (n.matches("(?i).*(password|pwd|pass).*")) val = pass;
+                else if (n.matches("(?i).*first.*name.*") || n.equals("fname")) val = "Test";
+                else if (n.matches("(?i).*(last|sur|family).*name.*") || n.equals("lname")) val = "User";
+                // Phone must be UNIQUE per account: apps with a UNIQUE phone constraint (DVRestaurant) reject a
+                // repeated number with 403 "already registered", so a constant collides on every re-scan. Derive a
+                // 10-digit number from the (nonce-based) email so it's unique across scans yet stable within one
+                // register flow. Generic — no hardcoded number.
+                else if (n.matches("(?i).*(phone|mobile|tel|number|msisdn).*"))
+                    val = "9" + String.format("%09d", Math.abs((email == null ? "0" : email).hashCode()) % 1_000_000_000L);
+                else if (n.contains("name") || n.contains("user")) val = "aisc" + Math.abs(System.nanoTime() % 100000);
+                else val = "1";
+                cur.put(f, val); any = true;
+            }
+            return any ? cur.toString() : body;
+        } catch (Exception e) { return body; }
+    }
+
+    /** Convert a flat JSON object body to an application/x-www-form-urlencoded body (for OAuth2PasswordRequestForm
+     *  / form-login token endpoints). Returns null if the body is not a flat JSON object. Generic. */
+    private static String jsonToForm(String jsonBody) {
+        if (jsonBody == null || !jsonBody.trim().startsWith("{")) return null;
+        try {
+            JSONObject o = new JSONObject(jsonBody);
+            StringBuilder sb = new StringBuilder();
+            for (String k : o.keySet()) {
+                Object v = o.opt(k);
+                if (v == null || v instanceof JSONObject || v instanceof org.json.JSONArray) continue;  // flat only
+                if (sb.length() > 0) sb.append('&');
+                sb.append(java.net.URLEncoder.encode(k, java.nio.charset.StandardCharsets.UTF_8))
+                  .append('=').append(java.net.URLEncoder.encode(String.valueOf(v), java.nio.charset.StandardCharsets.UTF_8));
+            }
+            return sb.length() == 0 ? null : sb.toString();
+        } catch (Exception e) { return null; }
+    }
+
     private static String superCreds(String tag, String email, String pass, String pf) {
         StringBuilder b = new StringBuilder("{\"username\":\"").append(tag).append("\",\"user\":\"").append(tag)
                 .append("\",\"login\":\"").append(tag).append("\",\"name\":\"").append(tag)
@@ -1438,7 +1924,7 @@ public final class EndpointDiscovery {
                 String t = body.trim();
                 JSONObject spec = null;
                 if (t.startsWith("{")) {
-                    try { spec = new JSONObject(t); } catch (Exception ignore) { }
+                    spec = parseSpecJson(t);   // tolerant: repairs invalid \escapes a strict parse would reject
                 } else if (t.toLowerCase().contains("openapi") || t.toLowerCase().contains("swagger")) {
                     spec = specFromYamlViaLlm(t);   // YAML spec → LLM converts to a JSON paths object
                 }
@@ -1452,6 +1938,50 @@ public final class EndpointDiscovery {
                 if (live.size() > before) return;   // one good spec is enough
             } catch (Exception ignore) { }
         }
+        // Change A: also ingest a spec published at a NON-conventional location (e.g. /static/openapi.json). Scan the
+        // site map for a same-host response that IS a spec — spec-ish URL name OR spec-shaped body — and ingest it
+        // with the tolerant parser. Matched by ARTIFACT SHAPE, not any app-specific path. (The conventional-location
+        // loop above returns on the first good spec, so this runs only when that list didn't find one.)
+        try {
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (rr.request() == null || rr.response() == null) continue;
+                String u = rr.request().url();
+                if (u == null || !host.equalsIgnoreCase(hostOf(u))) continue;
+                String body = rr.response().bodyToString();
+                if (body == null) continue;
+                String t = body.trim();
+                boolean urlSpecish  = u.matches("(?i).*(openapi|swagger|api-?docs)[^/?#]*\\.(json|ya?ml)(\\?.*)?$");
+                boolean bodySpecish = t.startsWith("{") && t.length() > 40 && t.contains("\"paths\"")
+                        && (t.toLowerCase().contains("\"openapi\"") || t.toLowerCase().contains("\"swagger\""));
+                if (!urlSpecish && !bodySpecish) continue;
+                JSONObject spec = parseSpecJson(t);
+                if (spec == null || !spec.has("paths")) continue;
+                specRoot = spec;
+                acquireSpecToken(spec, host, root);
+                int before = live.size();
+                parseSpecPaths(spec, host, root, live, seen);
+                scanLog.log("  -> API SPEC (site map " + u.split("\\?")[0] + "): ingested "
+                        + (live.size() - before) + " live endpoint(s).");
+                if (live.size() > before) return;
+            }
+        } catch (Exception ignore) { }
+    }
+
+    /** Parse a served OpenAPI/Swagger JSON spec TOLERANTLY. Some real specs embed regex patterns with a bare
+     *  backslash escape (like a caret-slash-d pattern) which is INVALID JSON — a strict org.json parse then rejects
+     *  the ENTIRE document and the whole documented surface is lost. When strict parsing fails, escape any backslash
+     *  that isn't part of a JSON-legal escape (quote, backslash, slash, b, f, n, r, t, u) and retry. Null if it
+     *  still won't parse. */
+    private static JSONObject parseSpecJson(String t) {
+        if (t == null) return null;
+        t = t.trim();
+        if (!t.startsWith("{")) return null;
+        try { return new JSONObject(t); } catch (Exception ignore) { }
+        try {
+            String repaired = t.replaceAll("\\\\(?![\"\\\\/bfnrtu])", java.util.regex.Matcher.quoteReplacement("\\\\"));
+            return new JSONObject(repaired);
+        } catch (Exception ignore) { }
+        return null;
     }
 
     /** Build + live-probe a request for every path×method in an OpenAPI paths object; keep the live ones. */
@@ -2266,8 +2796,9 @@ public final class EndpointDiscovery {
     private static final Pattern REST_PATH = Pattern.compile("(?<![A-Za-z0-9_])/?(?:rest|api)/[A-Za-z0-9_./-]+");
     // A base fragment an SPA appends an auth verb to at runtime (this.host = ".../rest/user"; post(host+"/login")).
     private static final Pattern AUTH_BASE = Pattern.compile("(?i).*/(users?|accounts?|auth|identity|session|customers?|members?)$");
-    private static final Pattern AUTH_LEAF = Pattern.compile("(?i).*/(login|signin|sign-in|logon|authenticate|authentication|session|token)$");
-    private static final String[] AUTH_VERBS = {"login", "signin", "authenticate", "session", "token"};
+    private static final Pattern AUTH_LEAF = Pattern.compile("(?i).*/(login|signin|sign-in|logon|authenticate|authentication|session|sessions|token|tokens|authorization|authorizations)$");
+    // ASP.NET Web API RESTful-controller convention adds authorizations/sessions/tokens (AuthorizationsController → /api/authorizations).
+    private static final String[] AUTH_VERBS = {"login", "signin", "authenticate", "session", "token", "authorizations", "sessions", "tokens"};
     // A service-base literal an SPA prepends to endpoint leaves at runtime: a single path segment ending
     // in "/", stored on its own (crAPI: og="identity/", ig="workshop/"). The whole quoted string must BE
     // the segment (so "text/html" etc. don't match).
@@ -2275,7 +2806,7 @@ public final class EndpointDiscovery {
     // A relative auth-endpoint leaf literal (crAPI: "api/auth/login"), which URLISH/REST_PATH miss because
     // it has no leading slash. Kept generic: any path-ish literal ending in an auth verb.
     private static final Pattern AUTH_LEAF_LITERAL = Pattern.compile(
-            "[\"'](/?[a-z0-9][a-z0-9/_.-]{0,60}?(?:login|signin|sign-in|logon|authenticate|signup|sign-up|register))[\"']",
+            "[\"'](/?[a-z0-9][a-z0-9/_.-]{0,60}?(?:login|signin|sign-in|logon|authenticate|signup|sign-up|register|registrations|authorizations))[\"']",
             Pattern.CASE_INSENSITIVE);
 
     /**
@@ -2303,6 +2834,21 @@ public final class EndpointDiscovery {
                 String[] p = spec.split(SEP, -1);
                 if (p.length < 3 || !"POST".equals(p[0].trim()) || !hasPasswordLike(p[2])) continue;
                 for (HttpRequest req : buildVariants(spec, baseUrl)) addAuthCandidate(out, seen, req, host);
+            }
+
+            // (1b) SITE-MAP POST endpoints carrying a credential (password) field — catches spec/OpenAPI-ingested
+            // login/register ops (e.g. FastAPI /token with username/password, /register) that mineSpecs (client-code
+            // mining) never surfaces because they are POST-only API routes absent from crawlable HTML/JS. Generic:
+            // a POST whose body or params include a password-like field is an auth endpoint worth trying.
+            java.util.regex.Pattern PWLIKE = java.util.regex.Pattern.compile("(?i)\"?(password|passwd|pwd)\"?");
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                HttpRequest req = rr.request();
+                if (req == null || !"POST".equalsIgnoreCase(req.method())) continue;
+                if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
+                String body = req.bodyToString();
+                boolean cred = (body != null && PWLIKE.matcher(body).find());
+                if (!cred) { try { for (var pp : req.parameters()) if (PWLIKE.matcher(pp.name()).find()) { cred = true; break; } } catch (Throwable ignore) {} }
+                if (cred) addAuthCandidate(out, seen, req, host);
             }
 
             // (2) derive auth endpoints from base fragments + auth verbs, then probe

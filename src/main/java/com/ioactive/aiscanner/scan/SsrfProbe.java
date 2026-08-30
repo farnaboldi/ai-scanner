@@ -31,16 +31,13 @@ import java.util.function.UnaryOperator;
  * like {@code /import?url=} is often dropped from the audit surface (a self-referential seed mirrors the app's
  * catch-all page), so this probe builds the request straight from the hint (base + path + param) to test it.</p>
  */
-public final class SsrfProbe {
+public final class SsrfProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
     private SourceFindings sourceHints;
     // url-like-param heuristic (SSRF surface) is shared with EndpointDiscovery.URL_PARAM — single source of truth.
 
     public SsrfProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public void setSourceHints(SourceFindings hints) { this.sourceHints = hints; }
@@ -49,10 +46,22 @@ public final class SsrfProbe {
      * @param baseUrl scheme://authority of the target (for building hint-derived requests), or null
      * @param targets discovered audit targets (their url-like params are also tested)
      */
+    // Hostnames used by the local listener: loopback for non-Docker targets, Docker-Desktop bridge for containers.
+    private static final String[] LOCAL_HOSTS = { "127.0.0.1", "host.docker.internal" };
+
     public int probe(String baseUrl, List<HttpRequest> targets, UnaryOperator<HttpRequest> withSession) {
+        // Start a local HTTP listener for SSRF callbacks — works without an external Collaborator server and
+        // covers localhost/Docker targets where outbound DNS callbacks are unreachable.
+        LocalSsrfListener localListener = LocalSsrfListener.start();
+        if (localListener != null) scanLog.debug("  ssrf: local listener started on port " + localListener.port());
+
         CollaboratorClient collab;
         try { collab = api.collaborator().createClient(); }
-        catch (Throwable t) { scanLog.debug("  ssrf: Collaborator unavailable — OAST SSRF skipped"); return 0; }
+        catch (Throwable t) {
+            collab = null;
+            if (localListener == null) { scanLog.debug("  ssrf: Collaborator unavailable and local listener failed — SSRF skipped"); return 0; }
+            scanLog.debug("  ssrf: Collaborator unavailable — using local listener only.");
+        }
 
         Map<String, String[]> tagToPoint = new LinkedHashMap<>();   // tag -> {url, point-label}
         Map<String, HttpRequestResponse> tagToRr = new LinkedHashMap<>();   // tag -> the request that carried the payload
@@ -67,8 +76,12 @@ public final class SsrfProbe {
                 if (pname == null || pname.isBlank()) continue;
                 String abs = baseUrl.replaceAll("/+$", "") + (h.path.startsWith("/") ? h.path : "/" + h.path);
                 if (!seen.add(pathKey(abs) + "|" + pname)) continue;
-                fire(collab, tagToPoint, tagToRr, idx, abs, h.method.isBlank() ? "GET" : h.method, pname,
+                String method = h.method.isBlank() ? "GET" : h.method;
+                if (collab != null) fire(collab, tagToPoint, tagToRr, idx, abs, method, pname,
                         HttpParameterType.URL, withSession, "SSRF hint " + h.path);
+                if (localListener != null) for (String lh : LOCAL_HOSTS)
+                    fireLocal(localListener, lh, tagToPoint, tagToRr, idx, abs, method, pname,
+                            HttpParameterType.URL, withSession, "SSRF hint " + h.path);
             }
         }
 
@@ -79,7 +92,9 @@ public final class SsrfProbe {
                     if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;
                     if (!isSsrfParam(req.url(), p.name())) continue;
                     if (!seen.add(pathKey(req.url()) + "|" + p.name())) continue;
-                    fireOn(collab, tagToPoint, tagToRr, idx, req, p.name(), p.type(), withSession);
+                    if (collab != null) fireOn(collab, tagToPoint, tagToRr, idx, req, p.name(), p.type(), withSession);
+                    if (localListener != null) for (String lh : LOCAL_HOSTS)
+                        fireLocalOn(localListener, lh, tagToPoint, tagToRr, idx, req, p.name(), p.type(), withSession);
                 }
             }
         }
@@ -87,8 +102,7 @@ public final class SsrfProbe {
         // (3) JSON BODY fields — a url/path/dispatch value inside a JSON body (e.g. {"theUrl":"page/Viewer/Search"})
         // is NOT a Montoya parameter, so arms (1)/(2) never see it. A field whose NAME is url-ish (theUrl/redirectUrl/
         // endpoint…) OR whose VALUE is an app-relative path / absolute URL is a dispatch/SSRF sink: inject a
-        // Collaborator URL and poll. The OAST oracle is zero-FP — it fires ONLY if the server actually fetches it
-        // (a pure internal-router that never egresses simply yields no callback). Generic — no app paths.
+        // Collaborator/local URL and poll. Generic — no app paths.
         if (targets != null) {
             for (HttpRequest req : targets) {
                 String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
@@ -102,14 +116,207 @@ public final class SsrfProbe {
                     if (!doneKeys.add(key)) continue;
                     if (!(NAME_URLISH.matcher(key).find() || looksPathOrUrl(val))) continue;
                     if (!seen.add(pathKey(req.url()) + "|json:" + key)) continue;
-                    fireJsonField(collab, tagToPoint, tagToRr, idx, req, body, key, withSession);
+                    if (collab != null) fireJsonField(collab, tagToPoint, tagToRr, idx, req, body, key, withSession);
+                    if (localListener != null) for (String lh : LOCAL_HOSTS)
+                        fireLocalJson(localListener, lh, tagToPoint, tagToRr, idx, req, body, key, withSession);
                 }
             }
         }
 
-        if (tagToPoint.isEmpty()) return 0;
-        scanLog.debug("  ssrf: fired " + tagToPoint.size() + " OAST payload(s); polling Collaborator…");
-        return poll(collab, tagToPoint, tagToRr);
+        // (4) BODY-ADD on write endpoints — a url-typed field named by an SSRF hint is often OPTIONAL and thus
+        // ABSENT from a discovered PUT/POST/PATCH target's baseline body; arm (3) only rewrites keys that are
+        // PRESENT, so it never fires. Take a discovered write target that already carries a VALID JSON body (the
+        // required sibling fields the endpoint validates, synthesized during discovery) and ADD the hinted url
+        // field pointing at our listener. This reaches url-fetch-on-create/update sinks generically
+        // (avatar-by-URL, import-from-URL, image_url → server-side fetch), independent of the hint's HTTP method
+        // (the SAST LLM often mislabels the route method as the sink's requests.get()).
+        if (targets != null && sourceHints != null) {
+            for (StaticHint h : sourceHints.all()) {
+                if (!h.hasEndpoint()) continue;
+                // A url-typed field on a write endpoint is an SSRF candidate BY STRUCTURE — don't depend on the
+                // LLM having labelled the hint vulnClass=SSRF (it often mislabels the sink). Gate on the field NAME.
+                java.util.LinkedHashSet<String> urlFields = new java.util.LinkedHashSet<>();
+                if (!h.paramName.isBlank() && NAME_URLISH.matcher(h.paramName).find()) urlFields.add(h.paramName);
+                for (String p : h.params) if (p != null && NAME_URLISH.matcher(p).find()) urlFields.add(p);
+                if (urlFields.isEmpty()) continue;
+                for (HttpRequest req : targets) {
+                    String m = req.method();
+                    if (!("POST".equalsIgnoreCase(m) || "PUT".equalsIgnoreCase(m) || "PATCH".equalsIgnoreCase(m))) continue;
+                    if (!pathMatchesHint(req.url(), h)) continue;
+                    String body = req.bodyToString();
+                    if (body == null || body.indexOf('{') < 0) continue;                  // JSON-body write only
+                    for (String f : urlFields) {
+                        if (body.matches("(?s).*\"" + java.util.regex.Pattern.quote(f) + "\"\\s*:.*")) continue; // present → arm(3)
+                        if (!seen.add(pathKey(req.url()) + "|bodyadd:" + f)) continue;
+                        if (collab != null) fireBodyAdd(collab, null, null, tagToPoint, tagToRr, idx, req, body, f, withSession);
+                        if (localListener != null) for (String lh : LOCAL_HOSTS)
+                            fireBodyAdd(null, localListener, lh, tagToPoint, tagToRr, idx, req, body, f, withSession);
+                    }
+                }
+            }
+        }
+
+        if (tagToPoint.isEmpty()) { if (localListener != null) localListener.close(); return 0; }
+        int fired = tagToPoint.size();
+        scanLog.debug("  ssrf: fired " + fired + " payload(s)"
+                + (collab != null ? " (Collaborator)" : "")
+                + (localListener != null ? " + local listener :" + localListener.port() : "")
+                + "; polling…");
+        int hits = collab != null ? poll(collab, tagToPoint, tagToRr) : 0;
+        if (localListener != null) hits += pollLocal(localListener, tagToPoint, tagToRr);
+        return hits;
+    }
+
+    /** Fire a local-listener URL into a fresh request — SSRF confirmed when the listener receives the tag. */
+    private void fireLocal(LocalSsrfListener ll, String host, Map<String, String[]> tagToPoint,
+                           Map<String, HttpRequestResponse> tagToRr, int[] idx,
+                           String abs, String method, String param, HttpParameterType type,
+                           UnaryOperator<HttpRequest> withSession, String why) {
+        try {
+            String tag = "ssrfl" + (idx[0]++);
+            String payload = "http://" + host + ":" + ll.port() + "/" + ll.nonce() + "/" + tag;
+            HttpRequest req = HttpRequest.httpRequestFromUrl(abs).withMethod(method)
+                    .withAddedParameters(HttpParameter.parameter(param, payload, type));
+            HttpRequestResponse rr = send(req, withSession);
+            tagToPoint.put(tag, new String[]{ abs, param + " (" + type + ") [" + why + "]" });
+            if (rr != null) tagToRr.put(tag, rr);
+        } catch (Throwable ignore) { }
+    }
+
+    private void fireLocalOn(LocalSsrfListener ll, String host, Map<String, String[]> tagToPoint,
+                             Map<String, HttpRequestResponse> tagToRr, int[] idx,
+                             HttpRequest req, String param, HttpParameterType type,
+                             UnaryOperator<HttpRequest> withSession) {
+        try {
+            String tag = "ssrfl" + (idx[0]++);
+            String payload = "http://" + host + ":" + ll.port() + "/" + ll.nonce() + "/" + tag;
+            HttpRequest m = req.withUpdatedParameters(HttpParameter.parameter(param, payload, type));
+            HttpRequestResponse rr = send(m, withSession);
+            tagToPoint.put(tag, new String[]{ req.url(), param + " (" + type + ")" });
+            if (rr != null) tagToRr.put(tag, rr);
+        } catch (Throwable ignore) { }
+    }
+
+    private void fireLocalJson(LocalSsrfListener ll, String host, Map<String, String[]> tagToPoint,
+                               Map<String, HttpRequestResponse> tagToRr, int[] idx,
+                               HttpRequest req, String body, String key,
+                               UnaryOperator<HttpRequest> withSession) {
+        try {
+            String tag = "ssrfl" + (idx[0]++);
+            String payload = "http://" + host + ":" + ll.port() + "/" + ll.nonce() + "/" + tag;
+            String mbody = body.replaceFirst(
+                    "(\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\")[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*(\")",
+                    "$1" + java.util.regex.Matcher.quoteReplacement(payload) + "$2");
+            HttpRequestResponse rr = send(req.withBody(mbody), withSession);
+            tagToPoint.put(tag, new String[]{ req.url(), key + " (JSON)" });
+            if (rr != null) tagToRr.put(tag, rr);
+        } catch (Throwable ignore) { }
+    }
+
+    /** Add a url-typed field to a write endpoint's VALID JSON body (keeping its required siblings) and send it —
+     *  reaches url-fetch-on-create/update SSRF sinks where the field was optional/absent from the baseline body.
+     *  Exactly one of {collab, ll} is non-null (Collaborator payload vs local-listener payload). */
+    private void fireBodyAdd(CollaboratorClient collab, LocalSsrfListener ll, String host,
+                             Map<String, String[]> tagToPoint, Map<String, HttpRequestResponse> tagToRr,
+                             int[] idx, HttpRequest req, String body, String field,
+                             UnaryOperator<HttpRequest> withSession) {
+        try {
+            String tag, payload;
+            if (ll != null) {
+                tag = "ssrfl" + (idx[0]++);
+                payload = "http://" + host + ":" + ll.port() + "/" + ll.nonce() + "/" + tag;
+            } else {
+                tag = "ssrf" + (idx[0]++);
+                payload = "http://" + collab.generatePayload(tag).toString() + "/" + tag;
+            }
+            org.json.JSONObject o = new org.json.JSONObject(body);   // valid baseline (has the required siblings)
+            o.put(field, payload);                                    // ADD the url-typed field
+            HttpRequest m = req.withBody(o.toString());
+            if (!m.hasHeader("Content-Type")) m = m.withAddedHeader("Content-Type", "application/json");
+            HttpRequestResponse rr = send(m, withSession);
+            tagToPoint.put(tag, new String[]{ req.url(), field + " (JSON body-add)" });
+            if (rr != null) tagToRr.put(tag, rr);
+        } catch (Throwable ignore) { }
+    }
+
+    /** Same-path-family match: the target URL's path equals the hint path or is a child of it (/menu ~ /menu/1). */
+    private static boolean pathMatchesHint(String url, StaticHint h) {
+        if (h == null || !h.hasEndpoint()) return false;
+        try {
+            String tp = java.net.URI.create(url).getPath();
+            if (tp == null) return false;
+            String hp = h.path.replaceAll("\\{[^}]*}", "").replaceAll("\\?.*$", "").replaceAll("/+$", "");
+            tp = tp.replaceAll("/+$", "");
+            if (hp.isEmpty()) return false;
+            return tp.equals(hp) || tp.startsWith(hp + "/") || hp.startsWith(tp + "/");
+        } catch (Exception e) { return false; }
+    }
+
+    /** Poll the local listener for tag hits (brief wait for async callbacks, then check). Catches BOTH:
+     *  (a) BLIND SSRF — the target's outbound request reached the listener (tag recorded); and
+     *  (b) REFLECTED SSRF — the target fetched the listener URL and echoed the canary body back in its OWN
+     *      response (raw or base64-wrapped, e.g. an image_base64 field). Both are deterministic and zero-FP:
+     *      the tag/canary are 128-bit random, so neither a chance collision nor a stray LAN request can forge one. */
+    private int pollLocal(LocalSsrfListener ll, Map<String, String[]> tagToPoint,
+                          Map<String, HttpRequestResponse> tagToRr) {
+        try { Thread.sleep(2000); } catch (InterruptedException ignore) { }
+        int hits = 0;
+        // Precompute the canary in the encodings a reflecting app might wrap it in.
+        String canary = ll.canary();
+        java.util.List<String> canaryForms = canaryForms(canary);
+        for (Map.Entry<String, String[]> e : tagToPoint.entrySet()) {
+            String tag = e.getKey(); if (!tag.startsWith("ssrfl")) continue;
+            String[] pt = e.getValue();
+            HttpRequestResponse ev = tagToRr.get(tag);
+            if (ll.received(tag)) {                                   // (a) blind / OOB callback
+                scanLog.found("SSRF", pt[0],
+                        "Server made an outbound HTTP request to the scanner-controlled listener (blind SSRF "
+                        + "callback confirmed). Injection point: " + pt[1] + " — the server fetched a URL the "
+                        + "scanner supplied (CWE-918).",
+                        ev != null ? new HttpRequestResponse[]{ ev } : new HttpRequestResponse[0]);
+                scanLog.incFinding(); hits++;
+                continue;
+            }
+            // (b) reflected / returned-content: the fetched canary appears in the app's own response body.
+            if (ev != null && ev.response() != null) {
+                String rb = ev.response().bodyToString();
+                if (rb != null && !rb.isEmpty()) {
+                    String form = firstContained(rb, canaryForms);
+                    if (form != null) {
+                        scanLog.found("SSRF", pt[0],
+                                "Server fetched the scanner-controlled URL and reflected the fetched content back "
+                                + "in its own response (" + form + "-encoded canary present) — returned-content SSRF "
+                                + "(CWE-918). Injection point: " + pt[1] + ".",
+                                new HttpRequestResponse[]{ ev });
+                        scanLog.incFinding(); hits++;
+                    }
+                }
+            }
+        }
+        ll.close();
+        return hits;
+    }
+
+    /** The canary in the forms a reflecting server might wrap it in: raw, and base64 (std + url-safe, padded/not). */
+    private static java.util.List<String> canaryForms(String canary) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        out.add(canary);                                              // raw
+        byte[] cb = canary.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        String std = java.util.Base64.getEncoder().encodeToString(cb);
+        out.add(std);                                                 // standard base64 (padded)
+        out.add(std.replace("=", ""));                                // unpadded
+        String url = java.util.Base64.getUrlEncoder().encodeToString(cb);
+        out.add(url);                                                 // url-safe base64 (padded)
+        out.add(url.replace("=", ""));                                // unpadded
+        return out;
+    }
+
+    /** Return the label of the first canary form contained in {@code body}, or null. */
+    private static String firstContained(String body, java.util.List<String> forms) {
+        // forms order: [raw, b64, b64-nopad, b64url, b64url-nopad]
+        if (body.contains(forms.get(0))) return "raw";
+        for (int i = 1; i < forms.size(); i++) if (body.contains(forms.get(i))) return "base64";
+        return null;
     }
 
     // A JSON "key":"value" string field; a url-ish field NAME (substring, so camelCase theUrl/redirectUrl match); and
@@ -180,9 +387,10 @@ public final class SsrfProbe {
     /** Send the payload request and return the request/response so it can be attached to the finding as proof.
      *  On a transport error we still return a request-only record — for an OAST hit the request itself is the proof. */
     private HttpRequestResponse send(HttpRequest req, UnaryOperator<HttpRequest> withSession) {
+        politeness();   // ScanConfig politeness delay
         HttpRequest s = withSession != null ? withSession.apply(req) : req;
         try {
-            return api.http().sendRequest(s, RequestOptions.requestOptions().withResponseTimeout(15000L));
+            return api.http().sendRequest(s, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
         } catch (Throwable t) {
             try { return HttpRequestResponse.httpRequestResponse(s, null); } catch (Throwable ignore) { return null; }
         }

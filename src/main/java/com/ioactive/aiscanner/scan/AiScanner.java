@@ -18,6 +18,8 @@ import com.ioactive.aiscanner.scan.flow.FlowEngine;
 import com.ioactive.aiscanner.scan.flow.StepResult;
 import com.ioactive.aiscanner.scan.sast.AgenticSourceAnalyzer;
 import com.ioactive.aiscanner.scan.sast.CoarseSourceAnalyzer;
+import com.ioactive.aiscanner.scan.sast.IterativeRouteScanner;
+import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.scan.sast.PostmanParser;
 import com.ioactive.aiscanner.scan.sast.RepoFetcher;
 import com.ioactive.aiscanner.scan.sast.RouteHarvester;
@@ -57,6 +59,7 @@ public final class AiScanner {
     private final java.util.function.BooleanSupplier cancelled;  // true once the extension is unloaded
     /** host → local source-repo path (or null) — drives the optional SAST pass. null resolver = never. */
     private final java.util.function.Function<String, String> repoResolver;
+    private final ScanConfig config;   // Settings knobs: politeness delay + LLM insertion budget (rounds × payloads)
     // Per-scan report path. Set for PARALLEL scans so two concurrent AiScanner instances each write their own report
     // instead of racing on the single global -Daiscanner.report property. null → fall back to the global property/env.
     private volatile String reportPathOverride;
@@ -120,7 +123,10 @@ public final class AiScanner {
     // PER audited request — on a big surface that alone runs to tens of minutes with a 35B model and starves the native
     // audit (which does the actual fuzzing) of time. Deterministic ranges (params + JSON + path IDs) are ALWAYS added;
     // the LLM only surfaces non-obvious extras, so capping it costs almost no coverage but reclaims the time budget.
-    private static final int LLM_INSERT_CAP = Integer.getInteger("aiscanner.llmInsertCap", 20);
+    // Explicit ops override (null when -Daiscanner.llmInsertCap is unset). When unset, the per-request LLM
+    // insertion-point budget comes from ScanConfig.maxRequestsPerClass() (rounds × payloadsPerRound + 8) via
+    // llmInsertCap(), so the Settings "Refine rounds" / "Payloads per round" knobs bound the LLM attack surface.
+    private static final Integer LLM_INSERT_CAP_PROP = Integer.getInteger("aiscanner.llmInsertCap");
     private final java.util.concurrent.atomic.AtomicInteger llmInsertBudget = new java.util.concurrent.atomic.AtomicInteger(0);
     private final java.util.concurrent.atomic.AtomicBoolean creditHaltLogged = new java.util.concurrent.atomic.AtomicBoolean(false);
     private final java.util.concurrent.atomic.AtomicBoolean stopLogged = new java.util.concurrent.atomic.AtomicBoolean(false);
@@ -137,6 +143,8 @@ public final class AiScanner {
     private static final Pattern NOISE = Pattern.compile("(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$");
     private static final Pattern FORM = Pattern.compile("(?is)<form\\b.*?</form>");
     private static final Pattern INPUT = Pattern.compile("(?is)<(input|textarea|select)\\b[^>]*>");
+
+    public ScanConfig config() { return config; }
 
     public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
                      SessionStore session) {
@@ -157,6 +165,15 @@ public final class AiScanner {
         this.session = session;
         this.cancelled = cancelled;
         this.repoResolver = repoResolver;
+        this.config = config != null ? config : new ScanConfig();
+    }
+
+    /** Per-request LLM insertion-point budget. An explicit {@code -Daiscanner.llmInsertCap} wins; otherwise the
+     *  ScanConfig knobs (rounds × payloadsPerRound + 8) bound how many LLM-suggested insertion points a phase adds,
+     *  so the Settings sliders actually change the LLM-driven attack surface. Default 20 either way. */
+    private int llmInsertCap() {
+        if (LLM_INSERT_CAP_PROP != null) return LLM_INSERT_CAP_PROP;
+        return config != null ? config.maxRequestsPerClass() : 20;
     }
 
     /** Re-authentication callback (set by the orchestrator). The captured session can go stale DURING the long
@@ -169,6 +186,17 @@ public final class AiScanner {
      *  cross-user differential. No-op if already minted / not authenticated. */
     private volatile Runnable secondIdentityMinter;
     public void setSecondIdentityMinter(Runnable r) { this.secondIdentityMinter = r; }
+
+    /** Consolidated second-identity + own-identity suffix for the SCAN COMPLETE auth line, so an auth/register
+     *  E2E can read the primary + secondary identity outcome from ONE grepable line. Pure logging (no behavior). */
+    private String secondIdSuffix() {
+        if (session == null) return "   |   second-identity: n/a";
+        String b = session.hasSecondIdentity()
+                ? "yes (B=" + (session.identityB().isBlank() ? "distinct" : session.identityB()) + ")"
+                : "no";
+        String own = session.ownIdentity();
+        return "   |   second-identity: " + b + (own == null || own.isBlank() ? "" : "   |   own-identity: " + own);
+    }
     private void refreshSessionIfPossible(String why) {
         try {
             if (reauth != null && session != null && session.authenticated()) {
@@ -205,7 +233,7 @@ public final class AiScanner {
                 return null;
             }
             int added = 0;
-            llmInsertBudget.set(LLM_INSERT_CAP);   // bound the per-request LLM insertion-point calls for THIS phase
+            llmInsertBudget.set(llmInsertCap());   // bound the per-request LLM insertion-point calls for THIS phase (ScanConfig)
             for (HttpRequest req : reqs) {
                 if (addToAudit(audit, req)) added++;
             }
@@ -235,6 +263,10 @@ public final class AiScanner {
             scanLog.log("scan aborted by preflight (required AI backend unusable).");
             return null;
         }
+        // ScanConfig politeness delay + per-request timeout → honoured by every probe via the base Probe send
+        // chokepoint. Set once per scan; parallel targets share one ScanConfig by design.
+        Probe.setPolitenessDelayMs(config.delayMs);
+        Probe.setRequestTimeoutMs(config.requestTimeoutMs);
         // In Pro, Burp's native audit will test every target we submit — so defer Burp-covered classes (SQLi/XSS/…)
         // to Burp's own dashboard issue instead of raising a duplicate. (No-op / keeps our issues in Community.)
         scanLog.setBurpNativeAudit(!communityEdition());
@@ -284,13 +316,15 @@ public final class AiScanner {
         String repoPath = repoResolver != null ? repoResolver.apply(host) : null;
         // Always surface the repo-association status on the Log page so it's obvious whether this run is
         // SAST-assisted or plain black-box (-Daiscanner.sastMode=agentic follows the child-process boundary).
-        boolean agentic = "agentic".equalsIgnoreCase(System.getProperty("aiscanner.sastMode", "coarse"));
+        String sastMode = System.getProperty("aiscanner.sastMode", "coarse").toLowerCase();
+        boolean agentic    = "agentic".equals(sastMode);
+        boolean iterative  = "iterative".equals(sastMode);
         if (repoPath != null && !repoPath.isBlank()) {
             scanLog.log("source repo associated with " + host + ": " + repoPath
-                    + "  → SAST-assisted scan (mode=" + (agentic ? "agentic" : "coarse") + ")");
+                    + "  → SAST-assisted scan (mode=" + sastMode + ")");
             try {
                 // Local path → use it; git/GitHub URL → fetch it over HTTP (no git binary, no subprocess).
-                String localRepo = RepoFetcher.ensureLocal(repoPath, scanLog);
+                String localRepo = RepoFetcher.ensureLocal(api, repoPath, scanLog);
                 if (localRepo == null) {
                     scanLog.log("source could not be resolved to a local checkout — SAST skipped (black-box).");
                 } else {
@@ -311,10 +345,10 @@ public final class AiScanner {
                     SourceFindings llm = SourceFindings.empty();
                     AiEngine sastEng = engine != null ? engine.get() : null;
                     if (sastEng != null && sastEng.isConfigured()) {
-                        scanLog.phase("Source analysis (SAST" + (agentic ? ", agentic" : "") + ")");
-                        SourceAnalyzer analyzer = agentic
-                                ? new AgenticSourceAnalyzer(sastEng, scanLog)
-                                : new CoarseSourceAnalyzer(sastEng, scanLog);
+                        scanLog.phase("Source analysis (SAST, " + sastMode + ")");
+                        SourceAnalyzer analyzer = agentic    ? new AgenticSourceAnalyzer(sastEng, scanLog)
+                                                : iterative  ? new IterativeRouteScanner(sastEng, scanLog)
+                                                             : new CoarseSourceAnalyzer(sastEng, scanLog);
                         llm = analyzer.analyze(host, localRepo);
                         scanLog.log("source analysis: " + llm.size() + " LLM hint(s) from " + localRepo);
                     } else {
@@ -337,6 +371,143 @@ public final class AiScanner {
             scanLog.log("no source repo associated with " + host + " — black-box scan.");
         }
         final SourceFindings hints = hints0;   // effectively-final snapshot the data-driven attack lambdas capture
+
+        // SAST mode: IterativeRouteScanner already ran above. HTTP-verify each proposed route,
+        // then feed only the live ones into Burp's native active audit. No extension probes,
+        // no crawl, no flow engine — just SAST discovery + Burp's own checks.
+        boolean sastOnlyMode = config.scanMode == ScanConfig.ScanMode.SAST
+                || "1".equals(System.getenv("AISCANNER_SAST_ONLY")) || "1".equals(System.getProperty("aiscanner.sastOnly"));
+        if (sastOnlyMode) {
+            if (hints.isEmpty()) {
+                scanLog.log("SAST mode: IterativeRouteScanner found no routes — nothing to audit. Check that the source repo is reachable and the SAST_MODE=iterative was applied.");
+                return null;
+            }
+            scanLog.phase("SAST — verifying routes + launching Burp active audit");
+            // Infer scheme from a site-map entry for THIS EXACT host:port — NOT the first arbitrary entry, which
+            // may be a sibling origin or an https redirect target. The old first-entry logic pinged an http-only
+            // target (every bench app) over https, so every ping failed the TLS handshake → "0/N live (100%
+            // hallucination)" and nothing was ever audited. Prefer http if the host answers on it at all; fall
+            // back to https only for a genuinely https-only host.
+            String scheme = "http";
+            try {
+                boolean sawHost = false;
+                for (burp.api.montoya.http.message.HttpRequestResponse smr : api.siteMap().requestResponses()) {
+                    if (smr == null || smr.request() == null) continue;
+                    String u = smr.request().url();
+                    if (!host.equalsIgnoreCase(hostOf(u))) continue;   // only entries for the target host:port
+                    if (!u.regionMatches(true, 0, "https", 0, 5)) { scheme = "http"; break; }   // http wins outright
+                    if (!sawHost) { scheme = "https"; sawHost = true; }   // tentative https; keep scanning for an http entry
+                }
+            } catch (Throwable ignore) {}
+
+            // Step 1: HTTP-ping each proposed route; keep only the live ones.
+            int proposed = 0;
+            List<HttpRequest> liveRoutes = new ArrayList<>();
+            scanLog.log("SAST: pinging " + hints.size() + " proposed route(s) against " + scheme + "://" + host + "…");
+            for (StaticHint h : hints.all()) {
+                if (h.path == null || h.path.isBlank()) continue;
+                proposed++;
+                String rawPath = (h.path.startsWith("/") ? h.path : "/" + h.path).replaceAll("\\{[^}]+\\}", "1");
+                // Try the raw path AND common docroot-stripped variants. Source frequently lives under a docroot
+                // subdir that is NOT part of the served URL (bWAPP app/, Laravel/Rails public/, Java src/main/webapp,
+                // .NET wwwroot) — so `/app/sqli_1.php` in the repo is really `/sqli_1.php` on the wire. Without this
+                // every such route 404s ("100% hallucination") even though the model named the page correctly.
+                java.util.List<String> cands = new java.util.ArrayList<>();
+                cands.add(rawPath);
+                for (String dr : new String[]{"app","public","src","www","htdocs","web","dist","build","wwwroot","webapps","public_html","httpdocs","webroot"}) {
+                    if (rawPath.startsWith("/" + dr + "/")) cands.add(rawPath.substring(dr.length() + 1));
+                }
+                String path = null; String pingUrl = null; int sc = 0;
+                try {
+                    for (String cand : cands) {
+                        String u = scheme + "://" + host + cand;
+                        burp.api.montoya.http.message.HttpRequestResponse pr = api.http().sendRequest(
+                                HttpRequest.httpRequestFromUrl(u).withMethod("GET"),
+                                burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(4000L));
+                        if (pr == null || pr.response() == null) continue;
+                        int c = pr.response().statusCode();
+                        if (c == 404 || c == 502 || c == 503) { scanLog.debug("SAST ping " + u + " → " + c + " (not live)"); continue; }
+                        path = cand; pingUrl = u; sc = c; break;   // first live variant wins
+                    }
+                    if (path == null) continue;   // no variant resolved → skip this route
+                    // Live — build the audit request with correct method AND the source-discovered param(s)
+                    // seeded as insertion points. A bare path with no query/body gives Burp's audit NOTHING to
+                    // fuzz (fuzzableRanges empty → submitToAudit returns false), which silently dropped every
+                    // param-less route ("submitted 0" despite N live). Seed query params for GET-like methods and
+                    // a JSON body for POST/PUT/PATCH so each sink the source named becomes a real insertion point.
+                    // (Path-id routes like /x/{id}→/x/1 are already covered by pathSegmentRanges.)
+                    String method = h.method == null || h.method.isBlank() ? "GET" : h.method.toUpperCase();
+                    java.util.List<String> pnames = new java.util.ArrayList<>();
+                    for (String p : h.params) if (p != null && !p.isBlank()) pnames.add(p.trim());
+                    if (pnames.isEmpty() && h.paramName != null && !h.paramName.isBlank()) pnames.add(h.paramName.trim());
+                    boolean bodyMethod = method.equals("POST") || method.equals("PUT") || method.equals("PATCH");
+                    HttpRequest auditReq;
+                    if (!pnames.isEmpty() && bodyMethod) {
+                        StringBuilder jb = new StringBuilder("{");
+                        for (int pi = 0; pi < pnames.size(); pi++) {
+                            if (pi > 0) jb.append(',');
+                            jb.append('"').append(pnames.get(pi).replace("\"", "\\\"")).append("\":\"1\"");
+                        }
+                        jb.append('}');
+                        auditReq = HttpRequest.httpRequestFromUrl(pingUrl).withMethod(method)
+                                .withBody(jb.toString()).withHeader("Content-Type", "application/json");
+                    } else if (!pnames.isEmpty()) {
+                        StringBuilder qs = new StringBuilder(pingUrl.contains("?") ? "&" : "?");
+                        for (int pi = 0; pi < pnames.size(); pi++) {
+                            if (pi > 0) qs.append('&');
+                            qs.append(java.net.URLEncoder.encode(pnames.get(pi), java.nio.charset.StandardCharsets.UTF_8)).append("=1");
+                        }
+                        auditReq = HttpRequest.httpRequestFromUrl(pingUrl + qs).withMethod(method);
+                    } else {
+                        auditReq = HttpRequest.httpRequestFromUrl(pingUrl).withMethod(method);
+                    }
+                    auditReq = withSession(auditReq);
+                    liveRoutes.add(auditReq);
+                    scanLog.log("  SAST live: " + method + " " + path + " → HTTP " + sc
+                            + (h.paramName.isBlank() ? "" : " [" + h.paramName + "]")
+                            + (h.sinkLocation.isBlank() ? "" : " @ " + h.sinkLocation));
+                } catch (Throwable t) {
+                    scanLog.debug("SAST ping failed " + pingUrl + ": " + t);
+                }
+            }
+            int halluc = proposed - liveRoutes.size();
+            scanLog.log("SAST: " + liveRoutes.size() + "/" + proposed + " route(s) verified live"
+                    + (proposed > 0 ? " (" + String.format("%.0f", 100.0 * halluc / proposed) + "% hallucination)" : ""));
+
+            if (liveRoutes.isEmpty()) { scanLog.log("SAST: no live routes to audit."); return null; }
+
+            // Step 2: feed live routes directly into Burp native active audit (no extension probes).
+            Audit audit = newAudit();
+            if (audit == null) { scanLog.log("SAST: Burp active audit unavailable (Community edition?)."); return null; }
+            int audited = 0;
+            for (HttpRequest req : liveRoutes) {
+                if (addToAudit(audit, req)) audited++;
+            }
+            scanLog.log("SAST: submitted " + audited + " live route(s) to Burp active audit — watch the Dashboard.");
+            // Nothing auditable (every live route lacked a param/insertion point) → there is NO audit to wait on.
+            // Entering the poll below would spin at requests=0 forever (auditStarted never flips) and burn the whole
+            // per-cell watchdog for zero work — the "queda al pedo" case. Return immediately.
+            if (audited == 0) { scanLog.log("SAST: 0 auditable routes (no insertion points) — nothing to audit; done."); return null; }
+            // Wait for the native audit to stabilise (same quiet-poll logic as the main scan).
+            int lastReq = -1, lastIss = -1, stable = 0, noStart = 0;
+            boolean auditStarted = false;
+            final long POLL = 60_000L; final int QUIET = 4; final int MAX_NOSTART = 3;   // ~3 min grace for Burp to dispatch
+            while (!cancelled()) {
+                try { Thread.sleep(POLL); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+                int c = 0; try { c = audit.requestCount(); } catch (Throwable ignore) {}
+                int i = scanLog.findingCount();
+                if (c > 0) auditStarted = true;
+                scanLog.log("SAST audit… requests: " + c + ", findings: " + i);
+                // Guard the auditStarted==false case too: if Burp never dispatches a request within MAX_NOSTART polls,
+                // the audit isn't going to run (submitted requests were all dropped/deduped) — stop instead of waiting
+                // out the watchdog. Once it HAS started, fall back to the normal quiet-poll convergence.
+                if (!auditStarted) { if (++noStart >= MAX_NOSTART) { scanLog.log("SAST: audit dispatched no requests in " + MAX_NOSTART + " min — abandoning the wait."); break; } }
+                else if (c == lastReq && i == lastIss) { if (++stable >= QUIET) break; } else stable = 0;
+                lastReq = c; lastIss = i;
+            }
+            scanLog.log("SAST: audit complete — " + lastIss + " finding(s).");
+            return null;
+        }
 
         // LLM + regex endpoint discovery: recover endpoints Burp's crawler can't reach
         // (JS-only AJAX/routes), probed live so nothing hallucinated gets audited.
@@ -1074,7 +1245,7 @@ public final class AiScanner {
                     scanLog.log("===================== SCAN COMPLETE (" + host + ") =====================");
                     scanLog.log("(no native-auditable parameters — the score below is deterministic-probe findings only)");
                     logBenchmarkTally();   // copy-pasteable, matches the harness metric() exactly
-                    scanLog.log("authenticated: " + authWith + "   |   audit requests: 0 (no native audit)   |   errors: 0");
+                    scanLog.log("authenticated: " + authWith + secondIdSuffix() + "   |   audit requests: 0 (no native audit)   |   errors: 0");
                     scanLog.log("==========================================================================");
                     emitManualNextSteps();
                     logAiUsage();
@@ -1172,7 +1343,7 @@ public final class AiScanner {
             scanLog.phase("Idle — scan complete");
             scanLog.log("===================== SCAN COMPLETE (" + host + ") =====================");
             logBenchmarkTally();   // copy-pasteable, matches the harness metric() exactly (no report file needed)
-            scanLog.log("authenticated: " + authWith
+            scanLog.log("authenticated: " + authWith + secondIdSuffix()
                     + "   |   audit requests: " + audit.requestCount() + "   |   errors: " + audit.errorCount());
             if (!issues.isEmpty()) {
                 scanLog.log("issues: " + issues.size()
@@ -1663,7 +1834,7 @@ public final class AiScanner {
         String text = req.toString();
         List<String> values;
         try {
-            values = eng.suggestInsertionValues(trunc(text, 4000), 6);
+            values = eng.suggestInsertionValues(trunc(text, 4000), config != null ? config.payloadsPerRound : 6);
         } catch (Throwable t) {
             return 0;
         }
@@ -1806,6 +1977,10 @@ public final class AiScanner {
     /** Build a concrete, baseline-seeded request for every SAST hint that names a route + param, and add it to
      *  the audit surface. This bridges "source knows the route/param" → "a real request the probes can mutate",
      *  using class-appropriate seeds so JSON.parse/mongo sinks return a valid baseline instead of erroring out. */
+    // REST API paths use JSON body; traditional server-side endpoints (.php, WP AJAX, etc.) use form-encoded.
+    private static final java.util.regex.Pattern HINT_API_ISH = java.util.regex.Pattern.compile(
+            "(?i).*/(api|rest|graphql|gql|v\\d+|services?)(/.*)?$|.*\\.json($|\\?).*");
+
     private void synthesizeHintTargets(String host, SourceFindings hints, List<HttpRequest> targets, Set<String> seen) {
         if (hints == null || hints.isEmpty() || targets.isEmpty()) return;
         String base = originOf(targets.get(0).url());
@@ -1821,19 +1996,41 @@ public final class AiScanner {
                 List<String> ps = new ArrayList<>();
                 ps.add(h.paramName);
                 for (String p : h.params) if (!ps.contains(p) && !p.isBlank()) ps.add(p);
+
+                // Routing params come from the path's query string (e.g. ?action=ajaxTrigger).
+                // Tag them so probes skip them — they are routing constants, not injection points.
+                java.util.LinkedHashSet<String> routingParams = new java.util.LinkedHashSet<>();
+                int qIdx = path.indexOf('?');
+                if (qIdx >= 0) {
+                    for (String kv : path.substring(qIdx + 1).split("&")) {
+                        int eq = kv.indexOf('=');
+                        String k = (eq >= 0 ? kv.substring(0, eq) : kv).trim();
+                        if (!k.isBlank()) routingParams.add(k);
+                    }
+                }
+
                 HttpRequest req;
                 if ("POST".equals(method) || "PUT".equals(method) || "PATCH".equals(method)) {
-                    StringBuilder sb = new StringBuilder("{");
-                    for (int i = 0; i < ps.size(); i++) {
-                        if (i > 0) sb.append(',');
-                        sb.append('"').append(ps.get(i)).append("\":\"").append(hintSeed(ps.get(i))).append('"');
+                    if (HINT_API_ISH.matcher(abs).matches()) {
+                        StringBuilder sb = new StringBuilder("{");
+                        for (int i = 0; i < ps.size(); i++) {
+                            if (i > 0) sb.append(',');
+                            sb.append('"').append(ps.get(i)).append("\":\"").append(hintSeed(ps.get(i))).append('"');
+                        }
+                        req = HttpRequest.httpRequestFromUrl(abs).withMethod(method)
+                                .withAddedHeader("Content-Type", "application/json").withBody(sb.append('}').toString());
+                    } else {
+                        req = HttpRequest.httpRequestFromUrl(abs).withMethod(method)
+                                .withAddedHeader("Content-Type", "application/x-www-form-urlencoded");
+                        for (String p : ps)
+                            req = req.withAddedParameters(HttpParameter.parameter(p, hintSeed(p), HttpParameterType.BODY));
                     }
-                    req = HttpRequest.httpRequestFromUrl(abs).withMethod(method)
-                            .withAddedHeader("Content-Type", "application/json").withBody(sb.append('}').toString());
                 } else {
                     req = HttpRequest.httpRequestFromUrl(abs).withMethod(method);
                     for (String p : ps) req = req.withAddedParameters(HttpParameter.urlParameter(p, hintSeed(p)));
                 }
+                if (!routingParams.isEmpty())
+                    req = req.withAddedHeader("X-AI-Skip", String.join(",", routingParams));
                 if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
                 if (addTarget(targets, seen, req)) added++;
             } catch (Throwable ignore) { }

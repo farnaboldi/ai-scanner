@@ -76,19 +76,21 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         if (!skills.isBlank()) scanLog.debug("SAST(agentic): injected stack skill guidance (" + skills.length() + " chars).");
 
         // Index every code file by basename (for child resolution) and gather entry/dispatch snippets.
+        // Also track which files contributed entry snippets so we can pass their full source for inline handlers.
         Map<String, Path> byName = new LinkedHashMap<>();
         List<String> entrySnips = new ArrayList<>();
+        Map<String, Path> entryFilePaths = new LinkedHashMap<>();  // rel path → file, for inline handler source
         int[] entryChars = {0};
         List<Path> cands = SastFiles.candidates(root);   // route/entry files first (shared selection/ordering)
         for (Path p : cands) byName.putIfAbsent(p.getFileName().toString().toLowerCase(), p);  // child-resolution index (no read)
         for (Path p : cands) {
             if (entryChars[0] >= MAX_ENTRY_CHARS) break;
-            indexEntries(root, p, entrySnips, entryChars);
+            indexEntries(root, p, entrySnips, entryChars, entryFilePaths);
         }
         if (entrySnips.isEmpty()) return coarseFallback(host, repoPath, "no entry/dispatch signals found");
 
         scanLog.log("SAST(agentic): " + entrySnips.size() + " entry/dispatch signal(s) across "
-                + byName.size() + " unit file(s) → step 1 (map entry points)…");
+                + entryFilePaths.size() + " file(s) → step 1 (map entry points)…");
 
         // --- Step 1: map entry points + dispatch targets ---
         List<Entry> entries;
@@ -97,7 +99,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         } catch (Exception e) { return coarseFallback(host, repoPath, "step 1 error (" + e.getClass().getSimpleName() + ")"); }
         if (entries.isEmpty()) return coarseFallback(host, repoPath, "step 1 mapped no entry points (flat/non-routed app)");
 
-        // --- resolve each dispatch target to a child source file (follow the boundary) ---
+        // --- resolve each dispatch target to a child source file (follow the process boundary) ---
         Map<String, String> childSrc = new LinkedHashMap<>();   // dispatch token -> "path\n<code>"
         for (Entry en : entries) {
             if (en.dispatch == null || en.dispatch.isBlank() || childSrc.size() >= MAX_CHILDREN) continue;
@@ -107,13 +109,28 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
                 childSrc.put(en.dispatch, rel + "\n" + readBounded(cp));
             }
         }
-        scanLog.log("SAST(agentic): mapped " + entries.size() + " entry point(s); following "
-                + childSrc.size() + " child unit(s) → step 2 (pin real sinks)…");
 
-        // --- Step 2: pin the real sink inside each child (or inline) ---
+        // --- inline handler sources: for entries handled in-process (dispatch=""), pass their full source
+        //     so step 2 can trace data-flow chains within the same file (e.g. $_POST → base64_decode →
+        //     json_decode → field → $wpdb->query). Bounded to MAX_CHILDREN slots shared with child sources. ---
+        Map<String, String> inlineSrc = new LinkedHashMap<>();
+        boolean anyInline = entries.stream().anyMatch(en -> en.dispatch == null || en.dispatch.isBlank());
+        if (anyInline) {
+            for (Map.Entry<String, Path> ef : entryFilePaths.entrySet()) {
+                if (childSrc.size() + inlineSrc.size() >= MAX_CHILDREN) break;
+                if (!inlineSrc.containsKey(ef.getKey())) {
+                    inlineSrc.put(ef.getKey(), ef.getKey() + "\n" + readBounded(ef.getValue()));
+                }
+            }
+        }
+        scanLog.log("SAST(agentic): mapped " + entries.size() + " entry point(s); following "
+                + childSrc.size() + " child unit(s), " + inlineSrc.size()
+                + " inline handler source(s) → step 2 (pin real sinks)…");
+
+        // --- Step 2: pin the real sink inside each child or inline handler ---
         List<StaticHint> hints;
         try {
-            hints = StaticHint.parseArray(engine.chat(SkillLibrary.augment(SINK_SYS, skills), sinkUser(entries, childSrc), "sast: sink"));
+            hints = StaticHint.parseArray(engine.chat(SkillLibrary.augment(SINK_SYS, skills), sinkUser(entries, childSrc, inlineSrc), "sast: sink"));
         } catch (Exception e) { return coarseFallback(host, repoPath, "step 2 error (" + e.getClass().getSimpleName() + ")"); }
         if (hints.isEmpty()) return coarseFallback(host, repoPath, "step 2 produced no hints");
         // FLAT-APP MERGE: the two-step boundary-follow fits framework-routed / process-boundary apps, but a flat
@@ -130,6 +147,14 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
                 hints = mergeHints(hints, coarse.all());
                 scanLog.log("SAST(agentic+coarse): " + hints.size() + " merged hint(s).");
             } catch (Throwable t) { scanLog.debug("SAST: coarse merge failed: " + t); }
+        }
+        // Merge deterministic WP AJAX hints — same pass used by coarse, LLM-independent.
+        List<StaticHint> wpHints = CoarseSourceAnalyzer.wpAjaxHints(root, scanLog);
+        if (!wpHints.isEmpty()) {
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (StaticHint h : hints) seen.add(hintKey(h));
+            for (StaticHint h : wpHints) if (seen.add(hintKey(h))) hints.add(h);
+            scanLog.debug("SAST(agentic, wp-ajax): merged " + wpHints.size() + " deterministic WP AJAX hint(s).");
         }
         return new SourceFindings(hints);
     }
@@ -157,13 +182,15 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
 
     // ---- indexing ----
 
-    private void indexEntries(Path root, Path p, List<String> entrySnips, int[] chars) {
+    private void indexEntries(Path root, Path p, List<String> entrySnips, int[] chars,
+                              Map<String, Path> entryFilePaths) {
         try {
             if (!p.toRealPath().startsWith(root)) return;      // symlink escape guard
             if (Files.size(p) > MAX_FILE_BYTES) return;
             if (chars[0] >= MAX_ENTRY_CHARS) return;
             String rel = root.relativize(p).toString().replace('\\', '/');
             String[] lines = new String(Files.readAllBytes(p), StandardCharsets.UTF_8).split("\n", -1);
+            boolean contributed = false;
             for (int i = 0; i < lines.length; i++) {
                 if (chars[0] >= MAX_ENTRY_CHARS) return;
                 String line = lines[i];
@@ -172,7 +199,9 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
                 String snip = rel + ":" + (i + 1) + "  " + line.trim();
                 entrySnips.add(snip);
                 chars[0] += snip.length() + 1;
+                contributed = true;
             }
+            if (contributed) entryFilePaths.putIfAbsent(rel, p);
         } catch (Exception ignore) { }
     }
 
@@ -254,21 +283,26 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
     }
 
     private static final String SINK_SYS =
-            "You are pinning the REAL sink for each HTTP entry point, following into the child program the "
-            + "parameter is dispatched to. You are given the entry points and, for each dispatched-to child, its "
-            + "FULL source. For each entry point, determine the concrete vulnerability at the true sink (inside the "
-            + "child when dispatched, else inline) and output ONLY a JSON array; each element:\n"
+            "You are pinning the REAL sink for each HTTP entry point. You receive:\n"
+            + "  (a) Entry points mapped in step 1.\n"
+            + "  (b) CHILD PROCESS SOURCES — full source of programs the parameter is dispatched to via exec/spawn.\n"
+            + "  (c) INLINE HANDLER SOURCES — full source of the handler files that process the parameter in-process.\n"
+            + "For (b): the real sink is inside the child — NOT the gateway's exec/spawn line.\n"
+            + "For (c): trace the parameter through any transformations within the file "
+            + "(e.g. base64_decode → json_decode → field extraction → SQL query) to find the true sink. "
+            + "The paramName should be the outermost HTTP parameter name (e.g. 'data'), even when the actual "
+            + "SQL-injectable value is a field inside a decoded structure — the probe will fuzz that param.\n"
+            + "Output ONLY a JSON array; each element:\n"
             + "  method, path, params (array), paramName\n"
             + "  vulnClass    one of: SQL Injection | NoSQL | IDOR | BFLA | mass-assignment | "
             + "Path traversal / File inclusion (LFI) | Command injection | SSRF | XXE | Insecure deserialization | "
             + "Open redirect | Cross-Site Scripting (Reflected)\n"
             + "  sinkType     sql|nosql|path|command|deser|idor|massassign|redirect|ssrf|xxe|other\n"
-            + "  sinkLocation the file:line of the REAL sink (inside the child source when the input crosses a "
-            + "process boundary — NOT the gateway's exec/spawn line)\n"
+            + "  sinkLocation file:line of the real sink\n"
             + "  confidence   0..1\n"
             + "Prefer precision; only attacker-reachable inputs. No prose, no markdown.";
 
-    private static String sinkUser(List<Entry> entries, Map<String, String> childSrc) {
+    private static String sinkUser(List<Entry> entries, Map<String, String> childSrc, Map<String, String> inlineSrc) {
         StringBuilder sb = new StringBuilder();
         sb.append("Entry points (JSON):\n[");
         for (int i = 0; i < entries.size(); i++) {
@@ -278,16 +312,27 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
               .append("\",\"param\":\"").append(esc(e.param)).append("\",\"dispatch\":\"").append(esc(e.dispatch)).append("\"}");
         }
         sb.append("]\n\n");
-        if (childSrc.isEmpty()) {
-            sb.append("(No child programs dispatched to — sinks are inline in the entry files.)\n");
-        } else {
+        if (!childSrc.isEmpty()) {
             for (Map.Entry<String, String> c : childSrc.entrySet()) {
                 int nl = c.getValue().indexOf('\n');
                 String rel = nl > 0 ? c.getValue().substring(0, nl) : c.getKey();
                 String code = nl > 0 ? c.getValue().substring(nl + 1) : c.getValue();
-                sb.append("=== CHILD dispatched as '").append(c.getKey()).append("'  (source: ").append(rel).append(") ===\n");
+                sb.append("=== CHILD PROCESS SOURCE (dispatched as '").append(c.getKey())
+                  .append("', source: ").append(rel).append(") ===\n");
                 sb.append(code).append("\n\n");
             }
+        }
+        if (!inlineSrc.isEmpty()) {
+            sb.append("=== INLINE HANDLER SOURCES (trace data-flow chains within these files) ===\n");
+            for (Map.Entry<String, String> c : inlineSrc.entrySet()) {
+                int nl = c.getValue().indexOf('\n');
+                String code = nl > 0 ? c.getValue().substring(nl + 1) : c.getValue();
+                sb.append("--- ").append(c.getKey()).append(" ---\n");
+                sb.append(code).append("\n\n");
+            }
+        }
+        if (childSrc.isEmpty() && inlineSrc.isEmpty()) {
+            sb.append("(No child or handler sources available — use only entry point signals above.)\n");
         }
         sb.append("Return the JSON array of directives now.");
         return sb.toString();

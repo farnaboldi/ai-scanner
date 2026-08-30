@@ -32,10 +32,8 @@ import java.util.regex.Pattern;
  * The introspected resolver queries are also the exact requests to hand Burp's active audit (variables = natural
  * JSON insertion points) so its SQLi/injection checks fire on GraphQL too — see AiScanner wiring.
  */
-public final class GraphqlProbe {
+public final class GraphqlProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
     private static final int MAX_RESOLVERS = 40;
 
     /** Engine-agnostic SQL-error signatures (SQLite/Python, MySQL, PostgreSQL, Oracle, MSSQL, generic ORM). Used by
@@ -55,8 +53,7 @@ public final class GraphqlProbe {
           + "args{name type{kind name ofType{kind name ofType{kind name ofType{kind name}}}}}}}}}";
 
     public GraphqlProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     private static final class Resolver {
@@ -342,7 +339,7 @@ public final class GraphqlProbe {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
                     .withHeader("Content-Type", "application/json").withBody(jsonBody);
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(req);
         } catch (Throwable t) { return null; }
     }
 
@@ -360,9 +357,7 @@ public final class GraphqlProbe {
         return null;
     }
 
-    private static String hostOf(String u) {
-        return Net.authority(u);
-    }
+    // hostOf(String) inherited from Probe.
     private static String clip(String s) {
         s = s.replaceAll("\\s+", " ").trim();
         return s.length() <= 60 ? s : s.substring(0, 60) + "…";

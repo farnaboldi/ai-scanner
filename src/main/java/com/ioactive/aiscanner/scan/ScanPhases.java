@@ -110,6 +110,17 @@ public final class ScanPhases {
      *  status-bar step number is derived from this one list (not an emission counter that could disagree). */
     public static int position(Phase p) { int i = ALL.indexOf(p); return i < 0 ? 0 : i + 1; }
 
+    /** 1-based position of {@code p} among ONLY the lifecycle (non-attack) phases; 0 if p is an attack phase.
+     *  SAST-only mode runs no attack battery and caps the status-bar denominator to {@link #lifecycleCount()},
+     *  so the numerator must count lifecycle phases too — otherwise a post-attack phase's absolute index (e.g.
+     *  "Auditing login/signin" = 44) shows against the 10-phase total → the nonsensical "44/10". */
+    public static int lifecyclePosition(Phase p) {
+        if (p == null || p.isAttack()) return 0;
+        int n = 0;
+        for (Phase q : ALL) { if (!q.isAttack()) { n++; if (q == p) return n; } }
+        return 0;
+    }
+
     /** Does this phase run given a {@code -Daiscanner.only=} filter? Lifecycle phases (null key) always run; an
      *  attack phase runs only if its key is listed. Null/blank filter → everything runs. */
     public static boolean runsUnderFilter(Phase p, String only) {

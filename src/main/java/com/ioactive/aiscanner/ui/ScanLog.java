@@ -25,6 +25,11 @@ public final class ScanLog {
     private final JPanel panel = new JPanel(new BorderLayout());
     private JScrollPane scroll;   // log viewport — used to follow the tail ONLY when the user is already at the bottom
     private final JTextArea area = new JTextArea(14, 100);
+    /** Right-side chat panel (added by enableChat). Non-null once the chat is wired. */
+    private javax.swing.JEditorPane chatPane;   // renders each turn's markdown as HTML — no scan-log noise
+    private JScrollPane chatScroll;
+    /** Raw chat turns ({speaker, markdown}); the whole HTML doc is re-rendered on each append. */
+    private final java.util.List<String[]> chatTurns = new java.util.ArrayList<>();
     private final JLabel status = new JLabel(" ");
     private final JLabel phase = new JLabel(" ");
     /** Progress bar: fraction of probe phases completed this scan run. Hidden when idle. */
@@ -35,9 +40,18 @@ public final class ScanLog {
     // transient sub-status never advances the step number twice. One entry per distinct ScanPhases label.
     private final java.util.Set<String> countedPhases = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private volatile int lastStep = 0;   // current step number = the active phase's position in ScanPhases
+    /** Override the progress-bar denominator (0 = use ScanPhases.filteredTotal). Set to lifecycle-only count
+     *  in SAST mode so the bar shows X/N where N reflects only the phases that actually run. */
+    private volatile int phaseTotal = 0;
+    public void setPhaseTotal(int n) { this.phaseTotal = n; }
     /** Panel holding the progress bar + (later) the chat row — occupies BorderLayout.SOUTH. */
     private final JPanel southPanel = new JPanel(new BorderLayout());
     private final Consumer<String> mirror;
+    /** Optional live file sink — the Settings "Log to file" toggle and -Daiscanner.logFile both point here. When
+     *  set, every emitted log line AND every chat turn is also written to it, so a session is followable outside
+     *  the GUI. Volatile: toggled live from the EDT, read from scan threads. */
+    private volatile java.io.PrintWriter fileSink;
+    private volatile String fileSinkPath;
     /** Per-scan target tag (e.g. "[localhost:3005] ") prepended to EVERY emitted line so a parallel two-target run is
      *  atomic to review/grep — set once at the start of each per-target scan thread; InheritableThreadLocal so all the
      *  worker threads that scan spawns (crawl, discovery, probes, the shared LLM engine's calling thread) inherit it.
@@ -102,9 +116,12 @@ public final class ScanLog {
             phaseSeen.set(0);
             countedPhases.clear();
             lastStep = 0;
+            phaseTotal = 0;   // reset per-scan override so next scan uses the full ScanPhases count by default
         } else {
             stopWatchdog();
+            currentPhase = "Idle";
         }
+        Runnable pcl = phaseChangeListener; if (pcl != null) SwingUtilities.invokeLater(pcl);
         javax.swing.SwingUtilities.invokeLater(() -> {
             if (stopBtn != null) stopBtn.setEnabled(active);
             if (rescanBtn != null) rescanBtn.setEnabled(!active && lastTarget != null);
@@ -226,6 +243,10 @@ public final class ScanLog {
     // (Phase classification + the -Daiscanner.only= module filter now derive entirely from ScanPhases — the one
     //  registry the Settings panel also reads — so there is no per-phase list to keep in sync here.)
     private volatile String currentPhase = "Idle";
+    private volatile Runnable phaseChangeListener;
+    /** Called on every phase transition; {@link SettingsTab} uses this to keep module-checkbox enabled/disabled state
+     *  in sync with the running scan (a module whose phase has already passed is greyed out — can't be enqueued). */
+    public void setPhaseChangeListener(Runnable r) { this.phaseChangeListener = r; }
     private volatile boolean filterAnnounced = false;   // -Daiscanner.only banner printed once per session
     public String currentPhase() { return currentPhase; }
     /** Best-effort "is it too late?": has the running scan's attack battery already advanced PAST the phase for
@@ -315,7 +336,7 @@ public final class ScanLog {
         searchRow.add(search, BorderLayout.CENTER);
         top.add(searchRow, BorderLayout.SOUTH);
 
-        panel.setBorder(BorderFactory.createTitledBorder("Scan progress / log"));
+        panel.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
         panel.add(top, BorderLayout.NORTH);
         scroll = new JScrollPane(area);
         // A JTextArea's DefaultCaret defaults to UPDATE_WHEN_ON_EDT: on every document insert it moves the caret
@@ -368,6 +389,7 @@ public final class ScanLog {
         });
     }
 
+    /** Returns the split-pane when the chat is enabled, or just the log panel before that. */
     public JComponent component() { return panel; }
 
     /** Jump the log viewport to the tail (re-enter autoscroll). Called when the Agent tab is focused so opening it
@@ -379,6 +401,30 @@ public final class ScanLog {
             if (v != null) v.setValue(v.getMaximum());
         });
     }
+
+    /** Enable/disable the live file sink (Settings "Log to file" toggle, and startup for -Daiscanner.logFile).
+     *  path null/blank closes it. Opens in APPEND mode so toggling on/off across a session keeps the transcript.
+     *  Thread-safe; applied live with no restart. */
+    public synchronized void setLogFile(String path) {
+        String p = (path == null) ? "" : path.trim();
+        if (!p.isEmpty() && p.equals(fileSinkPath) && fileSink != null) return;   // already open on this file
+        if (fileSink != null) {
+            log("file logging stopped (" + fileSinkPath + ")");
+            try { fileSink.close(); } catch (Throwable ignore) { }
+            fileSink = null; fileSinkPath = null;
+        }
+        if (p.isEmpty()) return;
+        try {
+            java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(p, true), true);
+            pw.println(LocalDateTime.now().format(TS) + " [AI Scanner] ==== log file opened ====");
+            fileSink = pw; fileSinkPath = p;
+            log("logging scan log + chat to file: " + p);
+        } catch (Throwable e) {
+            log("cannot open log file " + p + ": " + e);
+        }
+    }
+    /** The active log-file path, or null when file logging is off. */
+    public String logFilePath() { return fileSinkPath; }
 
     /** Always shown — reserve for phases, counts, and vulnerabilities. */
     public void log(String s) {
@@ -402,6 +448,8 @@ public final class ScanLog {
 
     /** Buffer a formatted line and append it to THIS log's visible tab area (search-filtered, tail-following). */
     private void render(String line) {
+        java.io.PrintWriter fs = fileSink;   // mirror EVERY line to the file sink (pre-filter: the file is the full log)
+        if (fs != null) { try { fs.println(line); } catch (Throwable ignore) { } }
         lines.add(line);
         if (lines.size() > MAX_BUFFER_LINES + 512) {           // bulk-trim the buffer (amortized, front removal is O(n))
             synchronized (lines) {
@@ -471,6 +519,32 @@ public final class ScanLog {
     /** Confirmed real vulnerabilities counted this session (used when audit.issues() is unavailable). */
     public int findingCount() { return findings.get(); }
 
+    /** Precise phase status for the Agent system prompt: each phase labelled DONE / → RUNNING / pending.
+     *  Derived from the authoritative ScanPhases registry — the model sees the EXACT list, not a guess. */
+    public String phaseContext() {
+        String cur = currentPhase;
+        boolean active = scanActive;
+        StringBuilder sb = new StringBuilder();
+        boolean seenCurrent = false;
+        for (com.ioactive.aiscanner.scan.ScanPhases.Phase p : com.ioactive.aiscanner.scan.ScanPhases.ALL) {
+            String state;
+            if (!active && lastStep == 0) {
+                state = "pending";
+            } else if (p.label.equalsIgnoreCase(cur) && active) {
+                state = "→ RUNNING";
+                seenCurrent = true;
+            } else if (!seenCurrent && !p.label.equalsIgnoreCase(cur)) {
+                state = "done";
+            } else {
+                state = "pending";
+            }
+            sb.append("  ").append(p.isAttack() ? "[module] " : "[phase]  ")
+              .append(p.label).append(": ").append(state).append('\n');
+        }
+        sb.append("Current: ").append(cur).append(" | Scan active: ").append(active);
+        return sb.toString();
+    }
+
     private final List<String> findingsLog = Collections.synchronizedList(new ArrayList<>());
     /** Every finding line ("＞＞＞ …") seen this run — a machine-readable report for the benchmark harness. */
     public List<String> findingsReport() { synchronized (findingsLog) { return new ArrayList<>(findingsLog); } }
@@ -504,25 +578,317 @@ public final class ScanLog {
         }
     }
 
-    /** Add a chat input row at the bottom; submitted text is handed to {@code onSubmit}. Chat lines are
-     *  written back through {@link #log} by the caller, so they interleave with the scan log. */
-    public void enableChat(java.util.function.Consumer<String> onSubmit) {
+    /** Build and return the Agent (chat) panel — a standalone JPanel to be placed in its own tab.
+     *  Submitted text goes to {@code onSubmit}; turns appear only here, never in the Log panel. */
+    public JPanel buildChatPanel(java.util.function.Consumer<String> onSubmit) {
+        // --- chat pane: renders each turn's markdown as HTML ---
+        chatPane = new javax.swing.JEditorPane();
+        chatPane.setEditable(false);
+        chatPane.setContentType("text/html");
+        chatPane.putClientProperty(javax.swing.JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
+        chatPane.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+        if (chatPane.getCaret() instanceof javax.swing.text.DefaultCaret dc)
+            dc.setUpdatePolicy(javax.swing.text.DefaultCaret.NEVER_UPDATE);
+        // Copy strips the zero-width break opportunities we injected for wrapping, so selecting a wrapped
+        // URL copies it clean (no invisible characters that would corrupt a paste into a terminal/browser).
+        // Covers every copy path (Cmd/Ctrl+C, right-click menu, drag) since they all route through here.
+        chatPane.setTransferHandler(new javax.swing.TransferHandler() {
+            @Override protected java.awt.datatransfer.Transferable createTransferable(javax.swing.JComponent c) {
+                String sel = ((javax.swing.text.JTextComponent) c).getSelectedText();
+                return new java.awt.datatransfer.StringSelection(sel == null ? "" : sel.replace(ZWSP, ""));
+            }
+            @Override public int getSourceActions(javax.swing.JComponent c) { return COPY; }
+        });
+        renderChat();   // seed with the (empty) document skeleton
+        chatScroll = new JScrollPane(chatPane);
+        chatScroll.setBorder(boldTitle("Chat"));
+
+        // --- input row (right panel, bottom) ---
         JTextField chatInput = new JTextField();
-        chatInput.putClientProperty("JTextField.placeholderText", "ask the model about anything in scope…");
+        chatInput.putClientProperty("JTextField.placeholderText", "ask the model or type 'scan <url>'…");
         JButton sendBtn = new JButton("Send");
-        JPanel row = new JPanel(new BorderLayout(4, 0));
-        row.setBorder(BorderFactory.createEmptyBorder(2, 6, 6, 6));
-        row.add(new JLabel("Chat:"), BorderLayout.WEST);
-        row.add(chatInput, BorderLayout.CENTER);
-        row.add(sendBtn, BorderLayout.EAST);
+        JPanel inputRow = new JPanel(new BorderLayout(4, 0));
+        inputRow.setBorder(BorderFactory.createEmptyBorder(2, 6, 6, 6));
+        inputRow.add(chatInput, BorderLayout.CENTER);
+        inputRow.add(sendBtn, BorderLayout.EAST);
+        // Terminal-style input history: submitted messages are remembered; ↑ walks back, ↓ walks forward
+        // (↓ past the newest returns to an empty line). idx[0] == history.size() means "on the fresh line".
+        final java.util.List<String> inHist = new java.util.ArrayList<>();
+        final int[] idx = { 0 };
         Runnable go = () -> {
             String t = chatInput.getText().trim();
-            if (!t.isEmpty()) { chatInput.setText(""); onSubmit.accept(t); }
+            if (!t.isEmpty()) {
+                if (inHist.isEmpty() || !inHist.get(inHist.size() - 1).equals(t)) inHist.add(t);  // skip consecutive dup
+                idx[0] = inHist.size();
+                chatInput.setText("");
+                onSubmit.accept(t);
+            }
         };
         sendBtn.addActionListener(e -> go.run());
         chatInput.addActionListener(e -> go.run());
-        southPanel.add(row, BorderLayout.SOUTH);
-        southPanel.revalidate();
+        chatInput.getInputMap().put(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_UP, 0), "histPrev");
+        chatInput.getInputMap().put(javax.swing.KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_DOWN, 0), "histNext");
+        chatInput.getActionMap().put("histPrev", new javax.swing.AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                if (idx[0] > 0) {
+                    idx[0]--;
+                    chatInput.setText(inHist.get(idx[0]));
+                    chatInput.setCaretPosition(chatInput.getText().length());
+                }
+            }
+        });
+        chatInput.getActionMap().put("histNext", new javax.swing.AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                if (idx[0] < inHist.size()) {
+                    idx[0]++;
+                    chatInput.setText(idx[0] == inHist.size() ? "" : inHist.get(idx[0]));
+                    chatInput.setCaretPosition(chatInput.getText().length());
+                }
+            }
+        });
+
+        JPanel chatPanel = new JPanel(new BorderLayout());
+        chatPanel.add(chatScroll, BorderLayout.CENTER);
+        chatPanel.add(inputRow, BorderLayout.SOUTH);
+        return chatPanel;
+    }
+
+    /** Clear all chat turns and re-render an empty pane. Called by the /clear command. */
+    public void clearChat() {
+        synchronized (chatTurns) { chatTurns.clear(); }
+        javax.swing.SwingUtilities.invokeLater(this::renderChat);
+    }
+
+    /** Append a User or AI turn to the chat panel (right side only — not the scan log). Thread-safe.
+     *  The turn's text is treated as markdown and rendered as HTML. */
+    public void appendChat(String speaker, String text) {
+        // Mirror the turn to stdout (Burp Output / the launcher log) so the conversation is observable from
+        // outside the GUI — the pane itself stays the primary view. Kept out of the scan-log PANE on purpose.
+        System.out.println("[chat " + speaker + "] " + (text == null ? "" : text));
+        if (chatPane == null) { log("[" + speaker + "] " + text); return; }  // fallback before split is built (log→file sink)
+        java.io.PrintWriter fs = fileSink;   // mirror chat to the file sink too, when "Log to file" is on
+        if (fs != null) { try { fs.println(LocalDateTime.now().format(TS) + " [AI Scanner] [chat " + speaker + "] " + (text == null ? "" : text)); } catch (Throwable ignore) { } }
+        synchronized (chatTurns) { chatTurns.add(new String[]{ speaker, text == null ? "" : text }); }
+        javax.swing.SwingUtilities.invokeLater(() -> {
+            renderChat();
+            // auto-scroll chat to bottom
+            javax.swing.JScrollBar vb = chatScroll.getVerticalScrollBar();
+            if (vb != null) vb.setValue(vb.getMaximum());
+        });
+    }
+
+    /** Re-render the whole chat transcript into the HTML pane. Cheap: chat turns are few. EDT-only. */
+    private void renderChat() {
+        StringBuilder b = new StringBuilder();
+        b.append("<html><head><style>")
+         .append("body{font-family:sans-serif;font-size:10px;margin:2px 4px;}")
+         .append(".you{color:#3b78c3;font-weight:bold;}")
+         .append(".ai{color:#177245;font-weight:bold;}")
+         .append(".turn{margin:0 0 10px 0;}")
+         .append("code{font-family:monospace;background:#eef;padding:0 2px;}")
+         .append("pre{font-family:monospace;font-size:8px;background:#f4f4f4;padding:4px;margin:4px 0;}")
+         .append("ul,ol{margin:2px 0 2px 18px;}")
+         .append("</style></head><body>");
+        synchronized (chatTurns) {
+            for (String[] t : chatTurns) {
+                boolean ai = "ai".equals(t[0]);
+                String cls = ai ? "ai" : "you";
+                String marker = ai ? "&bull;" : "&gt;";   // Claude Code CLI style: '>' for you, bullet for the agent
+                b.append("<div class=\"turn\"><span class=\"").append(cls).append("\">")
+                 .append(marker).append("</span> ")
+                 .append(mdToHtml(t[1])).append("</div>");
+            }
+        }
+        b.append("</body></html>");
+        chatPane.setText(b.toString());
+        // Autoscroll: defer to a nested invokeLater so it runs AFTER setText's re-layout — only then does
+        // the vertical scrollbar report the NEW maximum. Pinning to max follows both your messages and the
+        // model's replies to the bottom. (Reading max right after setText would use the stale pre-layout
+        // value and never actually scroll.)
+        final javax.swing.JScrollPane sc = chatScroll;
+        javax.swing.SwingUtilities.invokeLater(() -> {
+            if (sc == null) return;   // seed render runs before chatScroll is assigned
+            javax.swing.JScrollBar vb = sc.getVerticalScrollBar();
+            if (vb != null) vb.setValue(vb.getMaximum());
+        });
+    }
+
+    /** Titled border with a bold title, derived from the current default title font. */
+    private static javax.swing.border.TitledBorder boldTitle(String title) {
+        javax.swing.border.TitledBorder tb = BorderFactory.createTitledBorder(title);
+        java.awt.Font f = tb.getTitleFont();
+        if (f == null) f = javax.swing.UIManager.getFont("TitledBorder.font");
+        if (f == null) f = new Font(Font.SANS_SERIF, Font.PLAIN, 12);
+        tb.setTitleFont(f.deriveFont(Font.BOLD));
+        return tb;
+    }
+
+    private static String escapeHtml(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
+    /** Minimal, self-contained markdown → HTML for chat turns (no external deps). Handles fenced/inline
+     *  code, bold, italic, headings, ordered/unordered lists, links, and paragraph breaks. HTML-escapes
+     *  everything first so raw markup can't inject into the pane. */
+    static String mdToHtml(String md) {
+        if (md == null || md.isEmpty()) return "";
+        try {
+            return mdToHtml0(md);
+        } catch (Throwable t) {
+            // Fail safe: a malformed turn must never break the pane or leak raw markup — fall back to
+            // HTML-escaped plain text with line breaks preserved.
+            return escapeHtml(md).replace("\n", "<br>");
+        }
+    }
+
+    // Sentinel delimiters wrapping an extracted code block's index. Control chars that never occur in LLM
+    // text; scrubbed at the end so one can never reach the pane even if a fence is unbalanced.
+    private static final char BLK_A = '\u0001', BLK_B = '\u0002';
+
+    private static String mdToHtml0(String md) {
+        // Pull fenced code blocks out first so their contents are not further formatted. Substitute a
+        // sentinel, then swap the real <pre> blocks back in as the FINAL step via a global replace — so it
+        // works whether the fence landed on its own line or mid-paragraph. (The previous " BLOCKn "/NUL
+        // sentinel was removed by String.trim() before the restore check, leaking "BLOCK0" into output.)
+        java.util.List<String> blocks = new java.util.ArrayList<>();
+        java.util.regex.Matcher fm = java.util.regex.Pattern
+                .compile("```[a-zA-Z0-9]*\\n?([\\s\\S]*?)```").matcher(md);
+        StringBuffer pre = new StringBuffer();
+        while (fm.find()) {
+            blocks.add("<pre>" + escapeHtml(fm.group(1).strip()) + "</pre>");   // trim surrounding blank lines
+            fm.appendReplacement(pre, java.util.regex.Matcher.quoteReplacement(BLK_A + "" + (blocks.size() - 1) + BLK_B));
+        }
+        fm.appendTail(pre);
+
+        String[] lines = pre.toString().split("\n", -1);
+        StringBuilder out = new StringBuilder();
+        String listType = null;   // "ul" or "ol" while inside a list
+        int li = 0;
+        while (li < lines.length) {
+            String line = lines[li];
+            // --- GitHub-style table: a pipe row immediately followed by a |---|---| separator row ---
+            if (isTableRow(line) && li + 1 < lines.length && isTableSep(lines[li + 1])) {
+                if (listType != null) { out.append("</").append(listType).append('>'); listType = null; }
+                out.append("<table border=\"1\" cellspacing=\"0\" cellpadding=\"3\">");
+                out.append(tableRow(line, true));          // header
+                li += 2;                                    // skip header + separator
+                while (li < lines.length && isTableRow(lines[li])) {
+                    out.append(tableRow(lines[li], false));
+                    li++;
+                }
+                out.append("</table>");
+                continue;
+            }
+            java.util.regex.Matcher h = java.util.regex.Pattern.compile("^(#{1,6})\\s+(.*)$").matcher(line);
+            java.util.regex.Matcher ul = java.util.regex.Pattern.compile("^\\s*[-*]\\s+(.*)$").matcher(line);
+            java.util.regex.Matcher ol = java.util.regex.Pattern.compile("^\\s*\\d+[.)]\\s+(.*)$").matcher(line);
+            if (h.matches()) {
+                if (listType != null) { out.append("</").append(listType).append('>'); listType = null; }
+                int level = Math.min(6, h.group(1).length());
+                out.append("<h").append(level).append('>').append(inline(h.group(2)))
+                   .append("</h").append(level).append('>');
+            } else if (ul.matches()) {
+                if (!"ul".equals(listType)) {
+                    if (listType != null) out.append("</").append(listType).append('>');
+                    out.append("<ul>"); listType = "ul";
+                }
+                out.append("<li>").append(inline(ul.group(1))).append("</li>");
+            } else if (ol.matches()) {
+                if (!"ol".equals(listType)) {
+                    if (listType != null) out.append("</").append(listType).append('>');
+                    out.append("<ol>"); listType = "ol";
+                }
+                out.append("<li>").append(inline(ol.group(1))).append("</li>");
+            } else if (line.trim().isEmpty()) {
+                if (listType != null) { out.append("</").append(listType).append('>'); listType = null; }
+                out.append("<br>");
+            } else {
+                if (listType != null) { out.append("</").append(listType).append('>'); listType = null; }
+                out.append(inline(line)).append("<br>");
+            }
+            li++;
+        }
+        if (listType != null) out.append("</").append(listType).append('>');
+        // Restore fenced blocks; a global replace handles standalone and inline placeholders alike.
+        String html = out.toString();
+        for (int i = 0; i < blocks.size(); i++)
+            html = html.replace(BLK_A + "" + i + BLK_B, blocks.get(i));
+        // Scrub any orphan sentinel (e.g. an unbalanced fence) so a control char never reaches the pane.
+        html = html.replace(String.valueOf(BLK_A), "").replace(String.valueOf(BLK_B), "");
+        return html;
+    }
+
+    /** A markdown table separator row, e.g. {@code |---|:--:|---|} — only pipes/dashes/colons/space, ≥1 dash. */
+    private static boolean isTableSep(String l) {
+        String t = l.trim();
+        return t.indexOf('-') >= 0 && t.matches("\\|?[\\s:|-]+\\|?");
+    }
+
+    /** A table row: contains a pipe, has some non-pipe content, and is not itself a separator row. */
+    private static boolean isTableRow(String l) {
+        String t = l.trim();
+        return t.indexOf('|') >= 0 && !t.replace("|", "").trim().isEmpty() && !isTableSep(l);
+    }
+
+    /** Render one markdown table row as {@code <tr>} of {@code <th>}/{@code <td>} cells (inline-formatted). */
+    private static String tableRow(String l, boolean header) {
+        String t = l.trim();
+        if (t.startsWith("|")) t = t.substring(1);
+        if (t.endsWith("|"))   t = t.substring(0, t.length() - 1);
+        String tag = header ? "th" : "td";
+        StringBuilder r = new StringBuilder("<tr>");
+        for (String c : t.split("\\|", -1))
+            r.append('<').append(tag).append('>').append(inline(c.trim())).append("</").append(tag).append('>');
+        return r.append("</tr>").toString();
+    }
+
+    /** Inline markdown spans: escape HTML, then code / bold / italic / links, then soft-break long tokens. */
+    private static String inline(String s) {
+        s = escapeHtml(s);
+        s = s.replaceAll("`([^`]+)`", "<code>$1</code>");
+        s = s.replaceAll("\\*\\*([^*]+)\\*\\*", "<b>$1</b>");
+        s = s.replaceAll("__([^_]+)__", "<b>$1</b>");
+        s = s.replaceAll("(?<![\\w*])\\*([^*\\s][^*]*?)\\*(?![\\w*])", "<i>$1</i>");
+        s = s.replaceAll("(?<![\\w_])_([^_\\s][^_]*?)_(?![\\w_])", "<i>$1</i>");   // _italic_ (guarded vs some_var)
+        s = s.replaceAll("\\[([^\\]]+)\\]\\((https?://[^)\\s]+)\\)", "<a href=\"$2\">$1</a>");
+        s = softBreakTextNodes(s);
+        return s;
+    }
+
+    /** Zero-width space: inserted as a break OPPORTUNITY inside long unbroken tokens (URLs/hashes) so the
+     *  HTML pane can wrap them — Swing's HTMLEditorKit ignores CSS word-break/overflow-wrap. It is stripped
+     *  back out on copy (see the TransferHandler in enableChat), so selecting a wrapped URL yields it clean. */
+    static final String ZWSP = "​";
+
+    /** Insert ZWSP after break-friendly characters inside long tokens, operating ONLY on text between tags
+     *  (never inside a tag or an href attribute) so generated markup and link targets stay intact. */
+    private static String softBreakTextNodes(String html) {
+        StringBuilder out = new StringBuilder(html.length() + 32);
+        StringBuilder token = new StringBuilder();
+        boolean inTag = false;
+        for (int i = 0; i < html.length(); i++) {
+            char c = html.charAt(i);
+            if (inTag) { out.append(c); if (c == '>') inTag = false; continue; }
+            if (c == '<') { flushToken(token, out); inTag = true; out.append(c); continue; }
+            // Whitespace and '&' (entity start) end the current token without breaking inside it.
+            if (Character.isWhitespace(c) || c == '&') { flushToken(token, out); out.append(c); continue; }
+            token.append(c);
+        }
+        flushToken(token, out);
+        return out.toString();
+    }
+
+    private static void flushToken(StringBuilder token, StringBuilder out) {
+        if (token.length() == 0) return;
+        String t = token.toString();
+        token.setLength(0);
+        if (t.length() < 24) { out.append(t); return; }   // short tokens (normal prose) untouched
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            out.append(c);
+            if (i < t.length() - 1 && "-./_?=@:;,".indexOf(c) >= 0) out.append(ZWSP);
+        }
     }
 
     /** Turns a confirmed finding into a Burp AuditIssue so it shows on the dashboard (site map issues),
@@ -642,6 +1008,7 @@ public final class ScanLog {
         java.util.function.BooleanSupplier sc = stopCheck;
         if (sc != null && sc.getAsBoolean()) throw new ScanStopped();
         currentPhase = (s == null || s.isBlank()) ? "Idle" : s;
+        Runnable pcl = phaseChangeListener; if (pcl != null) SwingUtilities.invokeLater(pcl);
         // Module selector for fast debugging: -Daiscanner.only=rxss,sqli runs ONLY the selected ATTACK phases;
         // lifecycle phases (crawl/auth/discovery/audit) always run. Each attack probe is wrapped in its own
         // try/catch(Throwable), so throwing PhaseSkipped skips just that phase and the battery drains on.
@@ -666,13 +1033,23 @@ public final class ScanLog {
         // panel row for row (no emission-order to sync). Under only= it is the ordinal within just the executed subset
         // (e.g. cswsh → 8/11, not its absolute 40/44). A transient sub-status (cp == null) keeps the step, refreshes text.
         if (cp != null) {
-            lastStep = com.ioactive.aiscanner.scan.ScanPhases.filteredPosition(cp, only);
+            // MONOTONIC: never let the step number REGRESS. A LIFECYCLE phase legitimately re-runs mid-scan — the
+            // authenticated re-crawl, a mid-scan re-auth, a second "AI endpoint discovery" pass — and its early
+            // registry position would otherwise snap the bar backwards (observed: ~25/46 → 2/46 when discovery
+            // re-ran). Clamp to the furthest phase reached so the bar only ever advances. The LABEL below still
+            // shows the current (re-entered) activity; only the numeric progress is pinned forward.
+            // When a lifecycle-only denominator is in force (SAST mode sets phaseTotal=lifecycleCount), count the
+            // numerator among lifecycle phases too, so a post-attack phase can't read past the total (the "44/10").
+            int posInScheme = phaseTotal > 0
+                    ? com.ioactive.aiscanner.scan.ScanPhases.lifecyclePosition(cp)
+                    : com.ioactive.aiscanner.scan.ScanPhases.filteredPosition(cp, only);
+            lastStep = Math.max(lastStep, posInScheme);
             // Track distinct phases entered so the scan-end block can flip the bar to "Complete ✓" (it gates on
-            // phaseSeen>0) and learn the real phase count. The DISPLAYED step is filteredPosition above, not this.
+            // phaseSeen>0) and learn the real phase count. The DISPLAYED step is lastStep above, not this.
             if (countedPhases.add(String.valueOf(com.ioactive.aiscanner.scan.ScanPhases.position(cp)))) phaseSeen.incrementAndGet();
         }
         int done = lastStep;
-        int total = com.ioactive.aiscanner.scan.ScanPhases.filteredTotal(only);
+        int total = phaseTotal > 0 ? phaseTotal : com.ioactive.aiscanner.scan.ScanPhases.filteredTotal(only);
         int pct = total > 0 ? Math.min(100, done * 100 / total) : 0;
         String label = done + "/" + total + " — " + (cp != null ? cp.label : currentPhase);
         if (label.length() > 60) label = label.substring(0, 57) + "…";
@@ -717,8 +1094,16 @@ public final class ScanLog {
         scanned.set(0);
         findings.set(0);
         lines.clear();
+        boolean idle = !scanActive;   // don't wipe a LIVE scan's progress — only reset the advancement UI when idle
+        if (idle) { phaseSeen.set(0); countedPhases.clear(); lastStep = 0; }
         SwingUtilities.invokeLater(() -> {
             area.setText("");
+            if (idle) {   // a stale progress bar after Clear is meaningless → reset + hide it and the phase label
+                probeProgress.setValue(0);
+                probeProgress.setString("Idle");
+                probeProgress.setVisible(false);
+                phase.setText(" ");
+            }
             updateStatus();
         });
     }

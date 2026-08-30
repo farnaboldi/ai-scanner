@@ -38,10 +38,7 @@ import java.util.regex.Pattern;
  * </ol>
  * Fully generic: keyed on JWT structure and universal claim names, not on any one app.
  */
-public final class JwtAnalysisProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class JwtAnalysisProbe extends Probe {
 
     // A compact JWS: three base64url segments. header+payload start with "eyJ" (== '{"' base64url'd).
     private static final Pattern JWT = Pattern.compile("eyJ[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]{5,}\\.[A-Za-z0-9_-]*");
@@ -64,8 +61,7 @@ public final class JwtAnalysisProbe {
     private static final long MAX_LIFETIME_SEC = 24 * 3600;   // >24h without refresh is an excessive access-token TTL
 
     public JwtAnalysisProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** Returns the number of distinct JWT-implementation findings raised. */
@@ -193,8 +189,8 @@ public final class JwtAnalysisProbe {
             HttpRequest base = carrier.request().withMethod("GET");   // idempotent replay only — never re-mutate state
             HttpRequest withForged = base.withRemovedHeader("Authorization").withHeader("Authorization", "Bearer " + forged);
             HttpRequest withNone   = base.withRemovedHeader("Authorization");   // control: no credential at all
-            HttpRequestResponse rForged = api.http().sendRequest(withForged, RequestOptions.requestOptions().withResponseTimeout(12000L));
-            HttpRequestResponse rNone   = api.http().sendRequest(withNone, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse rForged = send(withForged);
+            HttpRequestResponse rNone   = send(withNone);
             int sf = status(rForged), sn = status(rNone);
             // FIRE only if the forged token is ACCEPTED (2xx) AND the no-credential control is DENIED — otherwise
             // the endpoint is simply public and proves nothing about signature checking.
@@ -260,9 +256,7 @@ public final class JwtAnalysisProbe {
     private static int status(HttpRequestResponse rr) {
         try { return rr != null && rr.response() != null ? rr.response().statusCode() : -1; } catch (Throwable t) { return -1; }
     }
-    private static String hostOf(String url) {
-        return Net.authority(url);
-    }
+    // hostOf(String) inherited from Probe.
     private interface Sup { String get() throws Exception; }
     private static String safe(Sup s) { try { return s.get(); } catch (Exception e) { return null; } }
 }

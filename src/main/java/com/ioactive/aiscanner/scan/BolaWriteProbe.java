@@ -31,10 +31,7 @@ import java.util.regex.Pattern;
  *   <li>each victim's original value is RESTORED afterward (non-destructive).</li>
  * </ul></p>
  */
-public final class BolaWriteProbe {
-
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+public final class BolaWriteProbe extends Probe {
 
     // .../{id}/{field}: an id-keyed collection with a mutable SUB-RESOURCE (the field we can write + read back).
     private static final Pattern SUBRES = Pattern.compile("^(https?://[^/]+/.+/)([A-Za-z0-9][A-Za-z0-9._@%-]{0,63})/([A-Za-z][A-Za-z0-9_-]{0,40})$");
@@ -44,8 +41,7 @@ public final class BolaWriteProbe {
     private static final int MAX_ENDPOINTS = 20;
 
     public BolaWriteProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public int probe(String host, SourceFindings hints, String baseUrl, List<HttpRequest> targets, String cookie, String bearer) {
@@ -166,7 +162,7 @@ public final class BolaWriteProbe {
             HttpRequest r = req;
             if (cookie != null && !cookie.isBlank()) r = r.withHeader("Cookie", cookie);
             if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            return api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return send(r);
         } catch (Throwable t) { return null; }
     }
 
@@ -192,5 +188,5 @@ public final class BolaWriteProbe {
         return m.find() ? m.group(1) : null;
     }
 
-    private static String hostOf(String url) { return Net.authority(url); }
+    // hostOf(String) inherited from Probe.
 }

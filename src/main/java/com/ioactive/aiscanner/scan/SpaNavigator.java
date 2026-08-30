@@ -95,9 +95,14 @@ public final class SpaNavigator {
                 HttpRequestResponse rr = execRepair(r.method, url, r.contentType, r.body);
                 if (rr == null || rr.response() == null) continue;
                 int st = rr.response().statusCode();
-                observed.add(summary(r.method, url, r.body, rr));   // feed EVERY response to the model (a 401/500 still guides navigation)
+                // VERIFY before counting/registering: a real 2xx data response — not a 3xx (redirect to /login), not
+                // an error, and NOT the app's login/shell HTML served as a soft-200 for an unknown/guessed path. That
+                // soft-200 is exactly how an LLM-hallucinated endpoint "succeeds"; without this check the model's
+                // guesses pollute the audit surface and we over-report "reached".
+                boolean data = isReachedData(rr);
+                observed.add(summary(r.method, url, r.body, rr, data));   // feed EVERY response (a 401/login page still guides navigation)
                 anyNew = true;
-                if (st < 400) {                                     // but only a USABLE response joins the audit surface (no 401/5xx noise)
+                if (data) {                                        // only a VERIFIED data endpoint joins the audit surface
                     try { api.siteMap().add(rr); } catch (Throwable ignore) {}
                     reachedRrs.add(rr);
                     reached++;
@@ -105,7 +110,7 @@ public final class SpaNavigator {
                 }
                 scanLog.debug("  SPA-nav " + up(r.method) + " " + url.replaceAll("^https?://[^/]+", "")
                         + (r.body != null && !r.body.isEmpty() ? " body=" + clip(r.body, 160) : "")
-                        + " -> HTTP " + rr.response().statusCode());
+                        + " -> HTTP " + st + (data ? "" : " (not a data endpoint — not registered)"));
             }
             if (!anyNew) break;
         }
@@ -459,16 +464,43 @@ public final class SpaNavigator {
     /** Response summary for the model's next round: a SUCCESS gets a wide body window (the record/menu/interface
      *  structure it must navigate into); an error gets a short window (the message that says what to fix). Plus the
      *  exact request body sent (so the model reuses the shape that WORKED and avoids the ones that 500'd). */
-    private String summary(String method, String url, String body, HttpRequestResponse rr) {
+    private String summary(String method, String url, String body, HttpRequestResponse rr, boolean data) {
         int st = rr.response().statusCode();
         String rb = rr.response().bodyToString(); if (rb == null) rb = "";
         LinkedHashSet<String> ids = new LinkedHashSet<>();
         Matcher m = GUID.matcher(rb); while (m.find() && ids.size() < 14) ids.add(m.group());
-        int win = st < 400 ? 700 : 200;
+        int win = data ? 700 : 200;
         String snip = (rb.length() > win ? rb.substring(0, win) : rb).replaceAll("\\s+", " ");
+        // Tell the model the TRUTH: a 200 that is actually the login/shell HTML is NOT a data endpoint, so it stops
+        // treating a soft-200 as success and navigates elsewhere instead of mining hallucinated paths.
+        String verdict = data ? " OK"
+                : looksHtmlDoc(rb) ? " NOT-DATA(login/shell HTML — this path is not a real endpoint; do NOT reuse it)"
+                : (st >= 200 && st < 300 ? " (empty/non-data)" : "");
         return up(method) + " " + url.replaceAll("^https?://[^/]+", "")
              + (body != null && !body.isEmpty() ? " body=" + clip(body, 220) : "")
-             + " -> " + st + (st < 400 ? " OK" : "") + " ids=" + ids + " | " + snip;
+             + " -> " + st + verdict + " ids=" + ids + " | " + snip;
+    }
+
+    /** A VERIFIED authenticated data endpoint: a real 2xx response carrying actual data — NOT a 3xx (redirect to
+     *  /login), NOT a 4xx/5xx, and NOT the app's login/shell HTML served as a soft-200 for an unknown/guessed path
+     *  (how an LLM-hallucinated endpoint "succeeds"). Generic: a JS-driven app's data ops return JSON/XML/data, so a
+     *  full HTML document here is the login/shell/error page, not a record. */
+    private boolean isReachedData(HttpRequestResponse rr) {
+        try {
+            int st = rr.response().statusCode();
+            if (st < 200 || st >= 300) return false;                 // 2xx only — a 3xx redirect isn't reaching data
+            String body = rr.response().bodyToString();
+            if (body == null || body.trim().length() < 2) return false;   // empty → nothing to audit
+            if (looksHtmlDoc(body)) return false;                    // full HTML doc = login/shell/soft-404, not data
+            return true;
+        } catch (Throwable t) { return false; }
+    }
+
+    /** A full HTML DOCUMENT (login page / SPA shell / soft-404) — as opposed to JSON/XML data. Deliberately does
+     *  NOT match {@code <?xml} so legitimate XML/OData data responses still count as data. Generic; no app strings. */
+    private static boolean looksHtmlDoc(String body) {
+        String h = (body.length() > 300 ? body.substring(0, 300) : body).trim().toLowerCase();
+        return h.startsWith("<!doctype") || h.startsWith("<html") || h.startsWith("<head") || h.startsWith("<!--");
     }
 
     private boolean isDestructive(Req r) {

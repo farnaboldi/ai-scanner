@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 699;
+    public static final int BUILD = 702;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -76,24 +76,18 @@ public class AiScannerExtension implements BurpExtension {
     @Override
     public void initialize(MontoyaApi api) {
         this.api = api;
+        // CLI scan-mode override is applied AFTER loadSettings() (below) so it wins over the persisted value.
         // Route ALL LLM traffic through Burp's own HTTP engine (visible in Logger, honors the user's network
         // config, avoids the java.net.http h2c body-drop). This is the only transport — BApp-compliant.
         this.http = new MontoyaLlmHttp(api);
-        String logFileProp = System.getProperty("aiscanner.logFile");
-        java.util.function.Consumer<String> logMirror;
-        if (logFileProp != null && !logFileProp.isBlank()) {
-            try {
-                java.io.PrintWriter fw = new java.io.PrintWriter(new java.io.FileWriter(logFileProp, false), true);
-                logMirror = s -> { api.logging().logToOutput(s); fw.println(s); };
-            } catch (Exception e) {
-                api.logging().logToOutput("[AI Scanner] cannot open log file " + logFileProp + ": " + e);
-                logMirror = s -> api.logging().logToOutput(s);
-            }
-        } else {
-            logMirror = s -> api.logging().logToOutput(s);
-        }
+        // Burp Output is the always-on sink. File logging (both -Daiscanner.logFile and the Settings "Log to
+        // file" toggle) is handled uniformly by ScanLog.setLogFile — one live-toggleable code path, and it
+        // captures the chat too (which the old logMirror-wrapping FileWriter did not).
+        java.util.function.Consumer<String> logMirror = s -> api.logging().logToOutput(s);
         this.logMirror = logMirror;   // field ref so launchParallel() can build per-target mirrors
         this.scanLog = new ScanLog(logMirror);
+        String logFileProp = System.getProperty("aiscanner.logFile");
+        if (logFileProp != null && !logFileProp.isBlank()) scanLog.setLogFile(logFileProp);   // CLI flag → same path
         // Surface the AI Scanner's OWN findings (probes + flow-engine + auth) as Burp AuditIssues so they
         // appear on the dashboard / site-map issues, not only in our log. Scope-gated to hosts we scan.
         scanLog.setIssueSink(this::raiseAiIssue);
@@ -111,6 +105,14 @@ public class AiScannerExtension implements BurpExtension {
         if (cli != null && !cli.isBlank()) LogLevel.set(LogLevel.parse(cli));
         else if (logLevelSetting != null)  LogLevel.set(logLevelSetting);
         scanLog.log("log level: " + LogLevel.current());
+        // CLI scan-mode override: wins over any persisted value (loadSettings already ran).
+        // Applied here so the SettingsTab that's built next reads the correct mode from scanConfig.
+        String scanModeInit = launchArg("aiscanner.scanMode", "AISCANNER_SCAN_MODE");
+        if (scanModeInit != null && !scanModeInit.isBlank()) {
+            try { scanConfig.scanMode = com.ioactive.aiscanner.scan.ScanConfig.ScanMode.valueOf(scanModeInit.trim().toUpperCase());
+                  scanLog.log("scan mode override from CLI: " + scanConfig.scanMode); }
+            catch (Exception ignore) { scanLog.log("[warn] unknown AISCANNER_SCAN_MODE='" + scanModeInit + "'"); }
+        }
 
         api.extension().setName(EXT_NAME);
         // Scanner-wide session self-preservation: neutralize any phase's state-changing request to OUR OWN account
@@ -152,14 +154,12 @@ public class AiScannerExtension implements BurpExtension {
                 this::repoForHost, this::setRepoForHost);
         api.userInterface().registerContextMenuItemsProvider(menuProvider);
         scanLog.setRescanHandler(url -> menuProvider.startScan(url));
-        // Suite tab: nav bar (Log / Settings) switching a CardLayout. No Dashboard tab — Burp's own
-        // Dashboard already shows the scan task/issues; ours was redundant.
-        // HEADLESS GUARD: registering a Swing Suite tab throws HeadlessException with no display. In an
-        // unattended/container run (autoscan via -Daiscanner.*), skip the whole UI — the scan needs no GUI.
         if (java.awt.GraphicsEnvironment.isHeadless()) {
             api.logging().logToOutput("[" + EXT_NAME + "] headless — Suite tab/UI skipped (scan runs via -Daiscanner.autoscan; config via -Daiscanner.* flags).");
         } else {
         SettingsTab settingsTab = new SettingsTab(this);
+        menuProvider.setSettingsTab(settingsTab);   // wire after creation so CLI scan-mode overrides sync the UI
+        settingsTab.hookPhaseChanges(scanLog);   // keep module checkboxes enabled/disabled in sync with scan phase
 
         // Chat with the local model, grounded in scope + the scan log. Replies interleave with the log.
         com.ioactive.aiscanner.ui.ChatAssistant chat =
@@ -182,74 +182,52 @@ public class AiScannerExtension implements BurpExtension {
                 String warn = scanLog.attackPhasePassed(key)
                         ? " — WARNING: its phase may already have run this scan (queued anyway; it'll apply next scan)"
                         : " — it'll run when the attack battery reaches that phase";
-                scanLog.log(known ? "[ai] queued '" + key + "' into the running scan's attack modules" + warn
-                                  : "[ai] unknown module '" + key + "' — not queued");
+                scanLog.appendChat("ai", known ? "queued '" + key + "' into the running scan's attack modules" + warn
+                                           : "unknown module '" + key + "' — not queued");
                 return;
             }
             // No scan running → fresh re-scan scoped to this ONE module (warm site map), race-free single-flight.
             if (!onDemandModuleRunning.compareAndSet(false, true)) {
-                scanLog.log("[ai] on-demand module run ignored — one is already starting.");
+                scanLog.appendChat("ai", "on-demand module run ignored — one is already starting.");
                 return;
             }
             String prev = System.getProperty("aiscanner.only");
             System.setProperty("aiscanner.only", key);
-            scanLog.log("[ai] on-demand module '" + key + "' on " + host + " (only=" + key + ", warm site map)");
+            scanLog.appendChat("ai", "on-demand module '" + key + "' on " + host + " (only=" + key + ", warm site map)");
             try { menuProvider.startScanAndWait(host.matches("(?i)^https?://.*") ? host : "http://" + host + "/"); }
-            catch (Throwable t) { scanLog.log("[ai] on-demand module run error: " + t); }
+            catch (Throwable t) { scanLog.appendChat("ai", "on-demand module run error: " + t); }
             finally {
                 if (prev == null) System.clearProperty("aiscanner.only"); else System.setProperty("aiscanner.only", prev);
                 onDemandModuleRunning.set(false);
             }
         });
-        scanLog.enableChat(msg -> {
-            scanLog.log("[you] " + msg);
-            new Thread(() -> scanLog.log("[ai] " + chat.reply(msg)), "ais-chat").start();
+        // Build the chat (Agent) panel — standalone, no longer a split of the log.
+        javax.swing.JPanel agentPanel = scanLog.buildChatPanel(msg -> {
+            scanLog.appendChat("you", msg);
+            new Thread(() -> { String r = chat.reply(msg); if (r != null) scanLog.appendChat("ai", r); }, "ais-chat").start();
         });
 
-        CardLayout cards = new CardLayout();
-        JPanel content = new JPanel(cards);
-        content.add(scanLog.component(), "log");
-        content.add(settingsTab.component(), "settings");
+        // Three-tab structure: Settings | Log | Agent
+        javax.swing.JTabbedPane tabs = new javax.swing.JTabbedPane();
+        tabs.addTab("Settings", settingsTab.component());
+        tabs.addTab("Log",     scanLog.component());
+        tabs.addTab("Agent",   agentPanel);
 
-        JPanel nav = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
-        // toggle buttons in a group → the active view stays visibly "pressed"
-        javax.swing.JToggleButton bLog = new javax.swing.JToggleButton("Agent");
-        javax.swing.JToggleButton bSet = new javax.swing.JToggleButton("Settings");
-        javax.swing.ButtonGroup group = new javax.swing.ButtonGroup();
-        group.add(bLog); group.add(bSet);
-        bLog.addActionListener(e -> cards.show(content, "log"));
-        bSet.addActionListener(e -> { cards.show(content, "settings"); settingsTab.focusBaseUrl(); });
-        nav.add(bSet);   // Settings first
-        nav.add(bLog);   // Agent second
-
-        JPanel tab = new JPanel(new BorderLayout());
-        tab.add(nav, BorderLayout.NORTH);
-        tab.add(content, BorderLayout.CENTER);
-        // Default view: if the LLM is already configured, open on Log (you just want to watch it run);
-        // otherwise open on Settings so you configure it first.
+        // Default: if LLM configured open on Log; else Settings.
         AiEngine cfgEngine = getEngine();
         boolean llmSet = cfgEngine != null && cfgEngine.isConfigured();
-        if (llmSet) {
-            bLog.setSelected(true);
-            cards.show(content, "log");
-        } else {
-            bSet.setSelected(true);
-            cards.show(content, "settings");
-            settingsTab.focusBaseUrl();
-        }
-        // When you open the AI Scanner suite tab WHILE a scan is running, snap to the Agent (log) view so you
-        // see live progress — even if the tab last defaulted to Settings.
-        Runnable focusAgentIfScanning = () -> {
-            if (tab.isShowing() && scanLog.isScanActive()) {
-                bLog.setSelected(true);
-                cards.show(content, "log");
-                scanLog.scrollToBottom();   // land at the live tail (re-enter autoscroll) when opening mid-scan
+        tabs.setSelectedIndex(llmSet ? 1 : 0);
+        if (!llmSet) settingsTab.focusBaseUrl();
+
+        // Snap to Log when a scan is running and the user opens the suite tab.
+        tabs.addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & java.awt.event.HierarchyEvent.SHOWING_CHANGED) != 0
+                    && tabs.isShowing() && scanLog.isScanActive()) {
+                tabs.setSelectedIndex(1);
+                scanLog.scrollToBottom();
             }
-        };
-        tab.addHierarchyListener(e -> {
-            if ((e.getChangeFlags() & java.awt.event.HierarchyEvent.SHOWING_CHANGED) != 0) focusAgentIfScanning.run();
         });
-        api.userInterface().registerSuiteTab(EXT_NAME, tab);
+        api.userInterface().registerSuiteTab(EXT_NAME, tabs);
         }  // end headless guard
 
         // BApp requirement (clean unloading): stop our background work when the user unloads the extension.
@@ -330,6 +308,7 @@ public class AiScannerExtension implements BurpExtension {
                     // authenticated too) BEFORE the scan starts, so the login flow is a no-op and the deep surface opens.
                     if (seedCookie != null && !seedCookie.isBlank()) {
                         session.set(seedCookie);
+                        session.setAdopted(true);   // operator-provided session → suppress auto-registration
                         session.setLandingUrl(seedLanding != null && !seedLanding.isBlank() ? seedLanding : url);
                         seedCookieJar(seedCookie, url);
                         scanLog.log("pre-seeded authenticated session from launch cookie — login skipped (names: "
@@ -504,8 +483,12 @@ public class AiScannerExtension implements BurpExtension {
             // Neutral preamble: the specific METHOD (active proof, offline crack, static decode, differential…) is
             // stated in the per-finding Evidence detail below, so we don't over-claim an active "proof payload"
             // for passive/analysis findings (e.g. a JWT claim decode). The attached request/response is the proof.
+            // If the probe already supplied HTML (contains a tag), embed it directly; otherwise escape plain text.
+            // This lets probes use <p>/<br>/<b> for structured evidence while plain-text probes stay safe.
+            String detailEncoded = (detail == null || detail.isBlank()) ? ""
+                    : detail.contains("<") ? detail : escapeHtml(detail).replace("\n", "<br>");
             String detailHtml = "<p>The AI Scanner reported <b>" + escapeHtml(cls) + "</b> at this location.</p>"
-                    + (detail == null || detail.isBlank() ? "" : "<p><b>Evidence:</b> " + escapeHtml(detail) + "</p>")
+                    + (detailEncoded.isBlank() ? "" : "<p><b>Evidence:</b> " + detailEncoded + "</p>")
                     + (ev.isEmpty() ? "<p><i>No single request/response is attached — this finding is derived from "
                             + "observed traffic/artifacts; see the Evidence above.</i></p>"
                             : "<p>See the attached request/response for the observed artifact.</p>");
@@ -617,7 +600,9 @@ public class AiScannerExtension implements BurpExtension {
     }
 
     private static EngineConfig.Provider parseProvider(String s) {
-        try { return EngineConfig.Provider.valueOf(s); } catch (Exception e) { return EngineConfig.Provider.LOCAL_LLM; }
+        // Fall back to the App-Store default (Burp AI) on an unknown/corrupt value. Legacy back-compat — a saved
+        // config predating the provider selector — is preserved by the caller passing "LOCAL_LLM" explicitly (loadSettings).
+        try { return EngineConfig.Provider.valueOf(s); } catch (Exception e) { return EngineConfig.Provider.BURP_AI; }
     }
 
     public void persist() {
@@ -629,7 +614,9 @@ public class AiScannerExtension implements BurpExtension {
          .put("disableThinking", c.disableThinking).put("timeoutSeconds", c.timeoutSeconds)
          .put("logLevel", LogLevel.current().name());
         o.put("rounds", scanConfig.rounds).put("payloadsPerRound", scanConfig.payloadsPerRound)
-         .put("delayMs", scanConfig.delayMs);
+         .put("delayMs", scanConfig.delayMs).put("requestTimeoutMs", scanConfig.requestTimeoutMs)
+         .put("logToFile", scanConfig.logToFile).put("logFilePath", scanConfig.logFilePath)
+         .put("scanMode", scanConfig.scanMode.name());
         if (!hostRepoMap.isEmpty()) o.put("hostRepoMap", new JSONObject(hostRepoMap));
         api.persistence().extensionData().setString(PREF_KEY, o.toString());
     }
@@ -666,6 +653,10 @@ public class AiScannerExtension implements BurpExtension {
             scanConfig.rounds = o.optInt("rounds", scanConfig.rounds);
             scanConfig.payloadsPerRound = o.optInt("payloadsPerRound", scanConfig.payloadsPerRound);
             scanConfig.delayMs = o.optInt("delayMs", scanConfig.delayMs);
+            scanConfig.requestTimeoutMs = o.optInt("requestTimeoutMs", scanConfig.requestTimeoutMs);
+            scanConfig.logToFile = o.optBoolean("logToFile", scanConfig.logToFile);
+            scanConfig.logFilePath = o.optString("logFilePath", scanConfig.logFilePath);
+            try { scanConfig.scanMode = com.ioactive.aiscanner.scan.ScanConfig.ScanMode.valueOf(o.optString("scanMode", "DAST_SAST")); } catch (Exception ignore) {}
             JSONObject rm = o.optJSONObject("hostRepoMap");
             if (rm != null) for (String k : rm.keySet()) {
                 String v = rm.optString(k, "");

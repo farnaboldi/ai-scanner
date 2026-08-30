@@ -28,17 +28,15 @@ import java.util.regex.Pattern;
  * marker tag reflects VERBATIM (unencoded) into an HTML response AND lands in an EXECUTABLE context (not still
  * inside a comment/script) — then re-confirm. Only then is it a real, browser-executable reflected XSS (CWE-79).
  */
-public final class ReflectedXssProbe {
+public final class ReflectedXssProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private static final AtomicInteger SEQ = new AtomicInteger();
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
     public ReflectedXssProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public boolean probe(HttpRequest req) {
@@ -51,7 +49,10 @@ public final class ReflectedXssProbe {
             boolean any = false;
             for (ParsedHttpParameter p : req.parameters()) {
                 if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;
-                if (fire(req, v -> req.withUpdatedParameters(HttpParameter.parameter(p.name(), v, p.type())),
+                // Percent-encode the payload for the wire (angle brackets, quotes, spaces): Montoya sends URL/form
+                // values raw, so a strict server (Tomcat/Java) 400s "<svg …>" before the app reflects it. The server
+                // URL-decodes on receipt, so the sink still reflects the decoded tag and the oracle matches.
+                if (fire(req, v -> req.withUpdatedParameters(HttpParameter.parameter(p.name(), Net.encQuery(v), p.type())),
                         p.name() + " (" + p.type() + ")")) any = true;
             }
             return any;
@@ -170,6 +171,15 @@ public final class ReflectedXssProbe {
      *  api.http().sendRequest, a stale JSESSIONID in the jar (e.g. an unauthenticated one the native crawler set)
      *  can OVERRIDE our explicit authenticated Cookie header — the server then sees the unauth session and 302s to
      *  login. Aligning the jar first makes the authenticated cookie win. No-op if the request carries no Cookie. */
+    /** True iff {@code u} is a well-formed http(s) URL we can safely build a request from (valid host + numeric
+     *  port). Catches its own MalformedURLException, so a canary-poisoned Location (invalid authority/port) is a
+     *  clean skip rather than an uncaught throw out of httpRequestFromUrl → new URL(). Generic. */
+    private static boolean followableHttpUrl(String u) {
+        if (u == null || !(u.startsWith("http://") || u.startsWith("https://"))) return false;
+        try { java.net.URL x = new java.net.URL(u); return x.getHost() != null && !x.getHost().isBlank(); }
+        catch (Exception e) { return false; }
+    }
+
     private void syncJar(HttpRequest req) {
         try {
             String cookie = req.headerValue("Cookie");
@@ -184,11 +194,12 @@ public final class ReflectedXssProbe {
         } catch (Throwable ignore) { }
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
+    protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): syncs the open-redirect jar first
+        politeness();   // ScanConfig politeness delay
         try {
             syncJar(req);
             HttpRequestResponse rr = AiScanner.decompress(
-                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
             // Authenticated POSTs can bounce through an interstitial (Zero Bank redirects to /auth/accept-certs.html
             // when the session needs re-priming) — a 302 whose empty body has no reflection. Walk the interstitial
             // carrying our session cookie, then RE-SEND the original request once so its params actually reach the
@@ -210,17 +221,23 @@ public final class ReflectedXssProbe {
                 if (loc != null && !loc.isBlank()) {
                     try {
                         String abs = URI.create(req.url()).resolve(loc).toString().replaceFirst("^https://", "http://");
+                        // Only follow a WELL-FORMED http(s) Location. Our own reflected canary can poison it into an
+                        // INVALID authority — an open redirect that echoes the value builds e.g.
+                        // "http://localhost:3300axr46z" (port = "3300axr46z"), and httpRequestFromUrl → new URL() then
+                        // throws MalformedURLException. Skip such a Location instead of letting it kill the probe.
+                        if (followableHttpUrl(abs)) {
                         HttpRequest walk = HttpRequest.httpRequestFromUrl(abs).withMethod("GET");
                         String cookie = req.headerValue("Cookie");
                         if (cookie != null) walk = walk.withHeader("Cookie", cookie);
-                        HttpRequestResponse wr = api.http().sendRequest(walk, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                        HttpRequestResponse wr = api.http().sendRequest(walk, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
                         if (dbg && wr != null && wr.response() != null)
                             scanLog.debug("  rxss walk GET " + abs + " → HTTP " + wr.response().statusCode()
                                     + (wr.response().statusCode() >= 300 && wr.response().statusCode() < 400 ? " Location: " + wr.response().headerValue("Location") : ""));
+                        }
                     } catch (Exception ignore) { }
                     syncJar(req);   // the interstitial walk-GET may have re-polluted the jar — realign before re-send
                     rr = AiScanner.decompress(
-                            api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                            api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
                     if (dbg && rr != null && rr.response() != null)
                         scanLog.debug("  rxss re-POST → HTTP " + rr.response().statusCode());
                 }

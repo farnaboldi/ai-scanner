@@ -42,10 +42,9 @@ import java.util.regex.Pattern;
  * paths); every seed of every class is sent to every endpoint, so the endpoint whose handler is vulnerable fires
  * its own oracle regardless of the URL name. Uses only {@code burp.api.montoya.websocket} (no external deps).</p>
  */
-public final class WsFuzzProbe {
+public final class WsFuzzProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private static final Pattern WS_URL = Pattern.compile("wss?://[^\\s\"'<>()\\\\{}]+", Pattern.CASE_INSENSITIVE);
     private static final int MAX_ENDPOINTS = 12;     // bound sockets opened
     private static final long RECV_TIMEOUT_MS = 2500;// wait for a reply to one frame
@@ -56,8 +55,7 @@ public final class WsFuzzProbe {
     private volatile CountDownLatch rxLatch;
 
     public WsFuzzProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     /** Discover WS endpoints (mined from JS/HTML) and fuzz each with the shared oracle seed set. Returns hit count. */
@@ -77,7 +75,7 @@ public final class WsFuzzProbe {
     /** WS URLs referenced by the app's own crawled JS/HTML ({@code new WebSocket("ws://…")}) on the target host. */
     private Set<String> discoverWsUrls(String base) {
         Set<String> out = new LinkedHashSet<>();
-        String baseHost = hostOf(base);
+        String baseHost = bareHost(base);
         try {
             for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
                 if (rr == null || rr.response() == null) continue;
@@ -87,7 +85,7 @@ public final class WsFuzzProbe {
                 Matcher m = WS_URL.matcher(body);
                 while (m.find()) {
                     String wsUrl = trimTrailing(m.group());
-                    String wsHost = hostOf(wsUrl.replaceFirst("(?i)^wss?://", "http://"));
+                    String wsHost = bareHost(wsUrl.replaceFirst("(?i)^wss?://", "http://"));
                     if (wsHost == null) continue;
                     // stay on the target host (a WS legitimately runs on a different PORT than the HTTP surface)
                     if (baseHost != null && !wsHost.equalsIgnoreCase(baseHost)) continue;
@@ -211,7 +209,7 @@ public final class WsFuzzProbe {
         } catch (Throwable t) { return null; }
     }
 
-    private static String hostOf(String url) {
+    private static String bareHost(String url) {
         try { return url == null ? null : java.net.URI.create(url).getHost(); } catch (Throwable t) { return null; }
     }
     private static String trimTrailing(String u) {

@@ -9,5 +9,5 @@ ProOnly: True
 Author: Fernando Arnaboldi
 ShortDescription: "AI Scanner automatically tests websites from a blackbox perspective assisted by an LLM. It will try to cover as much surface as possible: crawling, authenticating, registering, following links, analyzing JavaScript, identyfing API specs, etc. The purpose is to drive the native Burp active scans to those endpoints/parameters to deterministacally assess a webapp."
 EntryPoint: target/ai-scanner-0.1.0.jar
-BuildCommand: mvn -B -DskipTests package
+BuildCommand: mvn -B -DskipTests clean package
 SupportedProducts: Pro

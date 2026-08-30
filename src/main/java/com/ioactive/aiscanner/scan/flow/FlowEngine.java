@@ -29,7 +29,7 @@ import java.util.regex.Pattern;
 public final class FlowEngine {
 
     private static final int MAX_SEEDS = 12;
-    private static final int MAX_STEPS_PER_SEED = 4;
+    private static final int MAX_STEPS_PER_SEED = 6;
     private static final int MAX_PLATEAU = 2;   // consecutive no-progress / dead / dup / off-host steps
 
     private final AiEngine engine;
@@ -54,6 +54,10 @@ public final class FlowEngine {
     /** Feed compact SAST leads (endpoints/params/classes) so the planner targets them first. Blank = no-op. */
     public void setSourceHintText(String s) { this.sourceHintText = s == null ? "" : s.trim(); }
 
+    // Bearer token dynamically acquired mid-chain (e.g. login step returns a JWT → used for subsequent steps).
+    // Volatile so it's visible across method calls; reset per-run so chains don't bleed across seeds.
+    private volatile String chainBearer = null;
+
     /** Run the bounded loop over each seed. Returns the number of oracle-confirmed findings. */
     public int run(String host, List<HttpRequest> seeds) {
         if (engine == null || !engine.isConfigured() || seeds == null || seeds.isEmpty()) return 0;
@@ -63,15 +67,33 @@ public final class FlowEngine {
                 + "response returned; try a neighbour id (IDOR); if a role/privilege field appears, resend the body "
                 + "with it elevated (mass-assignment); submit the exact answer a lesson/assignment asks. Canaries to "
                 + "embed when probing — XSS: " + VulnClasses.XSS_CANARY + ", SSTI: " + VulnClasses.SSTI_INPUT
-                + " (=> " + VulnClasses.SSTI_RESULT + ")."
+                + " (=> " + VulnClasses.SSTI_RESULT + "). "
+                // SSRF→credential→reauth chain: if a response body field contains base64-encoded JSON with a
+                // password (e.g. image_base64 = base64({"password":"..."})), decode it, then POST /token (or
+                // equivalent login endpoint) with those credentials to obtain a new JWT, then retry any endpoint
+                // that was returning 403. Use the new JWT in the Authorization header of subsequent requests.
+                // CREDENTIAL EXTRACTION (highest priority): If the observation contains the section
+                // '[Auto-decoded base64 fields]' with a password/secret/credential field, your IMMEDIATE next
+                // step MUST be to authenticate: find the login/token endpoint (POST /token, POST /login, etc.)
+                // and submit those credentials. Do NOT do IDOR or any other step first.
+                + "CRITICAL RULE: If the observation includes '[Auto-decoded base64 fields]' showing a "
+                + "password, secret, or credential value, your VERY NEXT step must be to authenticate using "
+                + "those credentials (POST /token or equivalent login endpoint with the discovered username "
+                + "and password). After obtaining an access_token, use it as Bearer for endpoints that "
+                + "returned 403 earlier (privilege escalation via credential chain). "
+                // URL-typed field injection: if SAST leads mention a url-typed field for an endpoint,
+                // include it in PUT/POST JSON bodies pointing to internal credential/reset endpoints.
+                + "If SAST leads mention a url-typed field (image_url, url, link, redirect) for any endpoint, "
+                + "add that field to the JSON body of PUT/POST requests to the same path, pointing to internal "
+                + "password-reset or credential-vending endpoints (paths containing 'reset', 'password', "
+                + "'credential', 'secret') to retrieve credentials via SSRF."
                 + (sourceHintText.isBlank() ? ""
                         : " SOURCE-CODE LEADS from static analysis (prioritize reaching these endpoints/params; "
                           + "they must still be confirmed dynamically): " + sourceHintText);
 
         Set<String> visited = new LinkedHashSet<>();   // anti-loop across all seeds
         int findings = 0, seedCount = 0;
-        // Wall-clock budget for the WHOLE flow phase: bounds MAX_SEEDS×MAX_STEPS live sends (each up to the sender's
-        // 12s response timeout) + planner calls so one slow target can't stretch the phase to tens of minutes.
+        chainBearer = null;   // reset per run
         long deadlineMs = System.currentTimeMillis() + Long.getLong("aiscanner.flowBudgetMs", 240_000L);
 
         for (HttpRequest seed : seeds) {
@@ -81,7 +103,7 @@ public final class FlowEngine {
                 break;
             }
 
-            StepResult obs0 = safeSend(sessionizer.apply(seed));   // OBSERVE step-0: un-mutated, authenticated
+            StepResult obs0 = safeSend(applySession(seed));   // OBSERVE step-0: un-mutated, authenticated
             if (obs0 == null || !obs0.live()) continue;
             String baselineBody = obs0.body() == null ? "" : obs0.body();
             HttpRequestResponse cursor = obs0.rr();
@@ -95,19 +117,19 @@ public final class FlowEngine {
 
                 String rawJson = engine.planNextRequest(goal, observation, feedback);   // PLAN
                 PlannedRequest p = PlannedRequest.parse(rawJson);
-                if (p == null) break;                                     // no valid plan → end this seed
+                if (p == null) break;
 
-                if (!visited.add(p.signature())) {                        // ANTI-LOOP
+                if (!visited.add(p.signature())) {
                     feedback = "already tried " + p.method() + " " + p.url() + "; pick a different endpoint/param";
                     if (++plateau >= MAX_PLATEAU) break; else continue;
                 }
-                if (!sameHost(p.url(), host)) {                           // never leave scope
+                if (!sameHost(p.url(), host)) {
                     feedback = "off-host url rejected: " + p.url();
                     if (++plateau >= MAX_PLATEAU) break; else continue;
                 }
 
-                StepResult act = safeSend(sessionizer.apply(p.toHttpRequest()));   // ACT (live-probed)
-                if (act == null || !act.live()) {                        // hallucinated / 404 / 5xx → never verify
+                StepResult act = safeSend(applySession(p.toHttpRequest()));   // ACT
+                if (act == null || !act.live()) {
                     feedback = "planned " + p.method() + " " + p.url() + " not real (HTTP "
                             + (act == null ? 0 : act.status()) + ") — do not reuse it";
                     if (++plateau >= MAX_PLATEAU) break; else continue;
@@ -115,22 +137,51 @@ public final class FlowEngine {
                 scanLog.debug("  flow step " + step + ": " + p.method() + " " + p.url()
                         + (p.intent().isBlank() ? "" : " (" + p.intent() + ")") + " -> HTTP " + act.status());
 
-                if (act.ok2xx() && act.rr() != null && act.rr().response() != null) reached.add(act.rr());  // COVERAGE
+                if (act.ok2xx() && act.rr() != null && act.rr().response() != null) reached.add(act.rr());
 
-                if (verify(p, baselineBody, act, carriedId)) {           // VERIFY: deterministic oracle only
+                // Mid-chain credential upgrade: if a step returns a new access_token (e.g. POST /token with
+                // escalated credentials), capture it so subsequent steps in this chain use the new session.
+                String freshToken = extractAccessToken(act.body());
+                if (freshToken != null && !freshToken.equals(chainBearer)) {
+                    chainBearer = freshToken;
+                    scanLog.debug("  flow: mid-chain bearer updated (step " + step + ")");
+                }
+
+                if (verify(p, baselineBody, act, carriedId)) {
                     findings++;
                     break;
                 }
 
-                boolean progressed = act.body() != null && !act.body().equals(baselineBody);   // FEEDBACK
+                boolean progressed = act.body() != null && !act.body().equals(baselineBody);
                 feedback = "sent " + p.method() + " " + p.url() + " -> HTTP " + act.status()
                         + (progressed ? " (new state)" : " (no change)");
                 plateau = progressed ? 0 : plateau + 1;
                 if (plateau >= MAX_PLATEAU) break;
-                cursor = act.rr();                                        // chain: next OBSERVE is this response
+                cursor = act.rr();
             }
         }
+        chainBearer = null;   // clean up
         return findings;
+    }
+
+    /** Apply session — uses a mid-chain bearer when one was obtained, else falls back to the initial sessionizer. */
+    private HttpRequest applySession(HttpRequest req) {
+        if (chainBearer != null) {
+            // Apply the upgraded bearer; keep any cookies from the initial sessionizer.
+            HttpRequest withInitialCookies = sessionizer.apply(req);
+            return withInitialCookies.withHeader("Authorization", "Bearer " + chainBearer);
+        }
+        return sessionizer.apply(req);
+    }
+
+    /** Extract a freshly-issued auth token from a JSON response body — the common OAuth2/JWT field names, so a
+     *  login/refresh step's new session is picked up regardless of which of the standard keys the app uses. */
+    private static final Pattern ACCESS_TOKEN = Pattern.compile(
+            "\"(?:access_?token|auth_?token|id_?token|token|jwt|bearer)\"\\s*:\\s*\"([A-Za-z0-9_\\-\\.]{20,512})\"");
+    private static String extractAccessToken(String body) {
+        if (body == null || body.isEmpty()) return null;
+        Matcher m = ACCESS_TOKEN.matcher(body);
+        return m.find() ? m.group(1) : null;
     }
 
     /** 2xx requests the LLM reached that the crawl/mining didn't — for the caller to bridge into site map + targets. */

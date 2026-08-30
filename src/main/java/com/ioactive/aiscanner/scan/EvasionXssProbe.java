@@ -21,17 +21,15 @@ import java.util.regex.Pattern;
  * only if the tag reflects UNENCODED into an HTML-context response. Zero-FP: unique canary + raw-tag +
  * HTML-content-type + re-confirmation.
  */
-public final class EvasionXssProbe {
+public final class EvasionXssProbe extends Probe {
 
-    private final MontoyaApi api;
-    private final ScanLog scanLog;
+    // api + scanLog inherited from Probe
     private static final AtomicInteger SEQ = new AtomicInteger();
     private static final Pattern SKIP = Pattern.compile(
             "(?i).*/(socket\\.io|engine\\.io)(\\b.*)?$|.*\\.(css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|mp4|webp|pdf)(\\?.*)?$");
 
     public EvasionXssProbe(MontoyaApi api, ScanLog scanLog) {
-        this.api = api;
-        this.scanLog = scanLog;
+        super(api, scanLog);
     }
 
     public boolean probe(HttpRequest req) {
@@ -82,8 +80,5 @@ public final class EvasionXssProbe {
         return html && body != null && body.contains(tag);
     }
 
-    private HttpRequestResponse send(HttpRequest req) {
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
-        catch (Throwable t) { return null; }
-    }
+    // send(HttpRequest) inherited from Probe (politeness + configured request timeout).
 }
