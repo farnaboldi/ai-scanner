@@ -2797,6 +2797,13 @@ public final class EndpointDiscovery {
     // A base fragment an SPA appends an auth verb to at runtime (this.host = ".../rest/user"; post(host+"/login")).
     private static final Pattern AUTH_BASE = Pattern.compile("(?i).*/(users?|accounts?|auth|identity|session|customers?|members?)$");
     private static final Pattern AUTH_LEAF = Pattern.compile("(?i).*/(login|signin|sign-in|logon|authenticate|authentication|session|sessions|token|tokens|authorization|authorizations)$");
+    // Analytics/tracking namespaces whose paths contain auth-like words (before_register, deregister,
+    // track/*, engage/*, groups/*, record/*, flags/*) but are NOT authentication endpoints. Including them
+    // as "candidate login requests" wastes probe budget and floods the log with junk.
+    private static final Pattern ANALYTICS_NAMESPACE = Pattern.compile(
+            "(?i)^/?(track|engage|groups|record|flags|embed|applewebkit|chrome|mage|debug)(/|$)|"
+            + "(?i)/(before_register|before_unregister|deregister|footer_company_licenses_registrations)($|\\?)");
+
     // ASP.NET Web API RESTful-controller convention adds authorizations/sessions/tokens (AuthorizationsController → /api/authorizations).
     private static final String[] AUTH_VERBS = {"login", "signin", "authenticate", "session", "token", "authorizations", "sessions", "tokens"};
     // A service-base literal an SPA prepends to endpoint leaves at runtime: a single path segment ending
@@ -2845,6 +2852,9 @@ public final class EndpointDiscovery {
                 HttpRequest req = rr.request();
                 if (req == null || !"POST".equalsIgnoreCase(req.method())) continue;
                 if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
+                // Skip Cloudflare infrastructure paths — they are never real auth endpoints.
+                String rp = req.url();
+                if (rp.contains("/cdn-cgi/") || rp.contains("challenge-platform")) continue;
                 String body = req.bodyToString();
                 boolean cred = (body != null && PWLIKE.matcher(body).find());
                 if (!cred) { try { for (var pp : req.parameters()) if (PWLIKE.matcher(pp.name()).find()) { cred = true; break; } } catch (Throwable ignore) {} }
@@ -2871,6 +2881,7 @@ public final class EndpointDiscovery {
                 String p;
                 try { p = URI.create(rr.request().url()).getPath(); } catch (Exception e) { continue; }
                 if (p == null || !p.contains("/api/")) continue;
+                if (p.contains("/cdn-cgi/") || p.contains("challenge-platform")) continue;
                 p = p.replaceAll("/+$", "");
                 int slash = p.lastIndexOf('/');
                 if (slash <= 0) continue;
@@ -2948,11 +2959,14 @@ public final class EndpointDiscovery {
 
     private void addAuthCandidate(List<HttpRequest> out, Set<String> seen, HttpRequest req, String host) {
         if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) return;
-        // A change-password / profile form (password + confirm) looks like a register form but is NOT an auth
-        // endpoint — it needs an existing session, so registering/logging-in against it just wastes the whole
-        // battery (DVNA /app/useredit was hammered as a login/register candidate). Skip clearly post-auth paths
-        // unless the path ALSO carries an auth verb. Generic path heuristic, no app-specific names.
         String path; try { path = java.net.URI.create(req.url()).getPath(); } catch (Exception e) { path = req.url(); }
+        // Filter Cloudflare challenge infrastructure and known analytics/tracking namespaces — these paths
+        // contain words like "register", "before_register", "token" from analytics SDKs (Segment, Amplitude)
+        // but are never authentication endpoints. Including them floods the auth log with junk.
+        if (path != null && (path.contains("/cdn-cgi/") || path.contains("challenge-platform")
+                || ANALYTICS_NAMESPACE.matcher(path).find())) return;
+        // A change-password / profile form (password + confirm) looks like a register form but is NOT an auth
+        // endpoint — it needs an existing session. Skip clearly post-auth paths unless they carry an auth verb.
         if (path != null && POST_AUTH_PATH.matcher(path).matches() && !AUTH_VERB_PATH.matcher(path).matches()) return;
         String ct = req.hasHeader("Content-Type") ? req.headerValue("Content-Type") : "";
         String kind = ct != null && ct.toLowerCase().contains("json") ? "json" : "form";

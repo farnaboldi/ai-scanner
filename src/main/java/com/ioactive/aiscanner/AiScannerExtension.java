@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 703;
+    public static final int BUILD = 704;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
