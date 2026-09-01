@@ -23,6 +23,7 @@ import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.scan.sast.PostmanParser;
 import com.ioactive.aiscanner.scan.sast.RepoFetcher;
 import com.ioactive.aiscanner.scan.sast.RouteHarvester;
+import com.ioactive.aiscanner.scan.sast.WpAjaxHarvester;
 import com.ioactive.aiscanner.scan.sast.SourceAnalyzer;
 import com.ioactive.aiscanner.scan.sast.SourceFindings;
 import com.ioactive.aiscanner.ui.ScanLog;
@@ -316,7 +317,7 @@ public final class AiScanner {
         String repoPath = repoResolver != null ? repoResolver.apply(host) : null;
         // Always surface the repo-association status on the Log page so it's obvious whether this run is
         // SAST-assisted or plain black-box (-Daiscanner.sastMode=agentic follows the child-process boundary).
-        String sastMode = System.getProperty("aiscanner.sastMode", "coarse").toLowerCase();
+        String sastMode = System.getProperty("aiscanner.sastMode", "iterative").toLowerCase();
         boolean agentic    = "agentic".equals(sastMode);
         boolean iterative  = "iterative".equals(sastMode);
         if (repoPath != null && !repoPath.isBlank()) {
@@ -340,6 +341,13 @@ public final class AiScanner {
                     if (!postman.isEmpty()) {
                         scanLog.log("SAST(postman): " + postman.size() + " route(s) from Postman collection(s) in source.");
                         harvested = SourceFindings.combine(harvested, postman);
+                    }
+                    // DETERMINISTIC WordPress AJAX route harvest — runs in EVERY SAST mode (like RouteHarvester),
+                    // not tied to one LLM analyzer. Extracts add_action('wp_ajax_*', handler) → route + param + sink.
+                    SourceFindings wpajax = WpAjaxHarvester.harvest(localRepo, scanLog);
+                    if (!wpajax.isEmpty()) {
+                        scanLog.log("SAST(wp-ajax): " + wpajax.size() + " WordPress AJAX route(s) harvested from source.");
+                        harvested = SourceFindings.combine(harvested, wpajax);
                     }
                     // Optional LLM pass (taint-aware sinks) layered on top when an engine is configured.
                     SourceFindings llm = SourceFindings.empty();

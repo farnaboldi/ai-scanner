@@ -23,7 +23,18 @@ final class SastFiles {
             "(?i)\\.(java|kt|js|mjs|cjs|ts|tsx|jsx|py|rb|php|go|cs|jsp|scala|clj|rs|c|h|cc|cpp|cxx|hpp|m|mm|swift)$");
     private static final Pattern SKIP_DIR = Pattern.compile(
             "(?i)(^|/)(\\.git|node_modules|dist|build|target|out|vendor|\\.venv|venv|__pycache__|"
-            + "\\.idea|\\.gradle|coverage|bower_components|migrations|\\.next|\\.nuxt)(/|$)");
+            + "\\.idea|\\.gradle|coverage|bower_components|migrations|\\.next|\\.nuxt|"
+            // Test/fixture/example/codefix dirs: they saturate the bounded snippet budget with NON-production
+            // code (their req.query/$_GET reads are test inputs, not handlers), starving the real routes/ dir.
+            // `codefixes` catches Juice Shop's data/static/codefixes/ dup route tables. Whole-segment anchored so
+            // `latest/` etc. are unaffected.
+            + "__tests__|__mocks__|tests?|specs?|e2e|cypress|fixtures?|mocks?|codefixes|testdata|examples?|samples?)(/|$)");
+    // Test/spec/mock/fixture FILES (not just dirs) — e.g. foo.test.ts, foo.spec.js, redirect.unit.test.ts,
+    // foo_test.go, test_views.py. Matched on the file NAME only.
+    private static final Pattern SKIP_FILE = Pattern.compile(
+            "(?i)(\\.(test|spec|e2e|mock|fixture)\\.[a-z0-9]+$"
+          + "|_test\\.[a-z0-9]+$"
+          + "|(^|[._-])(test|tests|spec|specs|mock|mocks|fixture|fixtures|stub|stubs)([._-]|$))");
     private static final Pattern ROUTEY_PATH = Pattern.compile(
             "(?i)(controller|route|handler|\\bapi\\b|view|rest|endpoint|servlet|\\burls?\\b|\\broutes?\\b|"
             + "index\\.php|main\\.|/app\\.|/server|vuln|\\bschema\\b|\\bmodel\\b|\\bserializ)");
@@ -36,6 +47,7 @@ final class SastFiles {
             walk.filter(Files::isRegularFile)
                 .filter(p -> !SKIP_DIR.matcher(root.relativize(p).toString().replace('\\', '/')).find())
                 .filter(p -> INTERESTING_EXT.matcher(p.getFileName().toString()).find())
+                .filter(p -> !SKIP_FILE.matcher(p.getFileName().toString()).find())
                 .limit(MAX_FILES)
                 .forEach(cands::add);
         } catch (Exception ignore) { }

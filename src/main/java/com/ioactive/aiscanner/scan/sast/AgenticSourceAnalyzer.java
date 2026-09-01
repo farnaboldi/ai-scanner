@@ -148,14 +148,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
                 scanLog.log("SAST(agentic+coarse): " + hints.size() + " merged hint(s).");
             } catch (Throwable t) { scanLog.debug("SAST: coarse merge failed: " + t); }
         }
-        // Merge deterministic WP AJAX hints — same pass used by coarse, LLM-independent.
-        List<StaticHint> wpHints = CoarseSourceAnalyzer.wpAjaxHints(root, scanLog);
-        if (!wpHints.isEmpty()) {
-            java.util.Set<String> seen = new java.util.HashSet<>();
-            for (StaticHint h : hints) seen.add(hintKey(h));
-            for (StaticHint h : wpHints) if (seen.add(hintKey(h))) hints.add(h);
-            scanLog.debug("SAST(agentic, wp-ajax): merged " + wpHints.size() + " deterministic WP AJAX hint(s).");
-        }
+        // (Deterministic WP AJAX harvesting moved to WpAjaxHarvester, run mode-independently by AiScanner.)
         return new SourceFindings(hints);
     }
 
