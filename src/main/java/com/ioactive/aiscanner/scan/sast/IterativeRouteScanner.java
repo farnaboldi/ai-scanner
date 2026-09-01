@@ -3,7 +3,6 @@ package com.ioactive.aiscanner.scan.sast;
 import com.ioactive.aiscanner.engine.AiEngine;
 import com.ioactive.aiscanner.ui.ScanLog;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -11,7 +10,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
  * SAST mode focused on EXHAUSTIVE route discovery rather than vulnerability-sink steering.
@@ -22,23 +20,6 @@ import java.util.regex.Pattern;
  * Select via {@code -Daiscanner.sastMode=iterative} or Settings → SAST mode → iterative.</p>
  */
 public final class IterativeRouteScanner implements SourceAnalyzer {
-
-    private static final int MAX_CONTEXT   = 40_000;
-    private static final int MAX_SNIPS     = 300;
-    private static final int MAX_FILE_BYTES = 200_000;
-
-    // Same ROUTE pattern as CoarseSourceAnalyzer so file prioritisation is consistent.
-    private static final Pattern ROUTE = Pattern.compile(
-            "(?i)(@(get|post|put|delete|patch|request)mapping|@app\\.route|@rest?controller|"
-          + "app\\.(get|post|put|delete|patch)\\s*\\(|router\\.(get|post|put|delete|patch|use)\\s*\\(|"
-          + "route::(get|post|put|delete|any|match)|resources\\s+:|urlpatterns|@(getmapping|postmapping)|"
-          + "http\\.handlefunc|http\\.handle\\s*\\(|mux\\.handle|"
-          + "case\\s+\"/|\\$_(get|post|request|cookie|files|server)\\b|php://input|"
-          + "add_action\\s*\\(\\s*['\"]wp_ajax|"
-          + "@api_view|\\bpath\\s*\\(|\\bre_path\\s*\\(|router\\.register|@(app|blueprint)\\.route|"
-          + "request\\.(get|post|args|form|values|json|data|params|query)\\b|getparameter\\s*\\(|"
-          + "\\breq\\.(query|params|body|headers|cookies)\\b|"
-          + "^\\s*['\"]/(\\w[\\w./{}:@-]*)[\\'\"\\s,])");
 
     private final AiEngine engine;
     private final ScanLog  scanLog;
@@ -60,21 +41,17 @@ public final class IterativeRouteScanner implements SourceAnalyzer {
         }
         if (!Files.isDirectory(root)) return SourceFindings.empty();
 
-        List<String> snips = new ArrayList<>();
-        int[] chars = {0}, files = {0};
-        for (Path p : SastFiles.candidates(root)) {
-            if (snips.size() >= MAX_SNIPS || chars[0] >= MAX_CONTEXT) break;
-            collect(root, p, snips, chars, files);
-        }
-        if (snips.isEmpty()) {
-            scanLog.debug("SAST(iterative): no route signals found under " + root);
+        java.util.List<Path> cands = SastFiles.candidates(root);
+        SastRouteTable.Result rt = SastRouteTable.build(root, cands);
+        if (rt.isEmpty()) {
+            scanLog.debug("SAST(iterative): no routes/handlers found under " + root);
             return SourceFindings.empty();
         }
 
         String skills  = SkillLibrary.promptExcerpt(root, 3500);
-        String codeCtx = String.join("\n", snips);
-        scanLog.log("SAST(iterative): " + files[0] + " file(s), " + snips.size()
-                + " signal(s) — starting 3-round route scan…");
+        String codeCtx = rt.context;   // AUTHORITATIVE ROUTE TABLE + adaptive handler context
+        scanLog.log("SAST(iterative): " + cands.size() + " file(s), " + rt.routes + " route(s) + "
+                + rt.handlerUnits + " handler " + rt.handlerType + " — starting 3-round route scan…");
 
         // Round 1 — enumerate: exhaustive, recall > precision
         List<StaticHint> r1 = call(SkillLibrary.augment(ENUMERATE_SYS, skills),
@@ -100,29 +77,35 @@ public final class IterativeRouteScanner implements SourceAnalyzer {
 
     private static final String ENUMERATE_SYS =
             "You are mapping every navigable HTTP route in a web application's source code.\n"
-          + "GOAL: EXHAUSTIVE coverage — recall beats precision. List every path the app can serve, "
-          + "even without an obvious vulnerability. A missing route is worse than a speculative one.\n"
+          + "You are given an AUTHORITATIVE ROUTE TABLE (the app's REAL HTTP method+path registrations) followed by "
+          + "HANDLER CODE. GOAL: EXHAUSTIVE coverage — recall beats precision. Emit EVERY entry from the ROUTE TABLE.\n"
+          + "RULE: copy each \"path\" VERBATIM from the ROUTE TABLE — NEVER invent or reconstruct a path from a "
+          + "filename/handler name. Only emit paths that appear in the ROUTE TABLE.\n"
           + "Output ONLY a JSON array (no prose, no markdown). Each element:\n"
-          + "  method        HTTP method (GET/POST/PUT/PATCH/DELETE) or \"\"\n"
-          + "  path          route path template e.g. /api/users/{id}; use {param} for path variables\n"
+          + "  method        HTTP method from the ROUTE TABLE (GET/POST/PUT/PATCH/DELETE)\n"
+          + "  path          route path, copied VERBATIM from the ROUTE TABLE (path variables kept as written)\n"
           + "  params        array of parameter names (query, body, path) — can be []\n"
           + "  paramName     primary parameter for testing, or \"\"\n"
           + "  vulnClass     \"\" — leave blank, this round is route discovery only\n"
           + "  sinkType      \"\"\n"
-          + "  sinkLocation  file:line of the route declaration, or \"\"\n"
+          + "  sinkLocation  file:line of the route declaration/handler, or \"\"\n"
           + "  confidence    0.0..1.0\n"
-          + "Include explicit routes, middleware-mounted routes, resource helpers, REST patterns, "
-          + "admin panels, health/metrics/debug endpoints, file upload/download paths, WebSocket upgrades. "
-          + "Do NOT skip a route because you see no vulnerability — completeness is the goal.";
+          + "Completeness is the goal — list every route in the table, even without an obvious vulnerability.";
 
     private static final String ENRICH_SYS =
-            "You are enriching a list of discovered HTTP routes with missing details.\n"
-          + "For routes with empty params arrays, unclear methods, or missing path variables:\n"
-          + "  - Fill params[] with all query params, body fields, and path variables visible in source\n"
-          + "  - Correct the HTTP method if wrong\n"
-          + "  - Set sinkLocation to file:line of the route declaration\n"
-          + "  - Set vulnClass/sinkType ONLY when a clear dangerous sink is visible (else leave \"\")\n"
-          + "Also add any routes visible in the source NOT already in the list.\n"
+            "You are enriching a list of discovered HTTP routes with missing details, using the AUTHORITATIVE ROUTE "
+          + "TABLE + HANDLER CODE you are given.\n"
+          + "For each route:\n"
+          + "  - Fill params[] with all query params, body fields, and path variables the route's handler reads\n"
+          + "  - Set paramName to the primary tainted parameter KEY (the key read in code: req.query['id'] / "
+          + "req.body.accountno / request.args.get('q') / a handler arg like `string keyword` → id / accountno / q / "
+          + "keyword) — NEVER the accessor word ('query','body','params','args')\n"
+          + "  - Set sinkLocation to file:line of the sink or handler\n"
+          + "  - Set vulnClass/sinkType ONLY when a clear dangerous sink is visible in the handler (else leave \"\")\n"
+          + "Bind params by matching each route to the HANDLER CODE that serves it (by handler name, controller, or "
+          + "file). Do NOT copy a param onto a route whose handler does not read it (no guessing by resemblance).\n"
+          + "Keep every \"path\" EXACTLY as it appears in the ROUTE TABLE — never rewrite a path. You may add routes "
+          + "from the ROUTE TABLE not yet in the list, but never invent paths outside it.\n"
           + "Output ONLY the COMPLETE updated list as a JSON array — all routes, not just changes.";
 
     private static final String CRITIQUE_SYS =
@@ -158,30 +141,6 @@ public final class IterativeRouteScanner implements SourceAnalyzer {
              + "Routes found so far (" + routes.size() + " total):\n" + hintsJson(routes) + "\n\n"
              + "Source code:\n" + codeCtx
              + "\n\nWhat routes are MISSING from the list? Return only the new ones (or [] if complete).";
-    }
-
-    // ── Snippet collector (mirrors CoarseSourceAnalyzer.collect) ─────────────
-
-    private void collect(Path root, Path p, List<String> snips, int[] chars, int[] files) {
-        if (snips.size() >= MAX_SNIPS || chars[0] >= MAX_CONTEXT) return;
-        try {
-            if (!p.toRealPath().startsWith(root)) return;
-            if (Files.size(p) > MAX_FILE_BYTES) return;
-            String rel  = root.relativize(p).toString().replace('\\', '/');
-            String text = new String(Files.readAllBytes(p), StandardCharsets.UTF_8);
-            if (text.indexOf('\0') >= 0) return;   // binary
-            String[] lines = text.split("\n", -1);
-            files[0]++;
-            for (int i = 0; i < lines.length; i++) {
-                if (snips.size() >= MAX_SNIPS || chars[0] >= MAX_CONTEXT) return;
-                String line = lines[i];
-                if (line.length() > 300) line = line.substring(0, 300);
-                if (!ROUTE.matcher(line).find()) continue;
-                String snip = "ROUTE " + rel + ":" + (i + 1) + "  " + line.trim();
-                snips.add(snip);
-                chars[0] += snip.length() + 1;
-            }
-        } catch (Exception ignore) { }
     }
 
     // ── Utilities ─────────────────────────────────────────────────────────────

@@ -423,8 +423,8 @@ run_pro(){   # $1=url $2=repfile $3=ext(true/false) $4=repo(optional SAST source
   say "    log → $celllog"
   # Effective scan mode: SAST_ONLY=1 → SAST; else preserve AISCANNER_SCAN_MODE from the outer env (default DAST_SAST).
   local _SM; [ "${SAST_ONLY:-0}" = 1 ] && _SM=SAST || _SM="${AISCANNER_SCAN_MODE:-DAST_SAST}"
-  # When scan mode is SAST, the analyzer is always iterative (SAST_MODE is redundant — force it).
-  local SRC="$repo" SMODE; [ "$_SM" = SAST ] && SMODE=iterative || SMODE="${SAST_MODE:-agentic}"
+  # When scan mode is SAST, the analyzer defaults to iterative but SAST_MODE can override (e.g. coarse) for A/B.
+  local SRC="$repo" SMODE; [ "$_SM" = SAST ] && SMODE="${SAST_MODE:-iterative}" || SMODE="${SAST_MODE:-agentic}"
   local dl="${PRO_AUDIT_MIN:-40}"; [ "$_SM" = SAST ] && dl=12
   if [ "$ext" = true ]; then
     # AISCANNER_LOG_FILE makes the EXTENSION own the cell log (its live file sink) → the same path the Settings
