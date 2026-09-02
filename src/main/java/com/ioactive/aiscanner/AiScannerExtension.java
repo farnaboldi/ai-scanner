@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 703;
+    public static final int BUILD = 704;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -206,6 +206,26 @@ public class AiScannerExtension implements BurpExtension {
             scanLog.appendChat("you", msg);
             new Thread(() -> { String r = chat.reply(msg); if (r != null) scanLog.appendChat("ai", r); }, "ais-chat").start();
         });
+
+        // Passive proxy-narration watcher: every 60 s, if there is new in-scope proxy traffic and the
+        // LLM is available, produce a consultant-style narration of what the user just browsed and push
+        // it into the Agent chat. Respects the same cursor (narratedUpTo) as the on-demand "narrate"
+        // command so the two never double-narrate the same requests.
+        final com.ioactive.aiscanner.ui.ChatAssistant chatRef = chat;
+        Thread narratorThread = new Thread(() -> {
+            while (!unloaded) {
+                try { Thread.sleep(60_000); } catch (InterruptedException ie) { break; }
+                if (unloaded) break;
+                try {
+                    String narration = chatRef.narrateProxy(true);
+                    if (narration != null && !narration.isBlank()) {
+                        scanLog.appendChat("ai", "🔍 " + narration);   // 🔍 prefix to distinguish passive notes
+                    }
+                } catch (Throwable ignore) { }
+            }
+        }, "ais-proxy-narrator");
+        narratorThread.setDaemon(true);
+        narratorThread.start();
 
         // Three-tab structure: Settings | Log | Agent
         javax.swing.JTabbedPane tabs = new javax.swing.JTabbedPane();
