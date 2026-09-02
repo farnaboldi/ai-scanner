@@ -57,11 +57,15 @@ public final class WafObserver implements HttpHandler {
             "x-iinfo", "x-datadome", "x-waf", "x-waf-event", "x-waf-action", "x-sq-server"
     };
     // A WAF/CDN identity in the Server header value.
-    static final Pattern WAF_SERVER = Pattern.compile(
+    private static final Pattern WAF_SERVER = Pattern.compile(
             "(?i)(cloudflare|akamaighost|akamai|incapsula|imperva|sucuri|barracuda|fortiweb|"
           + "big-?ip|f5\\b|mod_?security|datadome|wallarm|reblaze|distil|awswaf)");
-    // A WAF block-page in the body (shared with Evasion.detectWaf for coverage in the headless unit test).
-    static final Pattern WAF_BODY = Pattern.compile(
+    // A WAF block-page in the body. Must carry a WAF/firewall-SPECIFIC phrase or a vendor name — NOT a generic
+    // security word. Earlier the pattern also matched bare "malicious"/"security reasons"/"access denied"/
+    // "reference id", which false-positived on (a) an app that echoes Burp's OWN audit payloads (a reflected
+    // <script>alert('malicious')</script> counted as a WAF block!) and (b) normal app copy (an order "reference
+    // number"). So a WAF-less target reported phantom WAF blocks. Now: firewall/CRS/WAF-vendor identity only.
+    private static final Pattern WAF_BODY = Pattern.compile(
             "(?i)(web application firewall|mod_?security|core rule set|"
           + "request (was |has been )?blocked by|blocked by (our )?(security|firewall|waf|policy)|"
           + "this request (has been|was) (blocked|denied)|attention required!?|ray id|"
@@ -97,21 +101,12 @@ public final class WafObserver implements HttpHandler {
                         default: break;
                     }
                     statusHits.incrementAndGet();
-                    String rawPath = pathOnly(req.url());
-                    String sample = req.method() + " " + rawPath;
-                    boolean cfInfra = rawPath.contains("/cdn-cgi/") || rawPath.contains("challenge-platform");
+                    String sample = req.method() + " " + pathOnly(req.url());
                     String sig = wafSignal(responseReceived);
                     if (sig != null) {                                   // real WAF, not the app
                         wafHits.incrementAndGet();
-                        // Exclude Cloudflare's own challenge-platform infra from the sample list —
-                        // it's not the app surface; logging it obscures which real paths the WAF blocked.
-                        if (!cfInfra && wafSamples.size() < 40) wafSamples.add(sample);
-                        if (fingerprint.isEmpty()) {
-                            fingerprint = sig;
-                            // First detection — log it once so it's visible without reading all debug lines.
-                            scanLog.log("WAF detected: " + sig + " — WAF-evasion mode auto-enabled for remaining probes.");
-                        }
-                        Evasion.autoEnable(sig);   // flip evasion mode on-the-fly for subsequent probes
+                        if (wafSamples.size() < 40) wafSamples.add(sample);
+                        if (fingerprint.isEmpty()) fingerprint = sig;
                     } else if (appSamples.size() < 20) {                 // app-origin block status
                         appSamples.add(sample);
                     }

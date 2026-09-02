@@ -50,33 +50,12 @@ public final class FileServePathProbe extends Probe {
                         if (r == null || r.response() == null) continue;
                         int st = r.response().statusCode();
                         int len = r.response().body().length();
+                        // served (200) and not a trivial/error/index page
                         if (st == 200 && len > 40 && !looksLikeHtmlIndex(r.response().bodyToString())) {
                             scanLog.found("Sensitive file exposure (extension/null-byte bypass)", base + suf, "served " + len + "b", r);
                             scanLog.incFinding();
                             hits++;
-                            break;
-                        }
-                        if (Evasion.enabled() && (st == 403 || st == 406 || st == 429)) {
-                            String path = pathOf(base + suf);
-                            for (String variant : Evasion.pathVariants(path)) {
-                                try {
-                                    String varUrl = base.substring(0, base.length() - pathOf(base).length()) + variant;
-                                    HttpRequest rv = HttpRequest.httpRequestFromUrl(varUrl).withMethod("GET");
-                                    if (cookieHeader != null && !cookieHeader.isBlank()) rv = rv.withHeader("Cookie", cookieHeader);
-                                    if (bearer != null && !bearer.isBlank()) rv = rv.withHeader("Authorization", "Bearer " + bearer);
-                                    HttpRequestResponse rv2 = send(rv);
-                                    if (rv2 == null || rv2.response() == null) continue;
-                                    int sv = rv2.response().statusCode();
-                                    int lv = rv2.response().body().length();
-                                    if (sv == 200) scanLog.debug("[WAF-evasion] file-serve bypass: " + path + " → " + variant + " HTTP " + sv + " len=" + lv);
-                                    if (sv == 200 && lv > 40 && !looksLikeHtmlIndex(rv2.response().bodyToString())) {
-                                        scanLog.found("Sensitive file exposure (WAF-evasion path variant)", varUrl, "served " + lv + "b via path variant [slipped " + st + " on " + path + "]", rv2);
-                                        scanLog.incFinding();
-                                        hits++;
-                                        break;
-                                    }
-                                } catch (Throwable ignore) { }
-                            }
+                            break;   // one working bypass per file is enough
                         }
                     } catch (Throwable ignore) { }
                 }

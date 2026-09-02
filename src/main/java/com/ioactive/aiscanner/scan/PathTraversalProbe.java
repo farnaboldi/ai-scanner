@@ -75,23 +75,6 @@ public final class PathTraversalProbe extends Probe {
                         scanLog.incFinding();
                         return true;
                     }
-                    if (Evasion.enabled() && mr != null && mr.response() != null) {
-                        int st = mr.response().statusCode();
-                        if (st == 403 || st == 406 || st == 429) {
-                            for (String variant : Evasion.pathVariants(payload)) {
-                                HttpRequest mv = req.withUpdatedParameters(HttpParameter.parameter(p.name(), variant, p.type()));
-                                scanLog.debug("[WAF-evasion] path-traversal retry: param=" + p.name() + " variant=" + variant);
-                                HttpRequestResponse mrv = send(mv);
-                                if (leaks(mrv)) {
-                                    scanLog.found("Path traversal / File inclusion (LFI, WAF-evasion path variant)", req.url(),
-                                            p.name() + " (" + p.type() + ") → " + variant + " [slipped WAF at original " + payload + "]"
-                                            + prov(req.url(), p.name()), mrv);
-                                    scanLog.incFinding();
-                                    return true;
-                                }
-                            }
-                        }
-                    }
                 }
             }
         } catch (Throwable t) {
