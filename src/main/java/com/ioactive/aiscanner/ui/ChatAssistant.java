@@ -2,6 +2,7 @@ package com.ioactive.aiscanner.ui;
 
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.proxy.ProxyHttpRequestResponse;
 import com.ioactive.aiscanner.engine.AiEngine;
 import com.ioactive.aiscanner.scan.ScanScope;
 
@@ -10,6 +11,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 /**
@@ -25,6 +27,10 @@ public final class ChatAssistant {
     private final ScanScope scope;
     private final ScanLog scanLog;
     private final List<String> history = new ArrayList<>();
+
+    // High-water mark: the index in api.proxy().history() up to which we've already narrated.
+    // Lets the passive watcher and on-demand narration share a cursor so they don't re-narrate.
+    final AtomicInteger narratedUpTo = new AtomicInteger(0);
 
     /** Wired by the extension to menuProvider.startScan() — null means scan launch is unavailable. */
     private volatile java.util.function.Consumer<String> scanHandler;
@@ -102,6 +108,12 @@ public final class ChatAssistant {
      *  WHICH parameters to fuzz; code marks those params' value offsets as insertion points. */
     private static final java.util.regex.Pattern INTRUDER_CMD = java.util.regex.Pattern.compile(
             "(?i)^\\s*(?:(?:send|add|push|throw|move|copy|fuzz)\\b.*\\bintruder\\b.*|intruder\\b.*)$");
+
+    /** Narrate proxy browsing: "narrate", "what did I browse?", "what have I visited?", "describe my traffic" etc. */
+    private static final java.util.regex.Pattern NARRATE_CMD = java.util.regex.Pattern.compile(
+            "(?i)^\\s*(?:narrat(?:e|ion)|what(?:'s| is| did| have)?.{0,20}(?:brows|visit|traffic|captur|proxy|see|find|discover)|"
+            + "show.{0,15}(?:traffic|history|proxy|brows|visit)|describe.{0,20}(?:traffic|brows|visit|request)|"
+            + "analyz[es].{0,20}(?:traffic|proxy|request|brows)).*$");
 
     /** Hard cap on ports probed per run (user-set). Also the max the LLM is asked for. */
     private static final int PORTSCAN_MAX = 100;
@@ -259,6 +271,13 @@ public final class ChatAssistant {
             String reply = sendToIntruder(userMsg.trim());
             history.add("User: " + userMsg);
             history.add("Assistant: (sent a captured request to Intruder)");
+            return reply;
+        }
+        // --- proxy narration: "narrate", "what did I browse?", "describe my traffic" ---
+        if (NARRATE_CMD.matcher(userMsg.trim()).matches()) {
+            String reply = narrateProxy(false);
+            history.add("User: " + userMsg);
+            history.add("Assistant: " + reply);
             return reply;
         }
         AiEngine e = engine.get();
@@ -805,6 +824,110 @@ public final class ChatAssistant {
     }
 
     /** Distinct METHOD path [status] the browser/scan captured for in-scope hosts, from Burp's site map. */
+    /**
+     * Reads the proxy history (in-scope only), builds an attacker-focused prompt for the LLM, and returns
+     * a narration describing what the user browsed: interesting parameters, auth tokens, API patterns,
+     * response anomalies, and concrete attack surface hints. Called on-demand ("narrate" keyword) and by
+     * the passive watcher in the extension.
+     *
+     * @param passiveMode true when called by the background watcher (shorter, non-conversational output);
+     *                    false when the user explicitly asked (full analysis, added to chat history).
+     */
+    public String narrateProxy(boolean passiveMode) {
+        AiEngine e = engine.get();
+        if (e == null || !e.isConfigured())
+            return "(AI not available — configure Local LLM or Burp AI in Settings)";
+
+        List<ProxyHttpRequestResponse> all;
+        try { all = api.proxy().history(); } catch (Throwable t) { return "(proxy history unavailable: " + t + ")"; }
+        if (all == null || all.isEmpty()) return "(no proxy history yet — browse through Burp first)";
+
+        // Collect up to 60 in-scope entries not yet narrated, prioritising the newest.
+        int cursor = narratedUpTo.get();
+        List<ProxyHttpRequestResponse> fresh = new ArrayList<>();
+        for (int i = cursor; i < all.size(); i++) {
+            ProxyHttpRequestResponse rr = all.get(i);
+            try {
+                String url = rr.request().url();
+                if (url != null && (scope.hosts().isEmpty() || scope.contains(url))) fresh.add(rr);
+            } catch (Throwable ignore) { }
+        }
+        narratedUpTo.set(all.size());   // advance cursor regardless of scope filter
+        if (fresh.isEmpty()) return passiveMode ? null : "(no new in-scope traffic since last narration)";
+
+        // Build the prompt context: method + path + status + key headers + truncated body per request.
+        // Skip static assets (JS/CSS/images) to keep context focused on app logic.
+        StringBuilder ctx = new StringBuilder();
+        int limit = Math.min(fresh.size(), 60);
+        int added = 0;
+        for (int i = fresh.size() - 1; i >= 0 && added < limit; i--) {
+            ProxyHttpRequestResponse rr = fresh.get(i);
+            try {
+                burp.api.montoya.http.message.requests.HttpRequest req = rr.request();
+                String url    = req.url();
+                String method = req.method() == null ? "?" : req.method();
+                // skip static assets
+                if (url != null && url.matches("(?i).*\\.(js|css|png|jpe?g|gif|ico|woff2?|svg|map|ttf|eot)(\\?.*)?$")) continue;
+                String host   = rr.httpService() != null ? rr.httpService().host() : "";
+                try { java.net.URI u = new java.net.URI(url); host = u.getHost(); } catch (Exception ignore2) { }
+                String path   = url.contains("?") ? url.substring(url.indexOf("://") + 3) : url.replaceFirst("https?://[^/]+", "");
+                int    status = rr.response() != null ? rr.response().statusCode() : 0;
+                String ct     = rr.response() != null && rr.response().hasHeader("Content-Type")
+                                ? rr.response().headerValue("Content-Type") : "";
+                String reqBody = req.bodyToString();
+                if (reqBody != null && reqBody.length() > 300) reqBody = reqBody.substring(0, 300) + "…";
+                String respBody = rr.response() != null ? rr.response().bodyToString() : "";
+                if (respBody != null && respBody.length() > 400) respBody = respBody.substring(0, 400) + "…";
+
+                ctx.insert(0, "──\n"
+                    + method + " " + host + path + "\n"
+                    + (reqBody != null && !reqBody.isEmpty() ? "REQ: " + reqBody + "\n" : "")
+                    + "RSP " + status + (ct != null && !ct.isEmpty() ? " [" + ct + "]" : "")
+                    + (respBody != null && !respBody.isEmpty() ? ": " + respBody : "")
+                    + "\n");
+                added++;
+            } catch (Throwable ignore) { }
+        }
+
+        String sys = "You are a senior penetration tester reviewing live HTTP traffic captured through a Burp "
+                + "Suite proxy while a colleague manually browses a web application. Write short, actionable "
+                + "consultant notes — the kind you'd jot in a pentest notebook.\n\n"
+                + "Per-request analysis: NAME the endpoint + method → IDENTIFY the exact parameter/token/field "
+                + "worth attacking → STATE what vulnerability class is plausible and WHY (evidence from the "
+                + "response: status code, response body, headers) → SUGGEST the immediate next test step.\n\n"
+                + "Cross-request correlation (critical): look for values that APPEAR in one response and are "
+                + "REUSED in a later request (tokens, IDs, nonces, CSRF values leaking cross-context); "
+                + "parameter names that appear across multiple endpoints (same 'id' field on different routes "
+                + "→ IDOR chain); auth headers or cookies that change — or DON'T change — between requests "
+                + "(session fixation, token reuse). Call these out explicitly.\n\n"
+                + "You are NOT limited to a fixed list of vulnerability classes. Reason freely about anything "
+                + "suspicious in the traffic: unusual status codes, unexpected fields in responses, behavioural "
+                + "differences between requests, business-logic anomalies (prices, quantities, states), "
+                + "cryptographic weaknesses in tokens, race-condition indicators, cache poisoning vectors, "
+                + "HTTP request smuggling indicators, OAuth/OIDC flow deviations, or anything else a "
+                + "skilled attacker would notice. If you see something novel, name it and explain it.\n\n"
+                + "Pay special attention to ERROR RESPONSES and STACK TRACES — they often disclose: framework "
+                + "name and version (fingerprinting), internal file paths, class/method names, database type "
+                + "and query structure, dependency versions with known CVEs, environment variables, config values. "
+                + "Even a partial stack trace can confirm an injection point or reveal the exact injection context.\n\n"
+                + "Common starting points (not exhaustive): auth tokens and session management, IDOR "
+                + "(numeric/guessable IDs in paths/bodies), injection (SQLi/XSS/SSTI/SSRF/template/cmdi), "
+                + "privilege escalation, mass assignment in JSON, info disclosure in errors, CORS, redirects. "
+                + "Skip static assets (JS bundles, CSS, images, fonts). Be blunt and specific — no generic advice. "
+                + (passiveMode ? "Max 5 bullet points, lead with the highest-value finding." : "Group by endpoint, end with a 'Cross-request observations' section.");
+
+        String prompt = (passiveMode ? "New proxy traffic captured:\n" : "Here is my recent proxy traffic:\n")
+                + ctx.toString()
+                + "\nNarrate this from an attacker's perspective.";
+
+        try {
+            String reply = e.chat(sys, prompt, "narrate: proxy");
+            return reply == null || reply.isBlank() ? "(no narration returned)" : reply.trim();
+        } catch (Throwable t) {
+            return "(narration error: " + t.getMessage() + ")";
+        }
+    }
+
     private String scopeContext() {
         Set<String> hosts = scope.hosts();
         if (hosts.isEmpty()) return "(nothing scanned yet — run 'Crawl and scan this host' first)";
