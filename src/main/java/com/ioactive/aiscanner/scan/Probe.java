@@ -100,20 +100,6 @@ public abstract class Probe {
      *  (time-based injection that must outlast an injected sleep; slow LLM endpoints); null on any failure. */
     protected HttpRequestResponse send(HttpRequest req, long responseTimeoutMs) {
         politeness();
-        if (Evasion.hasUserAgent()) {
-            req = req.withHeader("User-Agent", Evasion.userAgent());
-        }
-        if (Evasion.enabled()) {
-            req = Evasion.injectBrowserHeaders(req);
-            for (String h : Evasion.ipSpoofHeaders("127.0.0.1")) {
-                String[] kv = h.split(": ", 2);
-                if (kv.length == 2 && !req.hasHeader(kv[0])) req = req.withHeader(kv[0], kv[1]);
-            }
-            // Only log evasion activity for real app endpoints, not Cloudflare infra paths.
-            String p = pathOf(req.url());
-            if (!p.contains("/cdn-cgi/") && !p.contains("challenge-platform"))
-                scanLog.debug("[WAF-evasion] " + req.method() + " " + p + "  reason=" + Evasion.autoReason());
-        }
         try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(responseTimeoutMs)); }
         catch (Throwable t) { return null; }
     }
