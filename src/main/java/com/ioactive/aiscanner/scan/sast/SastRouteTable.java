@@ -41,8 +41,10 @@ final class SastRouteTable {
     private static final Pattern CS_ACTION = Pattern.compile("\\[Http(Get|Post|Put|Delete|Patch)(?:\\(\\s*\"([^\"]*)\"\\s*\\))?\\s*\\]");
     private static final Pattern J_CLASSRT = Pattern.compile("@RequestMapping\\s*\\(\\s*(?:value|path)?\\s*=?\\s*[\"']([^\"']+)[\"']");
     private static final Pattern J_METHOD  = Pattern.compile("@(Get|Post|Put|Delete|Patch)Mapping\\s*\\(\\s*(?:value\\s*=\\s*)?[\"']([^\"']+)[\"']");
-    private static final Pattern PY_FLASK  = Pattern.compile("@\\w+\\.route\\(\\s*['\"]([^'\"]+)['\"](?:[^)]*methods\\s*=\\s*\\[([^\\]]+)\\])?");
-    private static final Pattern PY_DJANGO = Pattern.compile("(?:re_path|url|path)\\(\\s*r?['\"]\\^?([^'\"$]*?)\\$?['\"]\\s*,");
+    private static final Pattern PY_FLASK   = Pattern.compile("@\\w+\\.route\\(\\s*['\"]([^'\"]+)['\"](?:[^)]*methods\\s*=\\s*\\[([^\\]]+)\\])?");
+    // FastAPI / Starlette: @router.get("/path") @app.post("/path") etc. — HTTP verb is the method name
+    private static final Pattern PY_FASTAPI = Pattern.compile("@\\w+\\.(get|post|put|delete|patch)\\(\\s*['\"]([^'\"]+)['\"]");
+    private static final Pattern PY_DJANGO  = Pattern.compile("(?:re_path|url|path)\\(\\s*r?['\"]\\^?([^'\"$]*?)\\$?['\"]\\s*,");
     private static final Pattern PY_INCLUDE= Pattern.compile("(?:re_path|url|path)\\(\\s*r?['\"]\\^?([^'\"$]*?)\\$?['\"]\\s*,\\s*include\\(\\s*['\"]([\\w.]+)['\"]");
     private static final Pattern GO_MUX    = Pattern.compile("\\.HandleFunc\\(\\s*\"([^\"]+)\"(?:[^)]*)\\)(?:\\.Methods\\(([^)]*)\\))?");
     private static final Pattern GO_GIN    = Pattern.compile("\\.(GET|POST|PUT|DELETE|PATCH)\\(\\s*\"([^\"]+)\"");
@@ -81,6 +83,10 @@ final class SastRouteTable {
             else if (name.equals("routes.rb"))                              harvestRuby(p, table);
             if (table.size() > before) routeFiles.add(p);
         }
+
+        // Postman collection: always harvest if present — routes are authoritative (human-written, not inferred).
+        // Adds to whatever framework harvesters found, or provides the full table when they found nothing.
+        harvestPostman(root, table);
 
         boolean flat = table.size() < 3;
         if (flat) {
@@ -173,6 +179,11 @@ final class SastRouteTable {
 
     private static void harvestPython(Path p, Set<String> table, String mountPrefix) {
         forEachLine(p, ln -> {
+            // FastAPI/Starlette: @router.get("/path") @app.post("/path") — verb-specific decorators
+            Matcher fa = PY_FASTAPI.matcher(ln);
+            while (fa.find() && table.size() < MAX_ROUTES)
+                table.add(fa.group(1).toUpperCase() + " " + join(mountPrefix, fa.group(2)));
+            // Flask: @app.route("/path", methods=["GET","POST"])
             Matcher f = PY_FLASK.matcher(ln);
             while (f.find()) {
                 String path = f.group(1), methods = f.group(2);
@@ -320,6 +331,20 @@ final class SastRouteTable {
 
     private static String clean(String httpMethod) { return httpMethod.replaceAll("[^A-Za-z]", "").toUpperCase(); }
     private static String singular(String s) { return s.endsWith("s") ? s.substring(0, s.length() - 1) : s; }
+
+    /** Harvest routes from Postman collections in the repo — human-written, authoritative paths. */
+    private static void harvestPostman(Path root, Set<String> table) {
+        if (table.size() >= MAX_ROUTES) return;
+        try {
+            SourceFindings pf = PostmanParser.parse(root.toString());
+            for (StaticHint h : pf.all()) {
+                if (h.path == null || h.path.isBlank() || h.path.contains("{{")) continue;
+                String verb = (h.method == null || h.method.isBlank()) ? "GET" : h.method.toUpperCase();
+                table.add(verb + " " + h.path);
+                if (table.size() >= MAX_ROUTES) return;
+            }
+        } catch (Throwable ignore) { }
+    }
 
     private interface LineFn { void accept(String ln); }
     private static void forEachLine(Path p, LineFn fn) {

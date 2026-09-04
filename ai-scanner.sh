@@ -37,6 +37,7 @@ LOGIN_PASS="${AISCANNER_LOGIN_PASSWORD:-}"
 # Pre-seed an authenticated session (bypass the login) — paste a live browser Cookie header when the scanner
 # can't replicate the login (client-side-crypto login, SSO, MFA). AISCANNER_LANDING = the post-login entry URL.
 SEED_COOKIE="${AISCANNER_COOKIE:-}"
+SEED_BEARER="${AISCANNER_BEARER:-}"
 SEED_LANDING="${AISCANNER_LANDING:-}"
 # Optional source repo (local path OR git URL) — drives SAST-assisted DAST. A URL is cloned HERE (shallow, temp)
 # and only a LOCAL PATH is handed to the extension, which reads files with java.nio and never clones/spawns.
@@ -290,6 +291,7 @@ exec "$JAVA" \
   ${LOGIN_EMAIL:+-Daiscanner.loginEmail="${LOGIN_EMAIL}"} \
   ${LOGIN_PASS:+-Daiscanner.loginPassword="${LOGIN_PASS}"} \
   ${SEED_COOKIE:+-Daiscanner.cookie="${SEED_COOKIE}"} \
+  ${SEED_BEARER:+-Daiscanner.bearer="${SEED_BEARER}"} \
   ${SEED_LANDING:+-Daiscanner.landing="${SEED_LANDING}"} \
   ${REPORT_DIR:+-Daiscanner.reportDir="${REPORT_DIR}"} \
   ${SOURCE_REPO:+-Daiscanner.sourceRepo="${SOURCE_REPO}"} \
