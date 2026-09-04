@@ -61,6 +61,7 @@ ALL_TARGETS=(
   "vulnerableapp|running|aisc-vulnerableapp|9090|9090|/VulnerableApp/|https://github.com/SasanLabs/VulnerableApp"
   "log4shell|running|aisc-log4shell|8901|8080|/|"
   "crapi|compose|crapi-web|8889|80|/|https://github.com/OWASP/crAPI"
+  "capital|compose|capital-backend-1|8510|8000|/|https://github.com/Checkmarx/capital"
   "dvws|running|dvws-node-web-1|8180|80|/|https://github.com/snoopysecurity/dvws-node"
   "dvoauth|running|gallery|3005|3005|/|https://github.com/farnaboldi/Vulnerable-OAuth-2.0-Applications"
   "sstipy|running|aisc-ti-python|5056|13375|/Jinja2|https://github.com/Hackmanit/template-injection-playground"
@@ -273,6 +274,54 @@ teardown_crapi(){   # stop the full compose stack cleanly so the next cell doesn
   [ -d "$dir" ] && ( cd "$dir" && docker compose down -v --remove-orphans >/dev/null 2>&1 ) || true
 }
 
+setup_capital(){   # Checkmarx c{api}tal — FastAPI + Postgres + Redis + React frontend on :8510
+  local dir="/tmp/capital-src"
+  if [ ! -d "$dir/.git" ]; then
+    say "  capital: cloning Checkmarx/capital (shallow)…"
+    git clone --depth 1 -q https://github.com/Checkmarx/capital "$dir" 2>>"$LOG" \
+      || { say "  [FAIL] capital git clone"; return 1; }
+  fi
+  # Compose override: remap backend port 8000→8510 to avoid collision with the LLM endpoint.
+  cat > "$dir/docker-compose.bench.yml" << 'OVERRIDE'
+version: '3'
+services:
+  backend:
+    ports:
+      - "8510:8000"
+  frontend:
+    ports:
+      - "8511:4100"
+OVERRIDE
+  docker rm -f capital-backend-1 capital-db-1 capital-redis-1 capital-frontend-1 >/dev/null 2>&1 || true
+  say "  capital: docker compose up -d (4 services, port 8510)…"
+  ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d 2>>"$LOG" ) \
+    || { say "  [FAIL] capital compose up"; return 1; }
+  local i
+  for i in $(seq 1 30); do
+    curl -s -o /dev/null -m5 "http://localhost:8510/api/tags" 2>/dev/null && { say "  capital: backend reachable (i=$i)"; break; }
+    sleep 5
+  done
+  # Register a test user and capture the JWT bearer token for the scanner session.
+  curl -s -m10 -X POST "http://localhost:8510/api/users" \
+    -H "Content-Type: application/json" \
+    -d '{"user":{"username":"aiscbot","email":"aiscbot@mailinator.com","password":"Aiscpass1!"}}' >/dev/null 2>&1 || true
+  local tok
+  tok=$(curl -s -m10 -X POST "http://localhost:8510/api/v2/users/login" \
+    -H "Content-Type: application/json" \
+    -d '{"user":{"email":"aiscbot@mailinator.com","password":"Aiscpass1!"}}' 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('user',{}).get('token',''))" 2>/dev/null)
+  if [ -n "$tok" ]; then
+    export AISCANNER_BEARER="$tok"
+    say "  capital: bearer token captured (${#tok} chars) — scanner will use authenticated session"
+  else
+    say "  [warn] capital: login failed — scanner will run unauthenticated"
+  fi
+}
+teardown_capital(){
+  local dir="/tmp/capital-src"
+  [ -d "$dir" ] && ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml down -v --remove-orphans >/dev/null 2>&1 ) || true
+}
+
 setup_dvrestaurant(){
   local base="${1%/}"   # e.g. http://localhost:8091
   local dir="/tmp/dvrestaurant-src"
@@ -468,6 +517,7 @@ run_pair(){   # $@ = target names → bring each up + stabilize, ONE Burp scanni
       dvwssock)   setup_dvwssock;;
       dvoauth)      setup_dvoauth "$base";;   # fork clone + compose up (owns bring-up; no redundant start_running first)
       crapi)        setup_crapi;;             # 10-container stack; compose up + own teardown via teardown_crapi
+      capital)      setup_capital;;           # FastAPI+Postgres+Redis; compose up on :8510 to avoid LLM port collision
       *) [ "$kind" = running ] && start_running "$image" "$base"
          case "$t" in
            dvwa)    setup_dvwa "http://localhost:$hostport";;
@@ -554,6 +604,7 @@ for tname in $PRIORITY; do
         # compose-kind: target owns its full multi-container bring-up via a setup_<name> function and must also own teardown.
         case "$tname" in
           crapi)       setup_crapi;;
+          capital)     setup_capital;;
           *) say "  [warn] no setup_$tname for compose-kind target — skipping bring-up";;
         esac
         curl_url="http://localhost:$hostport$path"
@@ -585,6 +636,7 @@ for tname in $PRIORITY; do
       case "$tname" in   # per-target creds for the scanner's LLM-login (apps whose creds aren't in the default list)
         aspgoat)  export AISCANNER_LOGIN_EMAIL=admin AISCANNER_LOGIN_PASSWORD=admin123;;
         nodegoat) export AISCANNER_LOGIN_EMAIL=admin AISCANNER_LOGIN_PASSWORD=Admin_123;;
+        capital)  export AISCANNER_LOGIN_EMAIL=aiscbot@mailinator.com AISCANNER_LOGIN_PASSWORD='Aiscpass1!';;
         *)        unset AISCANNER_LOGIN_EMAIL AISCANNER_LOGIN_PASSWORD;;
       esac
       case "$tname" in   # per-target module scoping: skip the full battery for single-purpose targets
@@ -635,7 +687,7 @@ for tname in $PRIORITY; do
       fi
       [ "$kind" = docker ] && [ -n "$cname" ] && teardown "$cname"   # rm the fresh-spun instance (avoids name reuse)
       # compose-kind targets own their teardown to free memory before the next cell (critical for crAPI's 10 containers).
-      [ "$kind" = compose ] && case "$tname" in crapi) teardown_crapi;; esac
+      [ "$kind" = compose ] && case "$tname" in crapi) teardown_crapi;; capital) teardown_capital;; esac
       # running-kind: harness owns stop so the container is clean for the next cell and leaves no orphan.
       # Uses stop_running (not docker stop) so compose siblings are stopped together.
       if [ "$kind" = running ]; then

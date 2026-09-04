@@ -32,7 +32,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 704;
+    public static final int BUILD = 705;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -310,7 +310,8 @@ public class AiScannerExtension implements BurpExtension {
             // whose login the scanner CANNOT replicate (client-side-crypto login, SSO, MFA): paste a live browser
             // Cookie header and the scan runs authenticated with no login step. Optional AISCANNER_LANDING = the
             // post-login entry URL the explorer should seed. Generic — no app-specific logic.
-            final String seedCookie = launchArg("aiscanner.cookie", "AISCANNER_COOKIE");
+            final String seedCookie  = launchArg("aiscanner.cookie",  "AISCANNER_COOKIE");
+            final String seedBearer  = launchArg("aiscanner.bearer",  "AISCANNER_BEARER");
             final String seedLanding = launchArg("aiscanner.landing", "AISCANNER_LANDING");
             final boolean batch = targets.length > 1;
             String parFlag = launchArg("aiscanner.parallel", "AISCANNER_PARALLEL");
@@ -356,6 +357,15 @@ public class AiScannerExtension implements BurpExtension {
                         seedCookieJar(seedCookie, url);
                         scanLog.log("pre-seeded authenticated session from launch cookie — login skipped (names: "
                                 + seedCookie.replaceAll("=[^;]*", "=…") + ")");
+                    }
+                    if (seedBearer != null && !seedBearer.isBlank()) {
+                        session.setBearer(seedBearer);
+                        // Do NOT set adopted=true for bearer — that suppresses the JWT analysis probe which
+                        // legitimately inspects bearer tokens in responses for security issues (no-exp, weak alg).
+                        // Auto-registration is still suppressed implicitly because hasBearer()=true means the
+                        // scanner considers itself authenticated and skips the register→login flow.
+                        scanLog.log("pre-seeded bearer token from AISCANNER_BEARER — authenticated scan (token: "
+                                + seedBearer.substring(0, Math.min(20, seedBearer.length())) + "…)");
                     }
                     try { menuProvider.startScanAndWait(url); done++; }
                     catch (Throwable t) { scanLog.log("target failed (" + url + "): " + t + " — continuing."); }
