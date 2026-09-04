@@ -17,14 +17,15 @@ set -euo pipefail
 # Multiple targets are scanned SEQUENTIALLY in one Burp session (session + findings reset between each).
 # Bare hosts (no scheme) get https:// added by the extension.
 if [ "$#" -gt 0 ]; then TARGET="$(IFS=,; echo "$*")"; else TARGET="${AISCANNER_TARGET:-}"; fi
-if [ -z "$TARGET" ]; then
+if [ -z "$TARGET" ] && [ "${AISCANNER_NO_AUTOSCAN:-0}" != "1" ]; then
   echo "usage: ./ai-scanner.sh <target-url> [more-targets…]" >&2
   echo "   e.g. ./ai-scanner.sh http://juice.local:3000/" >&2
   echo "   e.g. ./ai-scanner.sh api.dev.example.com app.dev.example.com   # sequential batch" >&2
+  echo "   or:  AISCANNER_NO_AUTOSCAN=1 ./ai-scanner.sh   # start Burp+extension without auto-scanning" >&2
   exit 2
 fi
 # Count targets (commas + whitespace separate them) → batch mode writes one report per host into a dir.
-TARGET_COUNT="$(printf '%s' "$TARGET" | tr ', \t' '\n\n\n\n' | grep -c .)"
+TARGET_COUNT="$(printf '%s' "$TARGET" | tr ', \t' '\n\n\n\n' | grep -c . || true)"
 REPORT_DIR="${AISCANNER_REPORT_DIR:-}"
 BASE_URL="${AISCANNER_BASE_URL:-http://127.0.0.1:8000/v1/}"   # your OpenAI-compatible LLM endpoint
 MODEL="${AISCANNER_MODEL:-}"                                  # set to the model your endpoint serves
@@ -271,7 +272,7 @@ exec "$JAVA" \
   "-Daiscanner.maxTokens=${AISCANNER_MAX_TOKENS:-2048}" \
   "-Daiscanner.synthEndpoints=${AISCANNER_SYNTH:-true}" \
   ${AISCANNER_ONLY:+-Daiscanner.only="${AISCANNER_ONLY}"} \
-  ${AISCANNER_LOG_FILE:+-Daiscanner.logFile="${AISCANNER_LOG_FILE}"} \
+  "-Daiscanner.logFile=${AISCANNER_LOG_FILE:-/tmp/aiscanner.log}" \
   ${AISCANNER_SQLI_SLEEP_SEC:+-Daiscanner.sqliSleepSec="${AISCANNER_SQLI_SLEEP_SEC}"} \
   "-Daiscanner.discoveryOnly=${AISCANNER_DISCOVERY_ONLY:-false}" \
   "-Daiscanner.nativeOnly=${AISCANNER_NATIVE_ONLY:-false}" \
@@ -295,7 +296,7 @@ exec "$JAVA" \
   ${AISCANNER_AUTOSCAN_REPOS:+-Daiscanner.autoscanRepos="${AISCANNER_AUTOSCAN_REPOS}"} \
   "-Daiscanner.sastMode=${AISCANNER_SAST_MODE:-coarse}" \
   "-Daiscanner.deferToBurp=${AISCANNER_DEFER_TO_BURP:-true}" \
-  "-Daiscanner.autoscan=${TARGET}" \
+  ${TARGET:+"-Daiscanner.autoscan=${TARGET}"} \
   -jar "$BURP_JAR" \
   --project-file="$PROJECT" \
   --config-file="$CONF_PROJECT" \

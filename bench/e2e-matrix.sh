@@ -33,7 +33,11 @@ LOG="$RES/e2e.log"; : > "$LOG"
 CSV="$RES/e2e-matrix.csv"; [ -s "$CSV" ] || echo "target,config,findings,status" > "$CSV"
 CONFIGS="${CONFIGS:-pro-ext}"   # pro-bare (Burp-native, no extension) is ~0 behind a login → not run by default
 
-# target = name|kind|image|hostport|containerport|path|repo   (kind: docker|external|running)
+# target = name|kind|image|hostport|containerport|path|repo
+#   kind=docker   → harness does docker run (fresh instance per cell) + docker rm at teardown
+#   kind=running  → harness does docker start (pre-built image) + docker stop at teardown; SKIP if unreachable
+#   kind=compose  → multi-container stack; setup_<name>() owns bring-up + teardown_<name>() owns teardown
+#   kind=external → live remote host; no container management
 #   repo (7th, optional) = git URL or local path of the target's SOURCE, drives -Daiscanner.sourceRepo (SAST). Empty = none.
 ALL_TARGETS=(
   "juice|docker|bkimminich/juice-shop|3000|3000|/|https://github.com/juice-shop/juice-shop"
@@ -554,17 +558,29 @@ for tname in $PRIORITY; do
         esac
         curl_url="http://localhost:$hostport$path"
       elif [ "$kind" = running ]; then
-        case "$tname" in   # self-bootstrapping targets own their full bring-up; others just start the pre-built container
+        # "running" kind: harness owns start + stop (no external state assumed). Starts the pre-built container and all
+        # its compose siblings, waits for HTTP health, and stops them when the cell ends. If the target fails to come up
+        # after the wait, the cell is SKIPPED with an explicit marker rather than running against a dead URL and silently
+        # scoring 0 (which poisons model-comparison tables with misleading zeros).
+        local _up_ok=1
+        case "$tname" in
           nodevuln)   setup_nodevuln;;
           dvwssock)   setup_dvwssock;;
-          dvoauth)      setup_dvoauth "http://localhost:$hostport$path";;   # fork clone + compose up (owns bring-up; no start_running)
+          dvoauth)      setup_dvoauth "http://localhost:$hostport$path";;
           *) start_running "$image" "http://localhost:$hostport$path";;
         esac
+        if ! wait_http_n "http://localhost:$hostport$path" 30; then
+          say "  SKIP $tname/$local_label — target not reachable after start (container failed or image missing)"
+          echo "$tname,$local_label,SKIP,skip" >> "$CSV"
+          printf '%s\t%s\t%s\t%s\t%s\n' "$tname" "$local_label" "SKIP" "–\t–\t–\t–" "$(fmt_dur $(( $(date +%s) - cell_t0 )))" | tee -a "$TSV"
+          _up_ok=0
+        fi
         curl_url="http://localhost:$hostport$path"
       else
         base="$path"; curl_url="$path"
       fi
 
+      [ "${_up_ok:-1}" = 0 ] && continue   # running-kind target failed to start → already marked SKIP above
       say "  RUN  $tname/$local_label  -> $curl_url$([ -n "$src" ] && echo "   (web-src=$src)")"
       case "$tname" in   # per-target creds for the scanner's LLM-login (apps whose creds aren't in the default list)
         aspgoat)  export AISCANNER_LOGIN_EMAIL=admin AISCANNER_LOGIN_PASSWORD=admin123;;
@@ -620,6 +636,14 @@ for tname in $PRIORITY; do
       [ "$kind" = docker ] && [ -n "$cname" ] && teardown "$cname"   # rm the fresh-spun instance (avoids name reuse)
       # compose-kind targets own their teardown to free memory before the next cell (critical for crAPI's 10 containers).
       [ "$kind" = compose ] && case "$tname" in crapi) teardown_crapi;; esac
+      # running-kind: harness owns stop so the container is clean for the next cell and leaves no orphan.
+      # Uses stop_running (not docker stop) so compose siblings are stopped together.
+      if [ "$kind" = running ]; then
+        case "$tname" in
+          nodevuln|dvwssock|dvoauth) :;;   # self-bootstrapping targets own their own teardown
+          *) stop_running "$image";;
+        esac
+      fi
     done
   done
 done

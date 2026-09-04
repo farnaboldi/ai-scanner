@@ -207,31 +207,54 @@ public class AiScannerExtension implements BurpExtension {
             new Thread(() -> { String r = chat.reply(msg); if (r != null) scanLog.appendChat("ai", r); }, "ais-chat").start();
         });
 
-        // Passive proxy-narration watcher: every 60 s, if there is new in-scope proxy traffic and the
-        // LLM is available, produce a consultant-style narration of what the user just browsed and push
-        // it into the Agent chat. Respects the same cursor (narratedUpTo) as the on-demand "narrate"
-        // command so the two never double-narrate the same requests.
-        final com.ioactive.aiscanner.ui.ChatAssistant chatRef = chat;
-        Thread narratorThread = new Thread(() -> {
+        // "Analyze Manual Navigation" button — shows new unanalyzed proxy traffic count as a badge,
+        // green when there's traffic to analyze, grey otherwise. Clicking it runs narrateProxy() immediately.
+        final com.ioactive.aiscanner.ui.ChatAssistant chatBtn = chat;
+        javax.swing.JButton analyzeBtn = new javax.swing.JButton("🔍 Analyze new in-scope proxy traffic");
+        analyzeBtn.setToolTipText("Analyze new in-scope proxy traffic as a penetration tester");
+        analyzeBtn.setEnabled(false);
+        analyzeBtn.setMargin(new java.awt.Insets(2, 8, 2, 8));   // compact — doesn't push other buttons
+        analyzeBtn.addActionListener(e -> {
+            analyzeBtn.setEnabled(false);
+            analyzeBtn.setText("🔍 Analyzing…");
+            scanLog.appendChat("you", "Analyze new in-scope proxy traffic");
+            new Thread(() -> {
+                String r = chatBtn.narrateProxy(false);
+                // Store in chat history so subsequent "test them" / "scan it" turns have context.
+                if (r != null && !r.isBlank()) chatBtn.addToHistory("Assistant: [proxy analysis]\nSystem: " + r);
+                javax.swing.SwingUtilities.invokeLater(() -> {
+                    analyzeBtn.setText("🔍 Analyze new in-scope proxy traffic");
+                    updateAnalyzeBtn(analyzeBtn, chatBtn, api);
+                });
+                if (r != null && !r.isBlank()) scanLog.appendChat("ai", r);
+                else scanLog.appendChat("ai", "(no new endpoints to analyze — browse more first)");
+            }, "ais-narrate-btn").start();
+        });
+        // Poll every 5s to update the button badge with the count of new requests
+        Thread btnPoller = new Thread(() -> {
             while (!unloaded) {
-                try { Thread.sleep(60_000); } catch (InterruptedException ie) { break; }
+                try { Thread.sleep(5_000); } catch (InterruptedException ie) { if (unloaded) break; continue; }
                 if (unloaded) break;
-                try {
-                    String narration = chatRef.narrateProxy(true);
-                    if (narration != null && !narration.isBlank()) {
-                        scanLog.appendChat("ai", "🔍 " + narration);   // 🔍 prefix to distinguish passive notes
-                    }
-                } catch (Throwable ignore) { }
+                javax.swing.SwingUtilities.invokeLater(() -> updateAnalyzeBtn(analyzeBtn, chatBtn, api));
             }
-        }, "ais-proxy-narrator");
-        narratorThread.setDaemon(true);
-        narratorThread.start();
+        }, "ais-narrate-poller");
+        btnPoller.setDaemon(true);
+        btnPoller.start();
+
+        // Add button at top of agent panel — FlowLayout.LEFT keeps it compact, doesn't stretch full width
+        javax.swing.JPanel btnBar = new javax.swing.JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 2));
+        btnBar.add(analyzeBtn);
+        javax.swing.JPanel agentWithBtn = new javax.swing.JPanel(new java.awt.BorderLayout());
+        agentWithBtn.add(btnBar, java.awt.BorderLayout.NORTH);
+        agentWithBtn.add(agentPanel, java.awt.BorderLayout.CENTER);
+
+        final com.ioactive.aiscanner.ui.ChatAssistant chatRef = chat;
 
         // Three-tab structure: Settings | Log | Agent
         javax.swing.JTabbedPane tabs = new javax.swing.JTabbedPane();
         tabs.addTab("Settings", settingsTab.component());
         tabs.addTab("Log",     scanLog.component());
-        tabs.addTab("Agent",   agentPanel);
+        tabs.addTab("Agent",   agentWithBtn);
 
         // Default: if LLM configured open on Log; else Settings.
         AiEngine cfgEngine = getEngine();
@@ -686,5 +709,39 @@ public class AiScannerExtension implements BurpExtension {
             this.engineConfig = def;
         }
         this.engine = engineFor(engineConfig);
+    }
+
+    /** Update the "Analyze Manual Navigation" button label + enabled state based on new unanalyzed requests. */
+    private static void updateAnalyzeBtn(javax.swing.JButton btn,
+                                          com.ioactive.aiscanner.ui.ChatAssistant chat,
+                                          burp.api.montoya.MontoyaApi api) {
+        try {
+            int cursor = chat.narratedUpTo.get();
+            // Count unique in-scope paths not yet narrated — same dedup as the actual analysis.
+            java.util.List<burp.api.montoya.proxy.ProxyHttpRequestResponse> all = api.proxy().history();
+            java.util.Set<String> newPaths = new java.util.HashSet<>();
+            for (int i = cursor; i < all.size(); i++) {
+                try {
+                    burp.api.montoya.proxy.ProxyHttpRequestResponse rr = all.get(i);
+                    String url = rr.request().url();
+                    if (url == null) continue;
+                    if (!api.scope().isInScope(url)) continue;
+                    if (url.matches("(?i).*\\.(js|css|png|jpe?g|gif|ico|woff2?|svg|map|ttf|eot)(\\?.*)?$")) continue;
+                    String method = rr.request().method();
+                    String pathOnly = url.replaceFirst("https?://[^/?]+", "").replaceFirst("\\?.*", "");
+                    String host = url.replaceFirst("https?://([^/?]+).*", "$1");
+                    String key = method + " " + host + pathOnly;
+                    if (!chat.narratedPaths.contains(key)) newPaths.add(key);
+                } catch (Throwable ignore) { }
+            }
+            int newReqs = newPaths.size();
+            if (newReqs > 0) {
+                btn.setText("🔍 Analyze new in-scope proxy traffic (" + newReqs + " new requests)");
+                btn.setEnabled(true);
+            } else {
+                btn.setText("🔍 Analyze new in-scope proxy traffic");
+                btn.setEnabled(false);
+            }
+        } catch (Throwable ignore) { }
     }
 }
