@@ -291,6 +291,63 @@ public final class AiScanner {
         // map on a different host/port, so an exact-host filter would drop the very API calls we want to audit.
         // sameSite() keeps the seed origin AND same-registrable-domain siblings (the user-approved scope) and
         // still excludes third-party origins (CDNs, telemetry, vendor domains) the page also talks to.
+        // ── Cloudflare / WAF bypass config ──────────────────────────────────────────────────────────────
+        // Three env/system-property knobs for targets behind a bot-detection layer (e.g. Cloudflare):
+        //
+        // 1. AISCANNER_CF_CLEARANCE — a valid "cf_clearance" cookie value (+ optionally "__cf_bm=...")
+        //    obtained from a browser session that already passed the JS challenge. Injected into the
+        //    SessionStore so the native crawler and every probe carry it, exactly like a session cookie.
+        //    Also pushed into Burp's cookie jar so the native crawler uses it. Tied to the solving IP
+        //    and User-Agent, so pair with AISCANNER_USER_AGENT.
+        //    Example: AISCANNER_CF_CLEARANCE="cf_clearance=abc123; __cf_bm=xyz"
+        //
+        // 2. AISCANNER_USER_AGENT — override the User-Agent on every probe request to match the browser
+        //    that solved the CF challenge (cf_clearance is IP+UA-bound). If the property is set to the
+        //    exact Chrome UA used in the browser, the cf_clearance will be accepted by Cloudflare.
+        //    Example: AISCANNER_USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ..."
+        //
+        // 3. AISCANNER_SEED_URLS — comma-separated list of URLs to pre-populate into Burp's site map
+        //    before the scan starts. Use when the crawl is blocked (e.g. CF challenge) but you know the
+        //    real application endpoints from manual browsing, Postman, or a prior authenticated session.
+        //    Example: AISCANNER_SEED_URLS="https://crypto.com/api/v1/login,https://crypto.com/api/v1/signin"
+        String cfClearance = cfgVal("AISCANNER_CF_CLEARANCE", "aiscanner.cfClearance");
+        String uaOverride  = cfgVal("AISCANNER_USER_AGENT",   "aiscanner.userAgent");
+        String seedUrls    = cfgVal("AISCANNER_SEED_URLS",    "aiscanner.seedUrls");
+        // Autonomous CF cookie extraction: read cf_clearance / __cf_bm from Burp's cookie jar.
+        // If the user opened the target in Burp's embedded browser first, the challenge is already
+        // solved and the clearance cookie is sitting in the jar — no manual copy-paste needed.
+        if (cfClearance == null || cfClearance.isBlank()) {
+            cfClearance = Evasion.extractCfClearance(api, host);
+            if (!cfClearance.isBlank())
+                scanLog.log("CF-clearance found in Burp cookie jar (autonomous) — injecting.");
+        }
+        if (cfClearance != null && !cfClearance.isBlank()) {
+            String cookieHdr = cfClearance.trim();
+            session.set(cookieHdr);
+            scanLog.log("CF-clearance active: " + cookieHdr.substring(0, Math.min(50, cookieHdr.length())) + "…");
+        }
+        if (uaOverride != null && !uaOverride.isBlank()) {
+            Evasion.setUserAgent(uaOverride.trim());
+            scanLog.log("User-Agent override: " + uaOverride.substring(0, Math.min(60, uaOverride.length())));
+        }
+        if (seedUrls != null && !seedUrls.isBlank()) {
+            int seeded = 0;
+            for (String rawUrl : seedUrls.split(",")) {
+                rawUrl = rawUrl.trim();
+                if (rawUrl.isEmpty()) continue;
+                try {
+                    burp.api.montoya.http.message.requests.HttpRequest sr =
+                            burp.api.montoya.http.message.requests.HttpRequest.httpRequestFromUrl(rawUrl);
+                    api.siteMap().add(burp.api.montoya.http.message.HttpRequestResponse.httpRequestResponse(sr, null));
+                    seeded++;
+                } catch (Exception e) {
+                    scanLog.debug("seed URL parse failed: " + rawUrl + " — " + e);
+                }
+            }
+            if (seeded > 0) scanLog.log("seeded " + seeded + " URL(s) into site map from AISCANNER_SEED_URLS.");
+        }
+        // ────────────────────────────────────────────────────────────────────────────────────────────────
+
         Map<String, String> shellByOrigin = new HashMap<>();   // origin -> its catch-all shell ("" = none)
         int spaSkipped = 0, xorigin = 0;
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
@@ -2345,6 +2402,14 @@ public final class AiScanner {
     }
 
     private static String hostOf(String url) { return Net.authority(url); }
+
+    /** Read a config value from an env var first, then a system property, returning null if neither is set. */
+    private static String cfgVal(String envKey, String propKey) {
+        String v = System.getenv(envKey);
+        if (v != null && !v.isBlank()) return v;
+        v = System.getProperty(propKey);
+        return (v != null && !v.isBlank()) ? v : null;
+    }
     /** Full origin (scheme://authority incl. port) for {@code host} from the site map — lets a header-only OAST
      *  probe (Log4Shell) hit the root even when discovery surfaced no auditable parameter (targets list empty). */
     private String siteMapOrigin(String host) {

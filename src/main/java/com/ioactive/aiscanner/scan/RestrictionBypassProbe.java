@@ -88,6 +88,19 @@ public final class RestrictionBypassProbe extends Probe {
                 if (accepted(mutateNames(req, params), baseBody,
                         "renamed indexed field names (server validated by exact name)", req.url())) return true;
             }
+
+            // Variant 4 (WAF-evasion): X-Original-URL / X-Rewrite-URL path-override — misconfigured proxies
+            // honour these headers so the WAF sees a benign root path while the origin processes the real one.
+            if (Evasion.enabled()) {
+                String targetPath = pathOf(req.url());
+                HttpRequest decoyReq = req.withPath("/");
+                for (String h : Evasion.pathOverrideHeaders(targetPath)) {
+                    String[] kv = h.split(": ", 2);
+                    if (kv.length == 2) decoyReq = decoyReq.withHeader(kv[0], kv[1]);
+                }
+                if (accepted(mutate(decoyReq, params, p -> nameNumeric(p) ? "0" : BYPASS), baseBody,
+                        "bypass via X-Original-URL=" + targetPath, req.url())) return true;
+            }
         } catch (Throwable t) {
             scanLog.debug("restriction-bypass probe error: " + t);
         }

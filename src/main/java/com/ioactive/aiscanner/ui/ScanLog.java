@@ -602,6 +602,21 @@ public final class ScanLog {
         renderChat();   // seed with the (empty) document skeleton
         chatScroll = new JScrollPane(chatPane);
         chatScroll.setBorder(boldTitle("Chat"));
+        // Font-size controls — Cmd+/- is intercepted by Burp/macOS so use small A/A buttons instead
+        final int[] chatFontSize = { 10 };
+        java.util.function.Consumer<Integer> resizeChat = delta -> {
+            chatFontSize[0] = Math.max(9, Math.min(28, chatFontSize[0] + delta));
+            chatPane.putClientProperty("font-size", chatFontSize[0]);
+            renderChat();
+        };
+        JButton fontSmaller = new JButton("A−");
+        JButton fontLarger  = new JButton("A+");
+        fontSmaller.setMargin(new java.awt.Insets(0, 3, 0, 3));
+        fontLarger.setMargin(new java.awt.Insets(0, 3, 0, 3));
+        fontSmaller.setToolTipText("Decrease font size");
+        fontLarger.setToolTipText("Increase font size");
+        fontSmaller.addActionListener(e -> resizeChat.accept(-1));
+        fontLarger.addActionListener(e -> resizeChat.accept(+1));
 
         // --- input row (right panel, bottom) ---
         JTextField chatInput = new JTextField();
@@ -610,7 +625,11 @@ public final class ScanLog {
         JPanel inputRow = new JPanel(new BorderLayout(4, 0));
         inputRow.setBorder(BorderFactory.createEmptyBorder(2, 6, 6, 6));
         inputRow.add(chatInput, BorderLayout.CENTER);
-        inputRow.add(sendBtn, BorderLayout.EAST);
+        JPanel eastBtns = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 2, 0));
+        eastBtns.add(fontSmaller);
+        eastBtns.add(fontLarger);
+        eastBtns.add(sendBtn);
+        inputRow.add(eastBtns, BorderLayout.EAST);
         // Terminal-style input history: submitted messages are remembered; ↑ walks back, ↓ walks forward
         // (↓ past the newest returns to an empty line). idx[0] == history.size() means "on the fresh line".
         final java.util.List<String> inHist = new java.util.ArrayList<>();
@@ -679,9 +698,11 @@ public final class ScanLog {
 
     /** Re-render the whole chat transcript into the HTML pane. Cheap: chat turns are few. EDT-only. */
     private void renderChat() {
+        int fs = chatPane != null && chatPane.getClientProperty("font-size") instanceof Integer
+                 ? (Integer) chatPane.getClientProperty("font-size") : 10;
         StringBuilder b = new StringBuilder();
         b.append("<html><head><style>")
-         .append("body{font-family:sans-serif;font-size:10px;margin:2px 4px;}")
+         .append("body{font-family:sans-serif;font-size:" + fs + "px;margin:2px 4px;}")
          .append(".you{color:#3b78c3;font-weight:bold;}")
          .append(".ai{color:#177245;font-weight:bold;}")
          .append(".turn{margin:0 0 10px 0;}")

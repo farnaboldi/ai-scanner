@@ -30,7 +30,12 @@ public final class ChatAssistant {
 
     // High-water mark: the index in api.proxy().history() up to which we've already narrated.
     // Lets the passive watcher and on-demand narration share a cursor so they don't re-narrate.
-    final AtomicInteger narratedUpTo = new AtomicInteger(0);
+    public final AtomicInteger narratedUpTo = new AtomicInteger(0);
+
+    /** Add a raw entry to the conversation history so subsequent turns have context (e.g. proxy analysis results). */
+    public void addToHistory(String entry) { synchronized (history) { history.add(entry); } }
+    // Paths already narrated across all cycles — used to skip duplicates and tell the LLM what NOT to repeat.
+    public final java.util.Set<String> narratedPaths = java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
 
     /** Wired by the extension to menuProvider.startScan() — null means scan launch is unavailable. */
     private volatile java.util.function.Consumer<String> scanHandler;
@@ -109,11 +114,7 @@ public final class ChatAssistant {
     private static final java.util.regex.Pattern INTRUDER_CMD = java.util.regex.Pattern.compile(
             "(?i)^\\s*(?:(?:send|add|push|throw|move|copy|fuzz)\\b.*\\bintruder\\b.*|intruder\\b.*)$");
 
-    /** Narrate proxy browsing: "narrate", "what did I browse?", "what have I visited?", "describe my traffic" etc. */
-    private static final java.util.regex.Pattern NARRATE_CMD = java.util.regex.Pattern.compile(
-            "(?i)^\\s*(?:narrat(?:e|ion)|what(?:'s| is| did| have)?.{0,20}(?:brows|visit|traffic|captur|proxy|see|find|discover)|"
-            + "show.{0,15}(?:traffic|history|proxy|brows|visit)|describe.{0,20}(?:traffic|brows|visit|request)|"
-            + "analyz[es].{0,20}(?:traffic|proxy|request|brows)).*$");
+    // NARRATE_CMD removed — narration is now an LLM-callable directive (NARRATE: proxy), not a regex gate.
 
     /** Hard cap on ports probed per run (user-set). Also the max the LLM is asked for. */
     private static final int PORTSCAN_MAX = 100;
@@ -206,26 +207,32 @@ public final class ChatAssistant {
             history.add("Assistant: " + reply);
             return reply;
         }
-        // --- on-demand single-module run against an already-scanned host (reuses the warm site map) ---
-        java.util.regex.Matcher mod = MODULE_CMD.matcher(userMsg.trim());
-        if (mod.matches()) {
-            String key = resolveModuleKey(mod.group(1));
-            if (key != null) {   // a known module — otherwise fall through (it was ordinary chat/scan text)
+        // --- on-demand module run(s) — fires when user explicitly names modules (test ssrf, test sqli…).
+        // Skip if "manually" is present — those go to the LLM which uses FETCH: directives instead. ---
+        {
+            java.util.List<String> keys = new java.util.ArrayList<>();
+            boolean isManual = userMsg.toLowerCase().contains("manual");
+            java.util.regex.Matcher mAll = java.util.regex.Pattern.compile(
+                    isManual ? "(?!)" : "(?i)\\b(?:test|run|probe)\\s+([a-z0-9][a-z0-9_-]*)").matcher(userMsg);
+            while (mAll.find()) { String k = resolveModuleKey(mAll.group(1)); if (k != null) keys.add(k); }
+            // Also try the single MODULE_CMD match for backward compat
+            if (keys.isEmpty()) {
+                java.util.regex.Matcher mod = MODULE_CMD.matcher(userMsg.trim());
+                if (mod.matches()) { String k = resolveModuleKey(mod.group(1)); if (k != null) keys.add(k); }
+            }
+            if (!keys.isEmpty()) {
                 java.util.function.Consumer<String[]> mh = moduleHandler;
                 if (mh == null) return "(on-demand module run not available)";
+                // Host: prefer a scanned host; fall back to the most-seen in-scope proxy host (manual browsing mode).
                 Set<String> hosts = scope.hosts();
-                if (hosts.isEmpty()) return "(nothing scanned yet — scan a host first, then 'test " + key + "')";
-                final String host = hosts.iterator().next();   // the scanned host (reuse its discovered surface)
-                // A scan already running → the handler ENQUEUES the module into it (ticks the checkbox, rewrites the
-                // live only= filter, status bar +1) instead of starting a second scan. No scan → fresh scoped re-scan.
+                String host = hosts.isEmpty() ? proxyTopHost() : hosts.iterator().next();
+                if (host == null || host.isBlank()) return "(no target host — browse through Burp or run 'scan <url>' first)";
                 boolean live = scanLog.isScanActive();
-                new Thread(() -> mh.accept(new String[]{ host, key }), "chat-module").start();
+                final String h = host;
+                for (String key : keys) new Thread(() -> mh.accept(new String[]{ h, key }), "chat-module").start();
                 String reply = live
-                        ? "Queued '" + key + "' into the running scan's attack modules — it'll run when the battery "
-                          + "reaches that phase (if it hasn't passed it yet). The Modules checkbox ticks and the "
-                          + "status-bar phase count goes +1; no second scan is started."
-                        : "Running the '" + key + "' module on " + host + " — reusing the discovered surface "
-                          + "(no re-crawl). Watch the log tab for findings.";
+                        ? "Queued " + keys + " into the running scan on " + host + "."
+                        : "Running " + keys + " against " + host + " — watch the Log tab for findings.";
                 history.add("User: " + userMsg);
                 history.add("Assistant: " + reply);
                 return reply;
@@ -273,13 +280,6 @@ public final class ChatAssistant {
             history.add("Assistant: (sent a captured request to Intruder)");
             return reply;
         }
-        // --- proxy narration: "narrate", "what did I browse?", "describe my traffic" ---
-        if (NARRATE_CMD.matcher(userMsg.trim()).matches()) {
-            String reply = narrateProxy(false);
-            history.add("User: " + userMsg);
-            history.add("Assistant: " + reply);
-            return reply;
-        }
         AiEngine e = engine.get();
         if (e == null || !e.isConfigured())
             return "(AI not available — in the AI Scanner Settings tab, select Local LLM and set its Base "
@@ -290,12 +290,17 @@ public final class ChatAssistant {
                 + "findings). Do NOT pad replies with canned calls-to-action, and do NOT suggest starting or "
                 + "re-running a scan unless the user explicitly asks how to start one. `scan this host` is a "
                 + "right-click context-menu action, NOT a chat command — never tell the user to type it.\n"
-                + "IMPORTANT: To get real data from a URL, reply with a SINGLE line `FETCH: <url>` and NOTHING "
-                + "else. The tool performs the REAL HTTP request through Burp and returns the response for you to "
-                + "analyze on your NEXT turn; then you answer. Prefer public sources that need no API key. NEVER "
-                + "fabricate HTTP responses, headers, status codes, cookies, or scan results — if you don't have "
-                + "the data, FETCH it (or say plainly you can't). The ONLY chat commands you may mention (and only "
-                + "when the user actually needs them) are: `scan <url>` (start a scan on a NEW target), "
+                + "TOOLS — you can invoke these by emitting a SINGLE directive line and NOTHING else:\n"
+                + "  `FETCH: <url>` — perform a REAL HTTP request through Burp; you get the response on your next turn.\n"
+                + "  `NARRATE: proxy` — read the user's recent Burp proxy traffic (all in-scope requests/responses "
+                + "the user just browsed) and analyze it as a senior pentester: identify attack surface, interesting "
+                + "parameters, tokens, error disclosures, cross-request patterns, and concrete next test steps. "
+                + "Use this whenever the user asks about what they browsed, what to test, what looks interesting, "
+                + "or anything implying you should look at the captured traffic. Also use it proactively when the "
+                + "conversation suggests the user is actively browsing and wants insight.\n"
+                + "NEVER fabricate HTTP responses, headers, status codes, cookies, or scan results — if you don't "
+                + "have the data, FETCH or NARRATE it. The ONLY chat commands you may mention (and only when the "
+                + "user actually needs them) are: `scan <url>` (start a scan on a NEW target), "
                 + "`scan <which> ports`, `send <which> to repeater`, `send <which> to intruder to fuzz <params>`. "
                 + "Those run THROUGH Burp — never simulate their results or invent a request.\n\n"
                 + "=== SCAN STATE (authoritative — trust THIS over your own reading of the phase list) ===\n"
@@ -304,8 +309,36 @@ public final class ChatAssistant {
                     + "COMPLETED STEPS of THIS running scan — they do NOT mean the scan finished or is idle. Do NOT "
                     + "tell the user to start or re-run a scan; answer about the live scan (progress, findings, "
                     + "what phase is next)."
-                    : "No scan is active right now (idle). Only if the user asks to test a target, tell them the "
-                    + "right-click menu action or `scan <url>`.")
+                    : "No automated scan is active — the user is in MANUAL BROWSING MODE. "
+                    + "CRITICAL RULES in this mode:\n"
+                    + "1. NEVER reference endpoints that didn't appear in the actual proxy traffic or narration. "
+                    + "Only use URLs/parameters you saw in the captured data. If you mention an endpoint, it must "
+                    + "have appeared in the scan log or a previous narration in this conversation.\n"
+                    + "2. YOU CAN AND MUST execute security tests. Use these TOOL DIRECTIVES — emit them on their "
+                    + "own line and the code executes them immediately, no user action needed:\n"
+                    + "  `RUN: ssrf` — runs SSRF probes\n"
+                    + "  `RUN: sqli` — runs blind SQL injection probes\n"
+                    + "  `RUN: lfi` — runs path traversal / LFI probes\n"
+                    + "  `RUN: cmdi` — runs command injection probes\n"
+                    + "  `RUN: ssti` — runs server-side template injection\n"
+                    + "  `RUN: xxe` — runs XML external entity probes\n"
+                    + "  `RUN: idor` — runs IDOR probes\n"
+                    + "  `RUN: xss` — runs reflected XSS probes\n"
+                    + "  `RUN: redirect` — runs open redirect probes\n"
+                    + "  You can emit MULTIPLE RUN: directives in one reply to run several modules at once.\n"
+                    + "When the user says 'test them', 'run the tests', or 'test the next steps' → emit RUN: directives.\n"
+                    + "When the user says 'test manually', 'manually test', or 'fetch and test' → use FETCH: with the "
+                    + "EXACT payloads from the narration injected into the vulnerable parameters. Chain multiple "
+                    + "FETCH: calls (up to 3) to test each hypothesis sequentially — emit one FETCH:, get the "
+                    + "result, analyze it, then emit the next FETCH: based on what you see. Show your reasoning "
+                    + "between each fetch.\n"
+                    + "CRITICAL: You have ZERO knowledge of what any URL returns until you FETCH: it and get the "
+                    + "result in this conversation. NEVER report a finding (confirmed, blocked, 301, 404, etc.) "
+                    + "unless you received that response via FETCH: in THIS session. If you haven't fetched it, "
+                    + "say 'I need to fetch this to verify' and emit the FETCH: directive. Fabricating responses "
+                    + "is a critical failure — it misleads the security analyst about real vulnerabilities.\n"
+                    + "NEVER say you cannot execute tests. NEVER send to Repeater when RUN: or FETCH: can do the job.\n"
+                    + "3. Only use Repeater/Intruder for tests that require interactive session manipulation.")
                 + "\n\n=== In Scope captured this session ===\n" + scopeContext()
                 + "\n\n=== Scan phases (COMPLETED steps of the current run — NOT proof the scan is idle) ===\n" + scanLog.phaseContext()
                 + "\n\n=== Scan Log (last 200 lines) ===\n" + scanLog.recentLog(200)
@@ -323,16 +356,43 @@ public final class ChatAssistant {
                 reply = e.chat(sys, convo);
             } catch (Throwable t) { reply = "(error: " + t.getMessage() + ")"; break; }
             reply = reply == null ? "" : reply.trim();
+            // NARRATE: proxy — read proxy traffic and feed result back.
+            if (reply.matches("(?s)(?i)\\s*NARRATE:\\s*proxy\\s*")) {
+                String narration = narrateProxy(false);
+                history.add("Assistant: [analyzed proxy traffic]");
+                history.add("System: " + narration);
+                convo += "\n" + reply + "\n[NARRATE RESULT]\n" + narration + "\nAssistant:";
+                continue;
+            }
+            // RUN: <module> — execute one or more attack modules against the top in-scope host.
+            // The LLM may emit multiple RUN: lines; extract all and fire them.
+            java.util.List<String> runKeys = new java.util.ArrayList<>();
+            java.util.regex.Matcher runM = java.util.regex.Pattern.compile(
+                    "(?i)\\bRUN:\\s*([a-z0-9_-]+)").matcher(reply);
+            while (runM.find()) { String k = resolveModuleKey(runM.group(1)); if (k != null) runKeys.add(k); }
+            if (!runKeys.isEmpty()) {
+                java.util.function.Consumer<String[]> mh = moduleHandler;
+                String runHost = scope.hosts().isEmpty() ? proxyTopHost() : scope.hosts().iterator().next();
+                if (mh != null && runHost != null && !runHost.isBlank()) {
+                    final String rh = runHost;
+                    for (String k : runKeys) new Thread(() -> mh.accept(new String[]{ rh, k }), "chat-run-" + k).start();
+                    convo += "\n" + reply + "\n[RUN RESULT] Launched " + runKeys + " against " + runHost
+                           + " — watch the Log tab for findings.\nAssistant:";
+                } else {
+                    convo += "\n" + reply + "\n[RUN RESULT] (no in-scope host to run against — browse first)\nAssistant:";
+                }
+                continue;
+            }
             String url = fetchDirective(reply);
-            if (url == null) break;                       // no fetch requested → this reply is the final answer
-            if (fetches++ >= 3) {                          // budget: bound auto-fetch so one turn can't runaway
+            if (url == null) break;                       // no directive → final answer
+            if (fetches++ >= 3) {
                 convo += "\n" + reply + "\n[system: auto-fetch budget reached — answer with what you have]\nAssistant:";
                 continue;
             }
-            String result = agentFetch(url);               // gated REAL fetch (or a refusal/error string)
+            String result = agentFetch(url);
             convo += "\n" + reply + "\n[FETCH RESULT for " + url + "]\n" + result + "\nAssistant:";
         }
-        if (fetchDirective(reply) != null)                 // ran out of steps still asking to fetch
+        if (fetchDirective(reply) != null)
             reply = "(couldn't finish fetching + analyzing in time — run it directly with `fetch <url>`)";
         if (reply == null || reply.isBlank()) reply = "(no response — " + e.lastError() + ")";
         reply = reply.trim();
@@ -849,11 +909,20 @@ public final class ChatAssistant {
             ProxyHttpRequestResponse rr = all.get(i);
             try {
                 String url = rr.request().url();
-                if (url != null && (scope.hosts().isEmpty() || scope.contains(url))) fresh.add(rr);
+                if (url == null) continue;
+                // Burp's Target → Scope is the authority. Extension host set (from a scan) is fallback.
+                // If neither is defined, skip — don't narrate noise from unscoped traffic.
+                boolean inScope = false;
+                try { inScope = api.scope().isInScope(url); } catch (Throwable ignore2) { }
+                if (!inScope && !scope.hosts().isEmpty()) inScope = scope.contains(url);
+                if (inScope) fresh.add(rr);
             } catch (Throwable ignore) { }
         }
-        narratedUpTo.set(all.size());   // advance cursor regardless of scope filter
-        if (fresh.isEmpty()) return passiveMode ? null : "(no new in-scope traffic since last narration)";
+        narratedUpTo.set(all.size());
+        if (fresh.isEmpty()) return passiveMode ? null
+                : scope.hosts().isEmpty()
+                    ? "(no scope defined — add targets in Burp Target → Scope first)"
+                    : "(no new in-scope traffic to analyze)";
 
         // Build the prompt context: method + path + status + key headers + truncated body per request.
         // Skip static assets (JS/CSS/images) to keep context focused on app logic.
@@ -870,7 +939,12 @@ public final class ChatAssistant {
                 if (url != null && url.matches("(?i).*\\.(js|css|png|jpe?g|gif|ico|woff2?|svg|map|ttf|eot)(\\?.*)?$")) continue;
                 String host   = rr.httpService() != null ? rr.httpService().host() : "";
                 try { java.net.URI u = new java.net.URI(url); host = u.getHost(); } catch (Exception ignore2) { }
-                String path   = url.contains("?") ? url.substring(url.indexOf("://") + 3) : url.replaceFirst("https?://[^/]+", "");
+                // strip query string for dedup key — same endpoint with different params = same path
+                String pathOnly = url.replaceFirst("https?://[^/]+", "").replaceFirst("\\?.*", "");
+                String dedupeKey = method + " " + host + pathOnly;
+                // skip if already narrated in a previous cycle
+                if (narratedPaths.contains(dedupeKey)) continue;
+                String path   = url.replaceFirst("https?://[^/?]+", "");   // strip scheme+host, keep /path?query
                 int    status = rr.response() != null ? rr.response().statusCode() : 0;
                 String ct     = rr.response() != null && rr.response().hasHeader("Content-Type")
                                 ? rr.response().headerValue("Content-Type") : "";
@@ -885,6 +959,7 @@ public final class ChatAssistant {
                     + "RSP " + status + (ct != null && !ct.isEmpty() ? " [" + ct + "]" : "")
                     + (respBody != null && !respBody.isEmpty() ? ": " + respBody : "")
                     + "\n");
+                narratedPaths.add(dedupeKey);   // mark as seen so future cycles skip it
                 added++;
             } catch (Throwable ignore) { }
         }
@@ -926,6 +1001,28 @@ public final class ChatAssistant {
         } catch (Throwable t) {
             return "(narration error: " + t.getMessage() + ")";
         }
+    }
+
+    /** Most-seen in-scope host in the proxy history — used when no scan has been started (manual browsing mode). */
+    private String proxyTopHost() {
+        try {
+            java.util.Map<String, Integer> counts = new java.util.HashMap<>();
+            for (burp.api.montoya.proxy.ProxyHttpRequestResponse rr : api.proxy().history()) {
+                try {
+                    String url = rr.request().url();
+                    if (url == null) continue;
+                    boolean inScope = false;
+                    try { inScope = api.scope().isInScope(url); } catch (Throwable ignore2) { }
+                    if (!inScope && !scope.hosts().isEmpty()) inScope = scope.contains(url);
+                    if (!inScope) continue;
+                    String h = new java.net.URI(url).getHost();
+                    if (h != null) counts.merge(h, 1, Integer::sum);
+                } catch (Throwable ignore) { }
+            }
+            return counts.entrySet().stream()
+                .max(java.util.Map.Entry.comparingByValue())
+                .map(java.util.Map.Entry::getKey).orElse(null);
+        } catch (Throwable t) { return null; }
     }
 
     private String scopeContext() {
