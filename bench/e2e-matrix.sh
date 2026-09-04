@@ -301,21 +301,7 @@ OVERRIDE
     curl -s -o /dev/null -m5 "http://localhost:8510/api/tags" 2>/dev/null && { say "  capital: backend reachable (i=$i)"; break; }
     sleep 5
   done
-  # Register a test user and capture the JWT bearer token for the scanner session.
-  curl -s -m10 -X POST "http://localhost:8510/api/users" \
-    -H "Content-Type: application/json" \
-    -d '{"user":{"username":"aiscbot","email":"aiscbot@mailinator.com","password":"Aiscpass1!"}}' >/dev/null 2>&1 || true
-  local tok
-  tok=$(curl -s -m10 -X POST "http://localhost:8510/api/v2/users/login" \
-    -H "Content-Type: application/json" \
-    -d '{"user":{"email":"aiscbot@mailinator.com","password":"Aiscpass1!"}}' 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('user',{}).get('token',''))" 2>/dev/null)
-  if [ -n "$tok" ]; then
-    export AISCANNER_BEARER="$tok"
-    say "  capital: bearer token captured (${#tok} chars) — scanner will use authenticated session"
-  else
-    say "  [warn] capital: login failed — scanner will run unauthenticated"
-  fi
+  say "  capital: backend ready — scanner will auto-register via Postman spec"
 }
 teardown_capital(){
   local dir="/tmp/capital-src"
@@ -636,7 +622,6 @@ for tname in $PRIORITY; do
       case "$tname" in   # per-target creds for the scanner's LLM-login (apps whose creds aren't in the default list)
         aspgoat)  export AISCANNER_LOGIN_EMAIL=admin AISCANNER_LOGIN_PASSWORD=admin123;;
         nodegoat) export AISCANNER_LOGIN_EMAIL=admin AISCANNER_LOGIN_PASSWORD=Admin_123;;
-        capital)  export AISCANNER_LOGIN_EMAIL=aiscbot@mailinator.com AISCANNER_LOGIN_PASSWORD='Aiscpass1!';;
         *)        unset AISCANNER_LOGIN_EMAIL AISCANNER_LOGIN_PASSWORD;;
       esac
       case "$tname" in   # per-target module scoping: skip the full battery for single-purpose targets

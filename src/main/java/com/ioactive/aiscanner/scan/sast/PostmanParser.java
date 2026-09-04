@@ -66,13 +66,28 @@ public final class PostmanParser {
             JSONObject op = new JSONObject().put("requestBody", new JSONObject().put("content",
                     new JSONObject().put("application/json", new JSONObject().put("schema",
                             new JSONObject().put("type", "object").put("properties", props)))));
-            // Carry the collection's EXAMPLE body verbatim (x-example): it holds the real demo credentials the
-            // author shipped (e.g. {"email":"test@test.com","password":"test123"}). The auth bootstrap replays it
-            // directly (register-then-login with the SAME creds) instead of only synthesizing guesses.
+            // Carry the collection's EXAMPLE body as x-example so the auth bootstrap knows the EXACT request
+            // structure (including nested wrappers like {"user":{...}} used by RealWorld/FastAPI apps).
+            // When the body has Postman template vars ({{email}}), substitute them with synthetic placeholders
+            // so the STRUCTURE is preserved — the bootstrap will substitute real credentials at runtime.
             JSONObject bodyObj = req.optJSONObject("body");
             if (bodyObj != null && "raw".equals(bodyObj.optString("mode"))) {
                 String rawB = bodyObj.optString("raw", "").trim();
-                if (rawB.startsWith("{") && !rawB.contains("{{")) op.put("x-example", rawB);
+                if (rawB.startsWith("{")) {
+                    if (!rawB.contains("{{")) {
+                        op.put("x-example", rawB);   // verbatim: has real demo credentials
+                    } else {
+                        // Substitute {{var}} placeholders with type-guessed values, preserving the nesting.
+                        // The auth bootstrap will later overwrite email/password/username with its own nonce.
+                        String resolved = rawB
+                            .replaceAll("\\{\\{[^}]*(?i)email[^}]*\\}\\}", "aisc@mailinator.com")
+                            .replaceAll("\\{\\{[^}]*(?i)pass[^}]*\\}\\}", "Aiscpass1!")
+                            .replaceAll("\\{\\{[^}]*(?i)user[^}]*\\}\\}", "aiscbot")
+                            .replaceAll("\\{\\{[^}]*(?i)name[^}]*\\}\\}", "aiscbot")
+                            .replaceAll("\\{\\{[^}]*\\}\\}", "aiscvalue");   // any remaining var → generic value
+                        if (!resolved.contains("{{")) op.put("x-example", resolved);
+                    }
+                }
             }
             JSONObject item = paths.optJSONObject(path);
             if (item == null) { item = new JSONObject(); paths.put(path, item); }
@@ -214,7 +229,19 @@ public final class PostmanParser {
         if ("raw".equals(mode)) {
             String raw = body.optString("raw", "").trim();
             if (raw.startsWith("{")) {
-                try { for (String k : new JSONObject(raw).keySet()) addKey(keys, k); } catch (Exception ignore) { }
+                try {
+                    JSONObject parsed = new JSONObject(raw);
+                    for (String k : parsed.keySet()) {
+                        Object v = parsed.opt(k);
+                        if (v instanceof JSONObject) {
+                            // Flatten one level: {"user":{"email":"...","password":"..."}} → email, password
+                            // This lets bodyHasCredentials() see the actual credential fields even when wrapped.
+                            for (String nk : ((JSONObject) v).keySet()) addKey(keys, nk);
+                        } else {
+                            addKey(keys, k);
+                        }
+                    }
+                } catch (Exception ignore) { }
             }
         } else if ("urlencoded".equals(mode) || "formdata".equals(mode)) {
             JSONArray arr = body.optJSONArray(mode);
