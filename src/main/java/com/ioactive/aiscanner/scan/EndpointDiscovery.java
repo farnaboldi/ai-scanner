@@ -1533,7 +1533,29 @@ public final class EndpointDiscovery {
                 String uf = cf != null ? cf[0] : "username";
                 String pf = cf != null ? cf[1] : "password";
                 String extra = extraRequiredFields(loginOps.get(loginPath), uf, pf);   // e.g. ,"op":"basic"
-                String url = root + (loginPath.startsWith("/") ? loginPath : "/" + loginPath);
+                // Build the candidate URL. When the path from a Postman collection omits the API prefix
+                // (e.g. "/v2/users/login" instead of "/api/v2/users/login" because the prefix is stored in
+                // a {{APIURL}} variable), the bare path hits a 404. We try the common prefix variants
+                // (/api, /api/v1, /v1) as fallbacks so the auth bootstrap finds the actual mount point.
+                String rawUrl = root.replaceAll("/+$", "") + (loginPath.startsWith("/") ? loginPath : "/" + loginPath);
+                rawUrl = rawUrl.replaceAll("//+", "/").replaceFirst(":/", "://");  // normalise double-slash
+                // Probe whether the path actually responds; if not, try with /api prefix.
+                String url = rawUrl;
+                {
+                    HttpRequestResponse probe0 = probe(HttpRequest.httpRequestFromUrl(rawUrl).withMethod("POST")
+                            .withHeader("Content-Type", "application/json").withBody("{}"));
+                    int s0 = statusOf(probe0);
+                    if (s0 == 404 || s0 == 0) {
+                        for (String pfx : new String[]{"/api", "/api/v1", "/v1", "/v2", "/api/v2"}) {
+                            String candidate = root.replaceAll("/+$", "") + pfx + (loginPath.startsWith("/") ? loginPath : "/" + loginPath);
+                            candidate = candidate.replaceAll("//+", "/").replaceFirst(":/", "://");
+                            HttpRequestResponse p0 = probe(HttpRequest.httpRequestFromUrl(candidate).withMethod("POST")
+                                    .withHeader("Content-Type", "application/json").withBody("{}"));
+                            int ps = statusOf(p0);
+                            if (ps != 404 && ps != 0) { url = candidate; break; }
+                        }
+                    }
+                }
                 // Try the collection's OWN example body FIRST (real demo creds) — a seeded account logs in directly;
                 // then the synthesized guesses. (x-example is set only when a Postman collection seeded this op.)
                 List<String> bodies = new ArrayList<>();
@@ -1590,13 +1612,19 @@ public final class EndpointDiscovery {
                 String[] rcf = credentialFieldNames(loginOps.get(regPath)), lcf = credentialFieldNames(loginOps.get(logPath));
                 String rpf = (rcf != null && rcf.length > 1 && rcf[1] != null) ? rcf[1] : "password";
                 String lpf = (lcf != null && lcf.length > 1 && lcf[1] != null) ? lcf[1] : "password";
-                String regUrl = root + (regPath.startsWith("/") ? regPath : "/" + regPath);
-                String logUrl = root + (logPath.startsWith("/") ? logPath : "/" + logPath);
+                String regUrl = resolveApiUrl(root, regPath);
+                String logUrl = resolveApiUrl(root, logPath);
                 // Prefer the collection's OWN example bodies (a Postman collection ships register + login with the
                 // SAME demo creds, e.g. test@test.com/test123) — register creates that account, login returns its
                 // token. Falls back to synthesized nonce creds (superCreds) when no example was shipped.
                 String regBody = loginOps.get(regPath).optString("x-example", "");
                 String logBody = loginOps.get(logPath).optString("x-example", "");
+                // Substitute the nonce credentials into the x-example body (which may carry a nested structure like
+                // {"user":{"email":"...","password":"..."}} from a RealWorld/FastAPI Postman collection). This replaces
+                // the placeholder values from PostmanParser with the actual unique-per-run email/password/username so we
+                // don't collide with prior registrations while still preserving the wrapper structure the app requires.
+                if (!regBody.isBlank()) regBody = substituteNonceCreds(regBody, tag, email, pass);
+                if (!logBody.isBlank()) logBody = substituteNonceCreds(logBody, tag, email, pass);
                 if (regBody.isBlank()) regBody = superCreds(tag, email, pass, rpf);
                 if (logBody.isBlank()) logBody = superCreds(tag, email, pass, lpf);
                 try {
@@ -1641,7 +1669,10 @@ public final class EndpointDiscovery {
                             // The recipe that just authenticated A is a PROVEN register→login path for this app —
                             // replay it with fresh nonce creds to mint identity B, so cross-user authz probes get a
                             // real second user even when the AutonomousAuth B-path can't (FastAPI form-token /token).
-                            mintSecondaryViaRecipe(regUrl, logUrl, regPath, logPath, rpf, lpf, tok);
+                            // Pass the x-example templates so identity B uses the same nested structure as A.
+                            String regExTpl = loginOps.get(regPath).optString("x-example", "");
+                            String logExTpl = loginOps.get(logPath).optString("x-example", "");
+                            mintSecondaryViaRecipe(regUrl, logUrl, regPath, logPath, rpf, lpf, tok, regExTpl, logExTpl);
                             return;
                         }
                     }
@@ -1658,11 +1689,20 @@ public final class EndpointDiscovery {
      *  Best-effort and idempotent: no-op if a second identity already exists, on any failure, or if B == A. */
     private void mintSecondaryViaRecipe(String regUrl, String logUrl, String regPath, String logPath,
                                         String rpf, String lpf, String aBearer) {
+        mintSecondaryViaRecipe(regUrl, logUrl, regPath, logPath, rpf, lpf, aBearer, "", "");
+    }
+    private void mintSecondaryViaRecipe(String regUrl, String logUrl, String regPath, String logPath,
+                                        String rpf, String lpf, String aBearer,
+                                        String regBodyTemplate, String logBodyTemplate) {
         try {
             if (session == null || session.hasSecondIdentity()) return;
             long n = Math.abs(System.nanoTime());
             String tag = "aisc" + Long.toString(n, 36), pass = "Aisc!" + (n % 100000) + "Zx", email = tag + "@example.com";
-            String rb = superCreds(tag, email, pass, rpf), logBody = superCreds(tag, email, pass, lpf);
+            // Use the same body structure (nested wrappers) that succeeded for identity A.
+            String rb = regBodyTemplate.isBlank() ? superCreds(tag, email, pass, rpf)
+                                                   : substituteNonceCreds(regBodyTemplate, tag, email, pass);
+            String logBody = logBodyTemplate.isBlank() ? superCreds(tag, email, pass, lpf)
+                                                        : substituteNonceCreds(logBodyTemplate, tag, email, pass);
             for (int round = 0; round < 5; round++) {           // register B (bare, adaptive fill) — same as A
                 HttpRequestResponse rg = probe(HttpRequest.httpRequestFromUrl(regUrl).withMethod("POST")
                         .withHeader("Content-Type", "application/json").withBody(rb));
@@ -1765,6 +1805,56 @@ public final class EndpointDiscovery {
             }
             return sb.length() == 0 ? null : sb.toString();
         } catch (Exception e) { return null; }
+    }
+
+    /** Replace email, password, and username values anywhere in a JSON body (including nested objects like
+     *  {"user":{"email":"...","password":"..."}} used by RealWorld/FastAPI apps) with the nonce credentials.
+     *  Preserves the wrapper structure, which is essential for apps that reject flat credential bodies. */
+    private static String substituteNonceCreds(String body, String tag, String email, String pass) {
+        if (body == null || body.isBlank()) return body;
+        try {
+            JSONObject root = new JSONObject(body);
+            substituteCredsInObject(root, tag, email, pass);
+            return root.toString();
+        } catch (Exception e) { return body; }
+    }
+
+    /** Build a URL for a spec path, retrying with common API prefixes (/api, /v1 …) when the bare path 404s.
+     *  Fixes Postman collections that store the API prefix in a {{APIURL}} variable — the path is relative
+     *  to that base, so the extracted path ("/v2/users/login") misses the mount point ("/api"). */
+    private String resolveApiUrl(String root, String path) {
+        String base = root.replaceAll("/+$", "");
+        String bare = base + (path.startsWith("/") ? path : "/" + path);
+        bare = bare.replaceAll("//+", "/").replaceFirst(":/", "://");
+        try {
+            HttpRequestResponse pr = probe(HttpRequest.httpRequestFromUrl(bare).withMethod("POST")
+                    .withHeader("Content-Type", "application/json").withBody("{}"));
+            if (statusOf(pr) != 404 && statusOf(pr) != 0) return bare;
+        } catch (Exception ignore) { }
+        for (String pfx : new String[]{"/api", "/api/v1", "/v1", "/v2", "/api/v2"}) {
+            String cand = base + pfx + (path.startsWith("/") ? path : "/" + path);
+            cand = cand.replaceAll("//+", "/").replaceFirst(":/", "://");
+            try {
+                HttpRequestResponse pr = probe(HttpRequest.httpRequestFromUrl(cand).withMethod("POST")
+                        .withHeader("Content-Type", "application/json").withBody("{}"));
+                if (statusOf(pr) != 404 && statusOf(pr) != 0) return cand;
+            } catch (Exception ignore) { }
+        }
+        return bare;   // fallback to bare — may still work or fail gracefully
+    }
+
+    private static void substituteCredsInObject(JSONObject obj, String tag, String email, String pass) {
+        for (String k : obj.keySet()) {
+            Object v = obj.opt(k);
+            if (v instanceof JSONObject) {
+                substituteCredsInObject((JSONObject) v, tag, email, pass);
+            } else if (v instanceof String) {
+                String lk = k.toLowerCase();
+                if (lk.contains("email"))                       obj.put(k, email);
+                else if (lk.matches("(?i).*(password|pwd|pass).*")) obj.put(k, pass);
+                else if (lk.matches("(?i).*(user(name)?|login|handle).*")) obj.put(k, tag);
+            }
+        }
     }
 
     private static String superCreds(String tag, String email, String pass, String pf) {
