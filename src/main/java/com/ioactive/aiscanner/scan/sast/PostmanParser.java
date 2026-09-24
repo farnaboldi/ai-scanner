@@ -96,6 +96,30 @@ public final class PostmanParser {
         return paths.length() > 0 ? new JSONObject().put("paths", paths) : null;
     }
 
+    /**
+     * Detect the Authorization header prefix used by authenticated requests in the Postman collection
+     * (e.g. "Token" for RealWorld/capital apps, "Bearer" for standard OAuth2). Returns "Bearer" as
+     * the default when no Authorization header is found in the collection.
+     */
+    public static String detectAuthPrefix(String repoPath) {
+        for (JSONObject req : collectRequests(repoPath)) {
+            JSONArray headers = req.optJSONArray("header");
+            if (headers == null) continue;
+            for (int i = 0; i < headers.length(); i++) {
+                JSONObject h = headers.optJSONObject(i);
+                if (h == null) continue;
+                String key = h.optString("key", "");
+                String val = h.optString("value", "");
+                if ("Authorization".equalsIgnoreCase(key) && val.contains(" ")) {
+                    String prefix = val.split(" ")[0].trim();
+                    // Skip template-only values like "{{token}}" with no prefix
+                    if (!prefix.startsWith("{{") && !prefix.isBlank()) return prefix;
+                }
+            }
+        }
+        return "Bearer";   // standard default
+    }
+
     /** All leaf {@code request} objects across every Postman collection under {@code repoPath} (bounded). */
     private static List<JSONObject> collectRequests(String repoPath) {
         List<JSONObject> out = new ArrayList<>();

@@ -62,6 +62,15 @@ public final class CommandInjectionProbe extends Probe {
             "(?i)(^|[_-])(cmd|command|exec|ping|host|hostname|ip|addr|address|target|url|domain|dns|nslookup|"
             + "file|path|name|arg|args|option|opt|id)([_-]|$)");
 
+    // Echo-canary separators for stdout-reflection oracle (ordered: least-filtered first).
+    private static final String[] ECHO_SEPS = { "; echo ", " && echo ", "\necho ", "| echo " };
+    // Sequential nonce to guarantee echo-canary uniqueness across invocations.
+    private static final java.util.concurrent.atomic.AtomicInteger NONCE = new java.util.concurrent.atomic.AtomicInteger();
+    // Common API-prefix variants to retry when the synthesised path returns 404.
+    private static final String[] API_PREFIXES = { "/api", "/api/v1", "/api/v2", "/v1", "/v2" };
+    // Common single-key wrappers that apps use around their payload (e.g. {"body":{…}}).
+    private static final String[] WRAP_KEYS = { "body", "data", "request", "params", "input", "payload" };
+
     /** Hint-driven pass: synthesize a concrete request for every command/eval sink the source pins, and confirm. */
     public int probeHints(String host, Function<HttpRequest, HttpRequest> withSession, String base) {
         if (sourceHints == null || base == null) return 0;
@@ -71,6 +80,59 @@ public final class CommandInjectionProbe extends Probe {
             HttpRequest req = synthesize(h, base);
             if (req == null) continue;
             try { req = withSession.apply(req); } catch (Throwable ignore) { }
+
+            // Path-prefix retry: SAST extracts bare paths (/debug) but APIs often live under /api/debug.
+            // If the synthesised path gets a 404, probe common prefix variants before giving up.
+            HttpRequestResponse probe0 = send(req);
+            if (probe0 != null && probe0.response() != null && probe0.response().statusCode() == 404) {
+                String rawPath = java.net.URI.create(req.url()).getPath();
+                HttpRequest found = null;
+                for (String pfx : API_PREFIXES) {
+                    String candidate = req.url().replace(rawPath, pfx + rawPath);
+                    HttpRequest cr = req.withPath(java.net.URI.create(candidate).getPath());
+                    HttpRequestResponse pr = send(cr);
+                    if (pr != null && pr.response() != null && pr.response().statusCode() != 404) {
+                        found = cr;
+                        try { found = withSession.apply(found); } catch (Throwable ignore) { }
+                        break;
+                    }
+                }
+                if (found != null) req = found;
+            }
+
+            // Body-wrapper retry: synthesise builds flat {"command":"1"} but many APIs expect {"body":{"command":"1"}}.
+            // If the flat body is rejected (4xx), probe each common wrapper key with multiple seeds — the endpoint
+            // may also whitelist/validate the VALUE (not just the structure), so "1" may be rejected while
+            // "uptime" is accepted. Both wrapper key and seed must be found together.
+            final String synBody = req.bodyToString();
+            if (synBody != null && synBody.trim().startsWith("{")) {
+                HttpRequestResponse cur = send(req);
+                if (cur != null && cur.response() != null && cur.response().statusCode() >= 400) {
+                    boolean wrappedTested = false;
+                    String[] wrapSeeds = { seed(h.paramName), "uptime", "ls", "id", "whoami", "dir", "" };
+                    wrapSearch:
+                    for (String wk : WRAP_KEYS) {
+                        for (String ws : wrapSeeds) {
+                            String wrapped = "{\"" + wk + "\":{\"" + h.paramName + "\":\"" + ws + "\"}}";
+                            HttpRequest wr = req.withBody(wrapped);
+                            HttpRequestResponse pr = send(wr);
+                            if (pr != null && pr.response() != null && pr.response().statusCode() < 400) {
+                                final String wkFinal = wk; final HttpRequest wrFinal = wr; final String wsFinal = ws;
+                                String wlabel = h.paramName + " @ " + h.path
+                                        + " (in \"" + wk + "\" wrapper)  " + h.provenance();
+                                if (confirmWith(wrFinal,
+                                        v -> setNestedBodyParam(wrFinal, wkFinal, h.paramName, v),
+                                        wsFinal, wlabel, true)) hits++;
+                                wrappedTested = true;
+                                break wrapSearch;
+                            }
+                        }
+                    }
+                    if (wrappedTested) continue;   // found a valid wrapper — skip flat confirm
+                    continue;   // no wrapper worked either — endpoint fully rejects our params
+                }
+            }
+
             String label = h.paramName + " @ " + h.path + "  " + h.provenance();
             if (confirm(req, h.paramName, label, true)) hits++;
         }
@@ -78,34 +140,90 @@ public final class CommandInjectionProbe extends Probe {
     }
 
     /** Generic pass over an already-discovered request: test its params (arithmetic always; time-based only on
-     *  command-ish names to bound cost). Complements the hint pass for surface the crawler DID reach. */
+     *  command-ish names to bound cost). Also drills one level into single-key JSON wrappers so params like
+     *  {"body":{"command":"…"}} are reached even when the top-level key is not command-ish. */
     public boolean probe(HttpRequest req) {
         try {
             if (req == null) return false;
-            boolean any = false;
+            // Top-level params (URL + BODY)
             for (ParsedHttpParameter p : req.parameters()) {
                 if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;
                 boolean timeBased = CMDISH.matcher(p.name()).find();
-                if (confirm(req, p.name(), p.name() + " (" + p.type() + ")", timeBased)) { any = true; break; }
+                if (confirm(req, p.name(), p.name() + " (" + p.type() + ")", timeBased)) return true;
             }
-            return any;
+            // Nested JSON drilling: {"wrapper":{"command":"…"}} — top-level key is not command-ish but inner is.
+            String body = req.bodyToString();
+            if (body != null && body.trim().startsWith("{")) {
+                try {
+                    org.json.JSONObject top = new org.json.JSONObject(body);
+                    if (top.length() == 1) {
+                        String wrapKey = top.keys().next();
+                        Object wrapVal = top.opt(wrapKey);
+                        if (wrapVal instanceof org.json.JSONObject) {
+                            org.json.JSONObject inner = (org.json.JSONObject) wrapVal;
+                            for (String k : inner.keySet()) {
+                                if (!CMDISH.matcher(k).find()) continue;
+                                String label = k + " (nested in \"" + wrapKey + "\") (BODY)";
+                                if (confirmWith(req, v -> setNestedBodyParam(req, wrapKey, k, v),
+                                        seed(k), label, true)) return true;
+                            }
+                        }
+                    }
+                } catch (Throwable ignore) { }
+            }
+            return false;
         } catch (Throwable t) { scanLog.debug("cmdi probe error: " + t); return false; }
     }
 
-    /** Run the eval (always) + time-based (when enabled) oracles on one param of one request. */
-    private boolean confirm(HttpRequest req, String param, String label, boolean timeBased) {
+    // Fallback seeds for whitelisted/restricted command endpoints (tried when the primary seed is blocked).
+    // "uptime" heads the list because many security CTFs/labs whitelist it specifically.
+    private static final String[] CMD_SEEDS = { "uptime", "ls", "id", "whoami", "dir", "echo 1", "" };
+
+    /** Run all oracles on one param via a supplied value-injector:
+     *  (1) eval/SSJS arithmetic (always) — cheapest, no delay;
+     *  (2) echo-canary stdout-reflection (command-ish only) — no delay, works when timing is filtered;
+     *  (3) time-based sleep (command-ish only) — definitive even without stdout reflection. */
+    private boolean confirmWith(HttpRequest baseReq, Function<String, HttpRequest> inject,
+                                String seedVal, String label, boolean timeBased) {
         try {
-            HttpRequestResponse base = send(req);
-            if (base == null || base.response() == null) return false;
-            String baseBody = base.response().bodyToString();
-            // --- eval / SSJS: arithmetic oracle (cheap; run first) ---
-            if (baseBody == null || !baseBody.contains(String.valueOf(EV_PRODUCT))) {   // product must NOT be in baseline
+            HttpRequest seedReq = inject.apply(seedVal);
+            if (seedReq == null) return false;
+            HttpRequestResponse baseRR = send(seedReq);
+            if (baseRR == null || baseRR.response() == null) return false;
+            String baseBody = baseRR.response().bodyToString();
+
+            // Seed-fallback: if the initial seed is rejected (4xx — whitelist, validation, etc.),
+            // probe common command values until one is accepted. This lets the echo-canary and
+            // time-based oracles run even against endpoints that whitelist specific commands
+            // (e.g. {"whitelist":{"commands":["uptime"]}}).
+            if (timeBased && baseRR.response().statusCode() >= 400) {
+                String foundSeed = null;
+                HttpRequestResponse foundRR = null;
+                for (String alt : CMD_SEEDS) {
+                    if (alt.equals(seedVal)) continue;
+                    HttpRequest ar = inject.apply(alt);
+                    if (ar == null) continue;
+                    HttpRequestResponse ar2 = send(ar);
+                    if (ar2 != null && ar2.response() != null && ar2.response().statusCode() < 400) {
+                        foundSeed = alt; foundRR = ar2; break;
+                    }
+                }
+                if (foundSeed == null) return false;   // every seed blocked — not injectable via this oracle
+                seedVal  = foundSeed;
+                baseRR   = foundRR;
+                baseBody = foundRR.response().bodyToString();
+            }
+
+            // --- oracle 1: eval / SSJS arithmetic ---
+            if (baseBody == null || !baseBody.contains(String.valueOf(EV_PRODUCT))) {
                 for (String expr : EVAL_EXPRS) {
-                    HttpRequestResponse r = send(setParam(req, param, expr));
+                    HttpRequest er = inject.apply(expr);
+                    if (er == null) continue;
+                    HttpRequestResponse r = send(er);
                     if (r == null || r.response() == null) continue;
                     String b = r.response().bodyToString();
                     if (b != null && b.contains(String.valueOf(EV_PRODUCT))) {
-                        scanLog.found("Server-side code injection (eval)", req.url(),
+                        scanLog.found("Server-side code injection (eval)", baseReq.url(),
                                 label + " — injected `" + expr + "` evaluated to " + EV_PRODUCT
                                 + " in the response (arithmetic oracle: the value was computed, not echoed).", r);
                         scanLog.incFinding();
@@ -113,21 +231,40 @@ public final class CommandInjectionProbe extends Probe {
                     }
                 }
             }
-            // --- OS command: time-based oracle ---
+
             if (timeBased) {
-                String seed = firstValue(req, param);
-                if (seed == null || seed.isBlank()) seed = "127.0.0.1";
+                // --- oracle 2: echo-canary stdout-reflection (faster than sleep; run before time-based) ---
+                // Canary: fixed prefix + nonce. Lowercase hex avoids shell quoting issues.
+                String canary = "cmdi" + Integer.toHexString(NONCE.incrementAndGet() & 0xFFFF) + "ok";
+                for (String sep : ECHO_SEPS) {
+                    HttpRequest cr = inject.apply(seedVal + sep + canary);
+                    if (cr == null) continue;
+                    HttpRequestResponse r = send(cr);
+                    if (r == null || r.response() == null) continue;
+                    String rb = r.response().bodyToString();
+                    if (rb != null && rb.contains(canary)) {
+                        scanLog.found("OS command injection", baseReq.url(),
+                                label + " — echo canary \"" + canary + "\" appeared verbatim in the response "
+                                + "after injection via `" + sep.trim() + "`. The shell executed the injected "
+                                + "command (stdout-reflection oracle, zero false-positive).", r);
+                        scanLog.incFinding();
+                        return true;
+                    }
+                }
+
+                // --- oracle 3: time-based sleep ---
                 for (String sep : CMD_SEPARATORS) {
                     long t0 = System.nanoTime();
-                    HttpRequestResponse r = send(setParam(req, param, seed + sep));
+                    HttpRequest tr = inject.apply(seedVal + sep);
+                    if (tr == null) continue;
+                    HttpRequestResponse r = send(tr);
                     long dt = (System.nanoTime() - t0) / 1_000_000;
                     if (r != null && r.response() != null && dt >= DELAY_THRESHOLD_MS) {
-                        // confirm it's the injection (not a one-off network stall): a benign re-request is fast
                         long c0 = System.nanoTime();
-                        send(setParam(req, param, seed));
+                        send(inject.apply(seedVal));
                         long cdt = (System.nanoTime() - c0) / 1_000_000;
                         if (cdt < DELAY_THRESHOLD_MS) {
-                            scanLog.found("OS command injection", req.url(),
+                            scanLog.found("OS command injection", baseReq.url(),
                                     label + " — payload `" + sep.trim() + "` delayed the response " + dt
                                     + "ms (baseline " + cdt + "ms); the injected sleep executed.", r);
                             scanLog.incFinding();
@@ -138,6 +275,29 @@ public final class CommandInjectionProbe extends Probe {
             }
         } catch (Throwable t) { scanLog.debug("cmdi confirm error: " + t); }
         return false;
+    }
+
+    /** Convenience wrapper: top-level param injection (existing surface). */
+    private boolean confirm(HttpRequest req, String param, String label, boolean timeBased) {
+        String sv = firstValue(req, param);
+        if (sv == null || sv.isBlank()) sv = seed(param);
+        final String seedVal = sv;
+        return confirmWith(req, v -> setParam(req, param, v), seedVal, label, timeBased);
+    }
+
+    /** Build a request with {@code innerKey} updated inside a single-key JSON wrapper
+     *  (e.g. {@code {"body":{"command":"PAYLOAD"}}}). Returns null on any parse failure. */
+    private static HttpRequest setNestedBodyParam(HttpRequest req, String wrapKey, String innerKey, String value) {
+        try {
+            String body = req.bodyToString();
+            org.json.JSONObject top = (body != null && body.trim().startsWith("{"))
+                    ? new org.json.JSONObject(body) : new org.json.JSONObject();
+            org.json.JSONObject inner = top.optJSONObject(wrapKey);
+            if (inner == null) inner = new org.json.JSONObject();
+            inner.put(innerKey, value);
+            top.put(wrapKey, inner);
+            return req.withBody(top.toString()).withHeader("Content-Type", "application/json");
+        } catch (Throwable t) { return null; }
     }
 
     // ---- request synthesis from a hint ----
@@ -174,7 +334,9 @@ public final class CommandInjectionProbe extends Probe {
     }
 
     private static boolean isCmdOrEval(StaticHint h) {
-        String v = (h.vulnClass + " " + h.sinkType).toLowerCase();
+        // Include paramName: a param literally named "command"/"cmd"/"exec" is always a CMDI candidate
+        // even if the LLM didn't assign a command/eval vulnClass to the hint.
+        String v = (h.vulnClass + " " + h.sinkType + " " + h.paramName).toLowerCase();
         return v.contains("command") || v.contains("cmd") || v.contains("rce")
                 || v.contains("eval") || v.contains("code") || v.contains("exec");
     }

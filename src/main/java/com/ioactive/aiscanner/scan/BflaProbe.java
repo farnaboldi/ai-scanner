@@ -4,6 +4,8 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import com.ioactive.aiscanner.scan.sast.SourceFindings;
+import com.ioactive.aiscanner.scan.sast.StaticHint;
 import com.ioactive.aiscanner.ui.ScanLog;
 
 import java.net.URI;
@@ -56,26 +58,109 @@ public final class BflaProbe extends Probe {
     }
 
     public int probe(String host, String cookieHeader, String bearer) {
+        return probe(host, cookieHeader, bearer, "Bearer");
+    }
+
+    public int probe(String host, String cookieHeader, String bearer, String bearerPrefix) {
+        this.bearerPfx = bearerPrefix != null && !bearerPrefix.isBlank() ? bearerPrefix.trim() : "Bearer";
         int hits = 0;
         try {
             List<Cand> candidates = discover(host);
             for (Cand c : candidates) {
                 for (String method : METHODS) {
-                    if (oracle(c, method, cookieHeader, bearer)) { hits++; break; }   // one finding per candidate path
+                    if (oracle(c, method, cookieHeader, bearer)) { hits++; break; }
                 }
             }
-            hits += probeRoleFunctions(host, cookieHeader, bearer);   // directly-observed privileged-role functions
+            hits += probeRoleFunctions(host, cookieHeader, bearer);
+            hits += probeLeafAdminHints(host, cookieHeader, bearer);
         } catch (Throwable t) {
             scanLog.debug("BFLA probe error: " + t);
         }
         return hits;
     }
 
+    // Authorization prefix for the current scan session (e.g. "Token" for RealWorld APIs, "Bearer" for OAuth2).
+    private String bearerPfx = "Bearer";
+
+    private SourceFindings sourceHints;
+    public void setSourceHints(SourceFindings h) { this.sourceHints = h; }
+
+    // API prefix variants to try when a bare SAST hint path returns 404 — same list as CommandInjectionProbe.
+    private static final String[] API_PFXS = { "", "/api", "/api/v1", "/api/v2", "/v1", "/v2" };
+
     // A path segment naming a PRIVILEGED ROLE whose functions a normal user must not invoke. Staff/operator
     // roles — NOT user-facing nouns (customer/member/merchant/user), so a role-function gate won't fire on
     // e.g. /merchant/contact_mechanic (a user feature). Generic role vocabulary, not app-specific paths.
     private static final Pattern PRIV_ROLE = Pattern.compile(
             "(?i)^(admin|administrator|superuser|root|sysadmin|backoffice|mechanic|manager|staff|moderator|operator|employee|agent)$");
+
+    /**
+     * Third BFLA source: SAST-hinted leaf admin endpoints (e.g. GET /admin, GET /api/admin) that the
+     * site-map sources can't find because (a) the crawler never visited them (hidden from OpenAPI schema)
+     * and (b) EndpointDiscovery probed the bare path (/admin → 404) without trying API prefix variants.
+     * Resolves each hint against common prefixes to find the live URL, then applies the same triple oracle:
+     * unauth→denied (401/403), authed→2xx, junk-sibling→different-shape.
+     */
+    private int probeLeafAdminHints(String host, String cookie, String bearer) {
+        if (sourceHints == null || sourceHints.isEmpty()) return 0;
+        int hits = 0;
+        Set<String> seen = new LinkedHashSet<>();
+        try {
+            for (StaticHint h : sourceHints.all()) {
+                if (!h.hasEndpoint()) continue;
+                String method = (h.method == null || h.method.isBlank()) ? "GET" : h.method.toUpperCase();
+                if (!"GET".equals(method)) continue;
+                String hPath = h.path.startsWith("/") ? h.path : "/" + h.path;
+                // Only consider hints whose last path segment is a strong admin-tier role name
+                String[] segs = pathSegs(hPath);
+                if (segs.length == 0) continue;
+                String lastSeg = segs[segs.length - 1];
+                boolean isAdminLeaf = false;
+                for (String adm : ADMIN_TIER) { if (adm.equalsIgnoreCase(lastSeg)) { isAdminLeaf = true; break; } }
+                if (!isAdminLeaf) continue;
+
+                // Resolve the live URL: try bare path then common API prefix variants
+                String base = "http://" + host;   // scheme resolved from site map below if possible
+                for (burp.api.montoya.http.message.HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                    String u = rr.request().url();
+                    if (host.equalsIgnoreCase(hostOf(u))) {
+                        base = baseOf(u); break;
+                    }
+                }
+                String liveUrl = null;
+                HttpRequestResponse noAuthRR = null; int noAuthSt = 0;
+                for (String pfx : API_PFXS) {
+                    String candidate = base + pfx + hPath;
+                    HttpRequestResponse r = send("GET", candidate, null, null);
+                    int st = status(r);
+                    if (st == 401 || st == 403) { liveUrl = candidate; noAuthRR = r; noAuthSt = st; break; }
+                }
+                if (liveUrl == null || !seen.add(liveUrl)) continue;
+
+                // Step 2: our session must reach the handler (2xx)
+                HttpRequestResponse authRR = send("GET", liveUrl, cookie, bearer);
+                int authSt = status(authRR);
+                if (authSt < 200 || authSt >= 300) continue;
+
+                // Step 3: junk sibling path must differ in shape (proves it's a real handler, not catch-all)
+                String[] junkSegs = segs.clone(); junkSegs[segs.length - 1] = JUNK_NOUN;
+                // Reconstruct the junk URL with the same prefix as liveUrl
+                String livePrefix = liveUrl.substring(0, liveUrl.length() - hPath.length());
+                String junkUrl = livePrefix + "/" + String.join("/", junkSegs);
+                HttpRequestResponse ctrlRR = send("GET", junkUrl, cookie, bearer);
+                if (status(ctrlRR) == 0 || Net.shape(authRR).equals(Net.shape(ctrlRR))) continue;
+
+                scanLog.found("Broken Function Level Authorization (BFLA)", liveUrl,
+                        "GET reached the admin-tier endpoint '" + liveUrl + "' as a non-privileged user "
+                        + "(hint from SAST source). Evidence: [1] our-session=" + authSt + " (reached), "
+                        + "[2] no-session=" + noAuthSt + " (denied — auth-gated), "
+                        + "[3] junk-path differs → real handler, not catch-all.", authRR, noAuthRR, ctrlRR);
+                scanLog.incFinding();
+                hits++;
+            }
+        } catch (Throwable t) { scanLog.debug("BFLA leaf-admin-hints error: " + t); }
+        return hits;
+    }
 
     /**
      * Second BFLA source: a function DIRECTLY OBSERVED under a privileged-role segment (…/mechanic/… ,
@@ -98,6 +183,38 @@ public final class BflaProbe extends Probe {
                 String[] segs = pathSegs(req.pathWithoutQuery());
                 int roleIdx = -1;
                 for (int i = 0; i < segs.length - 1; i++) if (PRIV_ROLE.matcher(segs[i]).matches()) { roleIdx = i; break; }
+
+                // Leaf admin: the privileged-role segment IS the last segment (e.g. /api/admin).
+                // The non-leaf loop above skips these, but BFLA leaf endpoints are common — a function
+                // reachable by any authenticated user with no sub-path, no role check (capital /api/admin).
+                // Oracle: unauth→denied, authed→2xx, junk-sibling (replaces "admin" with junk) → differs.
+                if (roleIdx < 0 && segs.length >= 1 && PRIV_ROLE.matcher(segs[segs.length - 1]).matches()) {
+                    String leafUrl = baseOf(url) + "/" + String.join("/", segs);
+                    if (seen.add("leaf|" + leafUrl)) {
+                        String[] junkSegs = segs.clone(); junkSegs[segs.length - 1] = JUNK_NOUN;
+                        String junkUrl = baseOf(url) + "/" + String.join("/", junkSegs);
+                        HttpRequestResponse rNoAuth = send("GET", leafUrl, null, null);
+                        int sNoAuth = status(rNoAuth);
+                        if (sNoAuth == 401 || sNoAuth == 403) {
+                            HttpRequestResponse rAuth = send("GET", leafUrl, cookie, bearer);
+                            int sAuth = status(rAuth);
+                            if (sAuth >= 200 && sAuth < 300) {
+                                HttpRequestResponse ctrl = send("GET", junkUrl, cookie, bearer);
+                                if (status(ctrl) != 0 && !Net.shape(rAuth).equals(Net.shape(ctrl))) {
+                                    scanLog.found("Broken Function Level Authorization (BFLA)", leafUrl,
+                                            "GET reached the admin-tier leaf endpoint '" + String.join("/", segs)
+                                            + "' as a non-privileged user. Evidence: [1] our-session=" + sAuth
+                                            + " (reached), [2] no-session=" + sNoAuth
+                                            + " (denied — auth-gated), [3] junk-sibling differs → real handler.", rAuth, rNoAuth, ctrl);
+                                    scanLog.incFinding();
+                                    hits++;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if (roleIdx < 0) continue;                                       // role segment must exist and be NON-LEAF
                 int nounIdx = segs.length - 1;                                   // the function/noun after the role
                 if (nounIdx <= roleIdx) continue;
@@ -220,7 +337,7 @@ public final class BflaProbe extends Probe {
         try {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod(method);
             if (cookie != null && !cookie.isBlank()) r = r.withHeader("Cookie", cookie);
-            if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
+            if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", bearerPfx + " " + bearer);
             return send(r);
         } catch (Throwable t) { return null; }
     }

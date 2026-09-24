@@ -61,7 +61,7 @@ ALL_TARGETS=(
   "vulnerableapp|running|aisc-vulnerableapp|9090|9090|/VulnerableApp/|https://github.com/SasanLabs/VulnerableApp"
   "log4shell|running|aisc-log4shell|8901|8080|/|"
   "crapi|compose|crapi-web|8889|80|/|https://github.com/OWASP/crAPI"
-  "capital|compose|capital-backend-1|8510|8000|/|https://github.com/Checkmarx/capital"
+  "capital|compose|capital-src-backend-1|8510|8000|/|https://github.com/Checkmarx/capital"
   "dvws|running|dvws-node-web-1|8180|80|/|https://github.com/snoopysecurity/dvws-node"
   "dvoauth|running|gallery|3005|3005|/|https://github.com/farnaboldi/Vulnerable-OAuth-2.0-Applications"
   "sstipy|running|aisc-ti-python|5056|13375|/Jinja2|https://github.com/Hackmanit/template-injection-playground"
@@ -72,6 +72,17 @@ ALL_TARGETS=(
   "vulnbank|docker|aiscanner-vulnbank:local|7010|5000|/|https://github.com/Commando-X/vuln-bank"
   "zero|external||||http://zero.webappsecurity.com/|"
   "pentestground|external||||https://pentest-ground.com:9000/|"
+  # weird_proxies labs: path-normalization ACL bypass targets (HTTPS, self-signed cert, port 8001-8007).
+  # All share one compose stack — setup_weirdproxies/teardown_weirdproxies manage the full lifecycle.
+  # curl_url is overridden to https:// in the compose-kind block below (harness defaults to http://).
+  # Port-collision note: 8004 (Caddy) collides with djangonv — never run together.
+  # weird_proxies: only targets reachable without SNI lab.io / sudo /etc/hosts modification.
+  # Envoy/Caddy (SNI "lab.io" required) and Traefik1 (no detectable vuln) excluded.
+  "weirdproxy-haproxy|compose|labs-haproxy-1|8001|443|/|https://github.com/GrrrDog/weird_proxies"
+  "weirdproxy-nginx|compose|labs-nginx-1|8002|443|/|https://github.com/GrrrDog/weird_proxies"
+  "weirdproxy-nuster|compose|labs-nuster-1|8003|443|/|https://github.com/GrrrDog/weird_proxies"
+  "weirdproxy-traefik2|compose|labs-traefik2-1|8006|443|/|https://github.com/GrrrDog/weird_proxies"
+  "weirdproxy-openproxy|compose|nginx-openproxy|8009|8443|/|https://github.com/GrrrDog/weird_proxies"
 )
 PRIORITY="${TARGETS:-juice dvwa webgoat}"
 # TARGETS=all → every containerized target (docker+running). External live hosts are excluded from `all`; name them explicitly.
@@ -276,8 +287,11 @@ teardown_crapi(){   # stop the full compose stack cleanly so the next cell doesn
 
 setup_capital(){   # Checkmarx c{api}tal — FastAPI + Postgres + Redis + React frontend on :8510
   local dir="/tmp/capital-src"
-  if [ ! -d "$dir/.git" ]; then
+  # Ensure a clean source tree: if docker-compose.yml is missing (dir was wiped or only bench override
+  # remained), re-clone. A stale .git alone is not enough — we need the actual compose file.
+  if [ ! -f "$dir/docker-compose.yml" ]; then
     say "  capital: cloning Checkmarx/capital (shallow)…"
+    rm -rf "$dir"
     git clone --depth 1 -q https://github.com/Checkmarx/capital "$dir" 2>>"$LOG" \
       || { say "  [FAIL] capital git clone"; return 1; }
   fi
@@ -292,7 +306,9 @@ services:
     ports:
       - "8511:4100"
 OVERRIDE
-  docker rm -f capital-backend-1 capital-db-1 capital-redis-1 capital-frontend-1 >/dev/null 2>&1 || true
+  # Tear down any leftover stack from a previous run so compose up starts with a fresh DB.
+  # Use compose labels to find containers (prefix is capital-src, not capital).
+  ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml down -v --remove-orphans >/dev/null 2>&1 ) || true
   say "  capital: docker compose up -d (4 services, port 8510)…"
   ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d 2>>"$LOG" ) \
     || { say "  [FAIL] capital compose up"; return 1; }
@@ -305,7 +321,175 @@ OVERRIDE
 }
 teardown_capital(){
   local dir="/tmp/capital-src"
-  [ -d "$dir" ] && ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml down -v --remove-orphans >/dev/null 2>&1 ) || true
+  [ -f "$dir/docker-compose.yml" ] && \
+    ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml down -v --remove-orphans >/dev/null 2>&1 ) || \
+    docker rm -f capital-src-backend-1 capital-src-db-1 capital-src-redis-1 capital-src-frontend-1 >/dev/null 2>&1 || true
+}
+
+setup_weirdproxies(){
+  # weird_proxies labs: 7 reverse-proxy containers (HAProxy/Nginx/Nuster/Caddy/Traefik1/Traefik2/Envoy) +
+  # a raw echo server and a gunicorn backend, all in a shared labs_network.
+  # Ports (host): haproxy=8001, nginx=8002, nuster=8003, caddy=8004, traefik1=8005, traefik2=8006, envoy=8007, raw=9999.
+  # All proxies use HTTPS (self-signed cert); scanner tolerates TLS errors via Burp's native TLS handling.
+  # Port-collision note: 8001-8007 are used ONLY by this stack; 8004 is also in djangonv (running kind) —
+  # never run weirdproxy-* and djangonv in the same bench invocation to avoid collision on 8004.
+  local dir="/tmp/weird_proxies/labs"
+  if [ ! -f "$dir/docker-compose.yml" ]; then
+    say "  weirdproxies: cloning GrrrDog/weird_proxies (shallow)…"
+    rm -rf /tmp/weird_proxies
+    git clone --depth 1 -q https://github.com/GrrrDog/weird_proxies /tmp/weird_proxies 2>>"$LOG" \
+      || { say "  [FAIL] weird_proxies git clone"; return 1; }
+  fi
+  # Bench compose override:
+  # - haproxy:2.4.0 segfaults on arm64 → use platform linux/amd64 (Rosetta) to run the amd64 image
+  # - haproxy.cfg uses `server s1 raw:9999`; on an EXTERNAL docker network (labs_network), Docker compose
+  #   DNS aliases are NOT injected, so `raw` doesn't resolve → haproxy exits. Override the config with
+  #   `init-addr none` so haproxy defers resolution until the first connection rather than failing at start.
+  # - Also pin nginx to 1.25 for consistent behaviour.
+  cat > "$dir/haproxy.bench.cfg" << 'HCFG'
+defaults
+    mode http
+    timeout connect 5000
+    timeout client 10000
+    timeout server 10000
+frontend http-in
+    bind *:80
+    bind *:443 ssl crt /tmp/labiotls.pem
+    default_backend forward_default
+    acl network_allowed src 20.30.40.50 20.30.40.40
+    acl restricted_page path_beg /admin
+    http-request deny if restricted_page !network_allowed
+backend forward_default
+    server s1 raw:9999 init-addr none resolvers docker
+resolvers docker
+    nameserver dns1 127.0.0.11:53
+    resolve_retries 5
+    timeout retry 2s
+HCFG
+  # nginx bench config: same ACLs as original but uses Docker's internal DNS resolver (127.0.0.11) so
+  # upstream `raw` resolves on the external labs_network. Use $variable for upstream to force per-request DNS.
+  cat > "$dir/nginx.bench.conf" << 'NCFG'
+server {
+    listen       443 ssl;
+    server_name  nginx localhost;
+    ssl_certificate     /tmp/labiotls.pem;
+    ssl_certificate_key /tmp/labiotls.pem;
+    resolver 127.0.0.11 valid=5s;
+    set $backend_raw raw;
+    location /admin {
+        deny all;
+    }
+    location / {
+        proxy_pass http://$backend_raw:9999/;
+        proxy_set_header Host $host;
+    }
+}
+NCFG
+  cat > "$dir/docker-compose.bench.yml" << WOVR
+version: '3'
+services:
+  haproxy:
+    image: haproxy:2.8
+    volumes:
+      - $dir/haproxy.bench.cfg:/usr/local/etc/haproxy/haproxy.cfg
+      - $dir/configs/labiotls.pem:/tmp/labiotls.pem
+  nginx:
+    image: nginx:1.25
+    volumes:
+      - $dir/nginx.bench.conf:/etc/nginx/conf.d/vhost.conf
+      - $dir/configs/labiotls.pem:/tmp/labiotls.pem
+  nuster:
+    volumes:
+      - $dir/nuster.bench.cfg:/etc/nuster/nuster.cfg
+WOVR
+  # Nuster bench config: add an admin ACL (same as HAProxy lab) so Class A ACL bypass is testable.
+  # Nuster is HAProxy + cache layer — default lab config has no admin ACL, only a cache rule.
+  cat > "$dir/nuster.bench.cfg" << 'NCFG'
+global
+    master-worker
+    nuster cache on data-size 100m
+defaults
+    mode http
+    timeout connect 5000
+    timeout client 10000
+    timeout server 10000
+frontend fe
+    bind *:80
+    bind *:443 ssl crt /tmp/labiotls.pem
+    default_backend be1
+    acl network_allowed src 20.30.40.50 20.30.40.40
+    acl restricted_page path_beg /admin
+    http-request deny if restricted_page !network_allowed
+backend be1
+    nuster rule img code all ttl 30s if { path_beg /img/ }
+    server s1 raw:9999
+NCFG
+  # Docker network required by all containers in the compose file (external: labs_network).
+  docker network create labs_network >/dev/null 2>&1 || true
+  # Tear down any leftover stack (idempotent — safe to call when stack is already down).
+  ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml down -v --remove-orphans >/dev/null 2>&1 ) || true
+  # Only start the minimal set needed for each proxy target: the proxy under test + shared backend services.
+  # Avoids the 60s+ Traefik/Caddy startup time when we're only testing HAProxy.
+  local svc="raw guni"
+  case "$tname" in
+    weirdproxy-haproxy)  svc="$svc haproxy";;
+    weirdproxy-nginx)    svc="$svc nginx";;
+    weirdproxy-nuster)   svc="$svc nuster";;
+    weirdproxy-traefik2)  svc="$svc traefik2";;
+    weirdproxy-openproxy) ;;   # managed separately via docker run in setup_weirdproxies
+    *)                    svc="";;   # empty = all services
+  esac
+  say "  weirdproxies: docker compose up -d ${svc:-'(all services)'} (bench override: haproxy:2.8, nginx:1.25)…"
+  ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml up -d $svc 2>>"$LOG" ) \
+    || { say "  [FAIL] weird_proxies compose up"; return 1; }
+  # Wait for the proxy under test
+  local wait_port=8001
+  case "$tname" in
+    weirdproxy-nginx)     wait_port=8002;;
+    weirdproxy-nuster)    wait_port=8003;;
+    weirdproxy-traefik2)  wait_port=8006;;
+    weirdproxy-openproxy) wait_port=8009;;
+  esac
+  # openproxy: start dedicated container (not part of compose stack)
+  if [ "$tname" = weirdproxy-openproxy ]; then
+    docker rm -f nginx-openproxy >/dev/null 2>&1 || true
+    cat > "$dir/nginx.openproxy.conf" << 'OCFG'
+server {
+    listen       8443 ssl;
+    server_name  _;
+    ssl_certificate     /tmp/labiotls.pem;
+    ssl_certificate_key /tmp/labiotls.pem;
+    resolver 127.0.0.11 valid=5s;
+    location / {
+        proxy_pass http://$http_host$request_uri;
+        proxy_set_header Host $http_host;
+    }
+}
+OCFG
+    docker run -d --rm --name nginx-openproxy \
+      --network labs_network \
+      -p "8009:8443" \
+      -v "$dir/nginx.openproxy.conf:/etc/nginx/conf.d/openproxy.conf" \
+      -v "$dir/configs/labiotls.pem:/tmp/labiotls.pem" \
+      nginx:1.25 >>"$LOG" 2>&1 || { say "  [FAIL] nginx-openproxy start"; return 1; }
+  fi
+  local i
+  for i in $(seq 1 20); do
+    curl -sk -o /dev/null -m5 "https://localhost:$wait_port/" 2>/dev/null && { say "  weirdproxies: proxy reachable on :$wait_port (i=$i)"; return 0; }
+    sleep 3
+  done
+  say "  [warn] weirdproxies: proxy not reachable on :$wait_port after 60s — continuing anyway"
+}
+teardown_weirdproxies(){
+  local dir="/tmp/weird_proxies/labs"
+  if [ -f "$dir/docker-compose.yml" ]; then
+    ( cd "$dir" && docker compose -f docker-compose.yml -f docker-compose.bench.yml down -v --remove-orphans >/dev/null 2>&1 ) || true
+  else
+    docker rm -f labs-haproxy-1 labs-nginx-1 labs-envoy-1 \
+                 labs-nuster-1 labs-caddy-1 labs-raw-1 labs-guni-1 labs-apachephp-1 \
+                 labs-traefik1-1 labs-traefik2-1 >/dev/null 2>&1 || true
+  fi
+  docker network rm labs_network >/dev/null 2>&1 || true
 }
 
 setup_dvrestaurant(){
@@ -504,6 +688,7 @@ run_pair(){   # $@ = target names → bring each up + stabilize, ONE Burp scanni
       dvoauth)      setup_dvoauth "$base";;   # fork clone + compose up (owns bring-up; no redundant start_running first)
       crapi)        setup_crapi;;             # 10-container stack; compose up + own teardown via teardown_crapi
       capital)      setup_capital;;           # FastAPI+Postgres+Redis; compose up on :8510 to avoid LLM port collision
+      weirdproxy-*) setup_weirdproxies; base="https://localhost:$hostport$path";;   # HTTPS self-signed; override http→https
       *) [ "$kind" = running ] && start_running "$image" "$base"
          case "$t" in
            dvwa)    setup_dvwa "http://localhost:$hostport";;
@@ -512,7 +697,11 @@ run_pair(){   # $@ = target names → bring each up + stabilize, ONE Burp scanni
            aspgoat) setup_aspgoat;;
          esac;;
     esac
-    wait_http_n "$base" 40 || say "  [warn] PAIR target $t slow/failed to come up"
+    # weirdproxy targets use HTTPS — skip wait_http_n (setup_weirdproxies already waited); others wait normally
+    case "$t" in
+      weirdproxy-*) :;;
+      *) wait_http_n "$base" 40 || say "  [warn] PAIR target $t slow/failed to come up";;
+    esac
     urls+=("$base"); names+=("$t"); repos+=("$repo")
   done
   local dl="${PRO_AUDIT_MIN:-25}" celllog; celllog="$RES/pair_$(IFS=-; echo "${names[*]}").log"; : > "$celllog"
@@ -589,11 +778,16 @@ for tname in $PRIORITY; do
       elif [ "$kind" = compose ]; then
         # compose-kind: target owns its full multi-container bring-up via a setup_<name> function and must also own teardown.
         case "$tname" in
-          crapi)       setup_crapi;;
-          capital)     setup_capital;;
+          crapi)         setup_crapi;;
+          capital)       setup_capital;;
+          weirdproxy-*)  setup_weirdproxies;;   # shared compose stack — idempotent (only brings up once per target run)
           *) say "  [warn] no setup_$tname for compose-kind target — skipping bring-up";;
         esac
-        curl_url="http://localhost:$hostport$path"
+        # weirdproxy targets: HTTPS with self-signed cert — use https:// regardless of what the harness defaults to
+        case "$tname" in
+          weirdproxy-*) curl_url="https://localhost:$hostport$path";;
+          *)             curl_url="http://localhost:$hostport$path";;
+        esac
       elif [ "$kind" = running ]; then
         # "running" kind: harness owns start + stop (no external state assumed). Starts the pre-built container and all
         # its compose siblings, waits for HTTP health, and stops them when the cell ends. If the target fails to come up
@@ -625,10 +819,13 @@ for tname in $PRIORITY; do
         *)        unset AISCANNER_LOGIN_EMAIL AISCANNER_LOGIN_PASSWORD;;
       esac
       case "$tname" in   # per-target module scoping: skip the full battery for single-purpose targets
-        sstipy)   export AISCANNER_ONLY=ssti;;         # template-injection playground only
-        dvwssock) export AISCANNER_ONLY=cswsh;;        # WebSocket CSRF target only
-        log4shell) export AISCANNER_ONLY=log4shell;;   # log4shell target only
-        *)        unset AISCANNER_ONLY;;
+        sstipy)       export AISCANNER_ONLY=ssti;;         # template-injection playground only
+        dvwssock)     export AISCANNER_ONLY=cswsh;;        # WebSocket CSRF target only
+        log4shell)    export AISCANNER_ONLY=log4shell;;    # log4shell target only
+        weirdproxy-*) export AISCANNER_ONLY=proxymisconfig         # proxy misconfig labs: ACL/cache/path/Host classes
+                      export AISCANNER_SKIP_NATIVE_AUDIT=true    # echo server returns 200 for everything → FP flood from Burp audit
+                      ;;
+        *)            unset AISCANNER_ONLY; unset AISCANNER_SKIP_NATIVE_AUDIT;;
       esac
       case "$cfg" in
         pro-ext)  run_pro "$curl_url" "$rep" true "$src";;
@@ -672,7 +869,9 @@ for tname in $PRIORITY; do
       fi
       [ "$kind" = docker ] && [ -n "$cname" ] && teardown "$cname"   # rm the fresh-spun instance (avoids name reuse)
       # compose-kind targets own their teardown to free memory before the next cell (critical for crAPI's 10 containers).
-      [ "$kind" = compose ] && case "$tname" in crapi) teardown_crapi;; capital) teardown_capital;; esac
+      [ "$kind" = compose ] && case "$tname" in crapi) teardown_crapi;; capital) teardown_capital;;
+        weirdproxy-openproxy) docker rm -f nginx-openproxy >/dev/null 2>&1 || true;;
+        weirdproxy-*) teardown_weirdproxies;; esac
       # running-kind: harness owns stop so the container is clean for the next cell and leaves no orphan.
       # Uses stop_running (not docker stop) so compose siblings are stopped together.
       if [ "$kind" = running ]; then
