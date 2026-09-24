@@ -482,6 +482,12 @@ public final class AiScanner {
                 for (String dr : new String[]{"app","public","src","www","htdocs","web","dist","build","wwwroot","webapps","public_html","httpdocs","webroot"}) {
                     if (rawPath.startsWith("/" + dr + "/")) cands.add(rawPath.substring(dr.length() + 1));
                 }
+                // Also try common API prefix variants — many APIs serve routes at /api/... or /api/v1/... but source
+                // code (and Postman collections) store bare paths like /users. Without this, every SAST-only scan of
+                // an API-prefixed app gets 100% hallucination and submits nothing to audit.
+                for (String prefix : new String[]{"/api","/api/v1","/api/v2","/v1","/v2"}) {
+                    cands.add(prefix + rawPath);
+                }
                 String path = null; String pingUrl = null; int sc = 0;
                 try {
                     for (String cand : cands) {
@@ -935,7 +941,10 @@ public final class AiScanner {
         attackActions.put("bfla", () -> {
             String cookie = session != null ? session.cookieHeader() : "";
             String bearer = session != null ? session.bearer() : "";
-            int hits = new BflaProbe(api, scanLog).probe(host, cookie, bearer);
+            String bearerPfx = session != null ? session.bearerPrefix() : "Bearer";
+            BflaProbe bflaProbe = new BflaProbe(api, scanLog);
+            bflaProbe.setSourceHints(hints);
+            int hits = bflaProbe.probe(host, cookie, bearer, bearerPfx);
             scanLog.log("BFLA probe: " + hits + " admin-tier function(s) reachable by a non-privileged user.");
         });
 
@@ -973,6 +982,19 @@ public final class AiScanner {
             String bearer = session != null ? session.bearer() : "";
             int hits = new PrivilegeParityProbe(api, scanLog).probe(host, cookie, bearer);
             scanLog.log("privilege-parity probe: " + hits + " privileged resource(s) reachable via an ungated sibling.");
+        });
+
+        // Proxy ACL bypass: path-encoding variants of 403/401 paths that confuse the proxy ACL evaluator.
+        // Deterministic 403→2xx differential oracle — no FP. Generic; also fires against real WAF/API-gateway targets.
+        // Proxy misconfiguration: four behavioral classes — ACL bypass (path encoding), cache key
+        // poisoning (unkeyed Host), path normalization redirect, and Host header routing bypass.
+        // All detection is purely behavioral — no proxy product names hardcoded in logic.
+        attackActions.put("proxymisconfig", () -> {
+            scanLog.phase("Reverse proxy misconfiguration (ACL/cache/path/Host)");
+            ProxyMisconfigProbe pmp = new ProxyMisconfigProbe(api, scanLog);
+            pmp.setSourceHints(hints);
+            int hits = pmp.probe(host, this::withSession);
+            scanLog.log("proxy-misconfig probe: " + hits + " finding(s) across ACL/cache/normalization/routing classes.");
         });
 
         // (CSRF probe ran early — see the fast-findings block above.)
@@ -1149,6 +1171,13 @@ public final class AiScanner {
         // User hit Stop during the probe battery (each probe swallowed the phase() ScanStopped) → don't now submit
         // the long native Burp audit; return what the probes already raised as live issues.
         if (cancelled()) return null;
+        // -Daiscanner.skipNativeAudit=true: skip submitting to Burp's native audit. Use when the target
+        // is a raw echo/catch-all server that returns 200 for everything (e.g. weird_proxies raw backend)
+        // and would generate a flood of FP HIGH/MED findings from Burp's payload library.
+        if (Boolean.getBoolean("aiscanner.skipNativeAudit")) {
+            scanLog.log("skipNativeAudit=true — Burp active audit suppressed (deterministic probe findings only).");
+            return null;
+        }
         return scanRequests(targets, host);
     }
 
@@ -2130,7 +2159,7 @@ public final class AiScanner {
         if (session != null && session.has()) r = r.withHeader("Cookie", session.cookieHeader());
         // Token/JWT auth (OpenAPI/SPA style): attach the captured bearer to every audited request
         // so authenticated-only endpoints are actually reachable. Generic — driven by capture, not host.
-        if (session != null && session.hasBearer()) r = r.withHeader("Authorization", "Bearer " + session.bearer());
+        if (session != null && session.hasBearer()) r = r.withHeader("Authorization", session.bearerPrefix() + " " + session.bearer());
         // Request-signature gate: if the app handed us a signing key at auth time, sign each request (last, so
         // the signature covers the final method/path/body) — otherwise the protected API returns "Missing
         // request signature" and every authenticated probe is wasted. No-op when no signing key was captured.

@@ -157,7 +157,14 @@ public final class UnauthAccessProbe extends Probe {
         java.util.regex.Matcher m = SECRET_VALUE.matcher(body);
         while (m.find()) if (looksHighEntropy(m.group(2))) return new Secret(m.group(1), m.group(2), m.start(2), m.end(2));
         java.util.regex.Matcher j = JWT_VALUE.matcher(body);
-        if (j.find()) return new Secret("JWT", j.group(), j.start(), j.end());
+        while (j.find()) {
+            // Skip JWTs that are a URL query-param value (preceded by '=' within a URL string) — e.g. a CDN image
+            // URL like "img.example.com/photo.jpg?token=eyJ..." embedded in an author.image field. Those are
+            // third-party access tokens on media URLs, not app session secrets leaked to the anonymous public.
+            int s = j.start();
+            if (s > 0 && body.charAt(s - 1) == '=') continue;
+            return new Secret("JWT", j.group(), s, j.end());
+        }
         return null;
     }
 

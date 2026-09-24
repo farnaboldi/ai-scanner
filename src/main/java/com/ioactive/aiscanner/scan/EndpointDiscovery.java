@@ -1478,6 +1478,13 @@ public final class EndpointDiscovery {
         String root = baseUrlFor(host);
         if (root == null || root.isBlank()) return;
         root = root.replaceAll("/+$", "");
+        // Detect the auth prefix this app uses (e.g. "Token" for RealWorld/capital, "Bearer" for OAuth2 apps).
+        // Must be set BEFORE acquireSpecToken so that every probe built with withSessionCookie uses the correct prefix.
+        String prefix = com.ioactive.aiscanner.scan.sast.PostmanParser.detectAuthPrefix(repoPath);
+        if (session != null && !"Bearer".equals(prefix)) {
+            session.setBearerPrefix(prefix);
+            scanLog.log("  -> API AUTH: detected auth prefix '" + prefix + "' from Postman collection");
+        }
         scanLog.log("  -> API AUTH: no live spec — bootstrapping auth from the repo's Postman collection.");
         acquireSpecToken(spec, host, root);
     }
@@ -1591,7 +1598,7 @@ public final class EndpointDiscovery {
                             scanLog.log("  -> API AUTH: obtained a token via " + loginPath + " (" + how
                                     + ", fields " + uf + "/" + pf + (extra.isEmpty() ? "" : " + required" + extra)
                                     + ", " + v[0].replace("application/", "") + ", from " + src
-                                    + "); auth header = " + (apiAuthHeader == null ? "Authorization: Bearer" : apiAuthHeader));
+                                    + "); auth header = " + (apiAuthHeader == null ? "Authorization: " + (session != null ? session.bearerPrefix() : "Bearer") : apiAuthHeader));
                             if (jsonBody) checkWeakToken(new JSONObject(resp), tok, url, rr);
                             return;
                         }
@@ -2274,7 +2281,7 @@ public final class EndpointDiscovery {
         String url = root + (resolvedPath.startsWith("/") ? resolvedPath : "/" + resolvedPath) + query;
         HttpRequest req = withSessionCookie(HttpRequest.httpRequestFromUrl(url).withMethod(method));
         for (String[] h : headers) req = req.withHeader(h[0], h[1]);
-        if (session != null && session.hasBearer()) req = req.withHeader("Authorization", "Bearer " + session.bearer());
+        if (session != null && session.hasBearer()) req = req.withHeader("Authorization", session.bearerPrefix() + " " + session.bearer());
 
         // requestBody: prefer JSON, then XML, then form — a declared example wins; else build from the schema.
         String bodyStr = null, bodyCt = "application/json";
@@ -3428,7 +3435,7 @@ public final class EndpointDiscovery {
         if (session != null && session.has()) req = req.withHeader("Cookie", session.cookieHeader());
         // Carry the bearer too — JWT/SPA apps (e.g. Juice) gate /rest/* behind Authorization, not a cookie,
         // so cookie-only probes 401 and never reach the authenticated surface (auth-details, basket, …).
-        if (session != null && session.hasBearer()) req = req.withHeader("Authorization", "Bearer " + session.bearer());
+        if (session != null && session.hasBearer()) req = req.withHeader("Authorization", session.bearerPrefix() + " " + session.bearer());
         // Sign if the app is signature-gated (key captured at auth) — reaches /me/ + merchant data endpoints
         // that a bearer alone can't. Signing covers method/path/body only, so a later header add is harmless.
         if (session != null && session.hasSigningKey())

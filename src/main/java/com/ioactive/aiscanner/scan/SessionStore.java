@@ -42,9 +42,15 @@ public final class SessionStore {
 
     // Bearer/JWT captured from a token-based (SPA/API) login → attached as Authorization on attacks.
     private volatile String bearer = "";
+    // Some apps use a non-standard Authorization prefix (e.g. "Token" instead of "Bearer").
+    // Detected from the app's own Postman collection or OpenAPI spec and stored here so every
+    // authenticated probe uses the correct prefix — without it, the app returns 403.
+    private volatile String bearerPrefix = "Bearer";
     public boolean hasBearer() { return !bearer.isBlank(); }
     public String bearer() { return bearer; }
+    public String bearerPrefix() { return bearerPrefix; }
     public void setBearer(String t) { this.bearer = t == null ? "" : t.trim(); }
+    public void setBearerPrefix(String p) { if (p != null && !p.isBlank()) this.bearerPrefix = p.trim(); }
 
     // Per-request HMAC signing key captured alongside the bearer from a token-based login/verify response
     // (e.g. `data.signing_key`). When present, the app gates its protected API behind a request signature

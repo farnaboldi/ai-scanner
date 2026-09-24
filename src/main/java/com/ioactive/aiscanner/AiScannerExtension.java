@@ -4,6 +4,7 @@ import burp.api.montoya.BurpExtension;
 import burp.api.montoya.EnhancedCapability;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.scanner.audit.issues.AuditIssue;
 import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence;
 import com.ioactive.aiscanner.engine.AiEngine;
@@ -32,7 +33,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 706;
+    public static final int BUILD = 727;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -556,6 +557,69 @@ public class AiScannerExtension implements BurpExtension {
                     : AuditIssue.auditIssue(name, detailHtml, remediationDetail, url, info.severity, AuditIssueConfidence.FIRM,
                             info.background, info.remediation, info.severity);
             api.siteMap().add(issue);
+            // Anchor the best evidence request/response into the site map so the issue is visible in
+            // Target → Site Map. Filter: only anchor evidence whose host matches the ISSUE URL's host —
+            // off-host evidence (e.g. the Burp Collaborator URL reached via an open proxy) would create
+            // a tree node under the wrong host (Collaborator domain, not localhost:8010).
+            // Anchor strategy: add a request/response entry at the ISSUE URL so it appears as a tree
+            // node in Target → Site Map. Rules:
+            // 1. Prefer same-host evidence with a 2xx response — most visible in Burp's tree.
+            // 2. If only 4xx/5xx same-host evidence exists, remap the best 2xx evidence (from a different
+            //    path on the same host) to the issue URL — the bypass response proves accessibility.
+            // 3. Filter off-host evidence (e.g. Collaborator domain reached via open proxy) — those
+            //    belong under the Collaborator node, not under the proxy's host.
+            // Priority: same-host 2xx > off-host 2xx (remapped) > same-host 4xx.
+            // Off-host 2xx happens for Class E (open proxy): the Collaborator callback is the 200 proof
+            // but it's at collab.oastify.com, not localhost:8010. Remapped to the issue URL it creates a
+            // 2xx tree node at localhost:8010, making the issue icon visible in Target → Site Map.
+            String issueHost = com.ioactive.aiscanner.scan.Net.authority(url);
+            HttpRequestResponse best2xxSame = null, best2xxOff = null, best4xx = null;
+            for (HttpRequestResponse evRr : ev) {
+                if (evRr == null || evRr.request() == null || evRr.response() == null) continue;
+                String evHost = com.ioactive.aiscanner.scan.Net.authority(evRr.request().url());
+                boolean sameHost = issueHost == null || issueHost.equalsIgnoreCase(evHost);
+                int st = evRr.response().statusCode();
+                if (st >= 200 && st < 300) {
+                    if (sameHost  && best2xxSame == null) best2xxSame = evRr;
+                    if (!sameHost && best2xxOff  == null) best2xxOff  = evRr;
+                }
+                if (st >= 400 && sameHost && best4xx == null) best4xx = evRr;
+            }
+            HttpRequestResponse anchor = best2xxSame != null ? best2xxSame
+                                       : best2xxOff  != null ? best2xxOff   // off-host 2xx remapped below
+                                       : best4xx;
+            if (anchor != null) {
+                try {
+                    HttpRequest anchorReq = anchor.request();
+                    // Remap to issue URL so the tree node appears at the right path
+                    if (!anchor.request().url().equals(url)) {
+                        try { anchorReq = HttpRequest.httpRequestFromUrl(url).withMethod("GET"); }
+                        catch (Throwable ignore) { anchorReq = anchor.request(); }
+                    }
+                    api.siteMap().add(HttpRequestResponse.httpRequestResponse(anchorReq, anchor.response()));
+                    int anchorSt = anchor.response().statusCode();
+                    scanLog.debug("siteMap anchored: " + url
+                            + " → HTTP " + anchorSt
+                            + (anchorSt >= 200 && anchorSt < 300 ? " (2xx)" : " (4xx)"));
+                } catch (Throwable t) {
+                    scanLog.debug("siteMap.add anchor failed: " + t);
+                }
+            } else {
+                scanLog.debug("siteMap: no same-host evidence to anchor for " + url);
+            }
+            // Verify: query the site map immediately to confirm the issue AND the anchor are visible.
+            try {
+                boolean issueFound = api.siteMap().issues().stream()
+                        .anyMatch(i -> i.name() != null && i.name().equals(name)
+                                    && i.baseUrl() != null && i.baseUrl().contains(
+                                            com.ioactive.aiscanner.scan.Net.authority(url)));
+                boolean urlInMap = api.siteMap().requestResponses().stream()
+                        .anyMatch(rr -> rr.request() != null
+                                     && rr.request().url().startsWith(url.replaceAll("/$","")));
+                scanLog.debug("siteMap verify [" + com.ioactive.aiscanner.scan.Net.authority(url) + "]"
+                        + " — issue registered: " + issueFound
+                        + " | URL in tree: " + urlInMap);
+            } catch (Throwable ignore) {}
             scanLog.debug("dashboard issue raised: " + name + " @ " + url);
         } catch (Throwable t) {
             scanLog.log("could not raise dashboard issue for " + vulnClass + " @ " + url + ": " + t);
