@@ -609,6 +609,22 @@ public final class AiScanner {
         if (bridged > 0) scanLog.log("bridged " + bridged
                 + " discovered endpoint(s) into the site map for IDOR/BFLA/chain probes.");
 
+        // GWT-RPC / compiled-SPA discovery. Native crawl + JS-link-mining find ZERO requests on a GWT app
+        // (one shell for every path; the surface is the compiled client's own service registry, not URLs).
+        // Parse that registry → live-confirm the RPC/JSON servlets → bridge them into the site map + audit
+        // surface so the IDOR/BFLA/unauth/privilege-parity oracles finally have real requests to work on.
+        // Generic-target-safe: never auto-invokes a state-changing method (see GwtRpcDiscovery).
+        try {
+            GwtRpcDiscovery gwt = new GwtRpcDiscovery(api, scanLog);
+            int gwtAdded = 0;
+            for (HttpRequestResponse rr : gwt.discover(host, this::withSession)) {
+                try { api.siteMap().add(rr); } catch (Exception ignore) { }
+                if (rr != null && rr.request() != null && addTarget(targets, seen, rr.request())) gwtAdded++;
+            }
+            if (gwtAdded > 0) scanLog.log("gwt-rpc: added " + gwtAdded
+                    + " confirmed GWT-RPC/JSON servlet(s) to the audit surface (site map + probe battery).");
+        } catch (Throwable t) { scanLog.debug("gwt-rpc discovery skipped: " + t); }
+
         // ABSTRACT authenticated SPA navigation. A static crawl never executes the app's JS, so a JS-driven app's
         // DATA surface (record lists / grids / detail views / searches loaded on demand behind menu→module→grid
         // navigation) never enters the site map and the battery never audits it. Now that EndpointDiscovery has

@@ -33,7 +33,7 @@ public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 727;
+    public static final int BUILD = 749;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -540,22 +540,32 @@ public class AiScannerExtension implements BurpExtension {
             // If the probe already supplied HTML (contains a tag), embed it directly; otherwise escape plain text.
             // This lets probes use <p>/<br>/<b> for structured evidence while plain-text probes stay safe.
             String detailEncoded = (detail == null || detail.isBlank()) ? ""
-                    : detail.contains("<") ? detail : escapeHtml(detail).replace("\n", "<br>");
-            String detailHtml = "<p>The AI Scanner reported <b>" + escapeHtml(cls) + "</b> at this location.</p>"
-                    + (detailEncoded.isBlank() ? "" : "<p><b>Evidence:</b> " + detailEncoded + "</p>")
+                    : detail.contains("<") ? detail : escapeHtml(detail).replace("\n\n", "</p><p>").replace("\n", "<br>");
+            String detailHtml = "<p>The AI Scanner confirmed <b>" + escapeHtml(cls) + "</b> at <code>"
+                    + escapeHtml(url) + "</code>.</p>"
+                    + (detailEncoded.isBlank() ? "" : "<p><b>Evidence</b></p><p>" + detailEncoded + "</p>")
                     + (ev.isEmpty() ? "<p><i>No single request/response is attached — this finding is derived from "
                             + "observed traffic/artifacts; see the Evidence above.</i></p>"
-                            : "<p>See the attached request/response for the observed artifact.</p>");
+                            : "<p>See the attached request/response(s) for the observed artifact.</p>");
             // Mirror a native Burp issue's four fields: instance detail + remediation detail (this location),
             // class-level background + remediation background (the vuln class). All non-null — Montoya's
-            // auditIssue() rejects a null remediation, which was silently thrown+swallowed here so findings
-            // never reached the dashboard. Attach the offending req/resp when a probe gave us one.
-            String remediationDetail = "<p>Apply the guidance in the remediation background to this endpoint/token.</p>";
+            // auditIssue() rejects a null remediation. The ACTIONABLE remediation steps go in the instance
+            // "Remediation detail" (info.remediation) — not a boilerplate pointer — so the analyst sees concrete
+            // guidance on the finding itself; the class-level "Remediation background" carries the standards refs.
+            String remediationDetail = (info.remediation == null || info.remediation.isBlank())
+                    ? "<p>Enforce authentication/authorization on this endpoint and remove or scope any secret it "
+                      + "returns; see the remediation background for the standards-aligned controls.</p>"
+                    : info.remediation;
+            String remediationBackground =
+                    "<p>Enforce the control server-side, deny-by-default, and add a regression test so it cannot "
+                    + "silently regress. Map the fix to the relevant OWASP ASVS chapter and OWASP API Security "
+                    + "Top 10 category for this issue class (e.g. access control, authentication, or secrets "
+                    + "management), and verify it holds for every affected endpoint, not just the reported one.</p>";
             AuditIssue issue = !ev.isEmpty()
                     ? AuditIssue.auditIssue(name, detailHtml, remediationDetail, url, info.severity, AuditIssueConfidence.FIRM,
-                            info.background, info.remediation, info.severity, ev.toArray(new HttpRequestResponse[0]))
+                            info.background, remediationBackground, info.severity, ev.toArray(new HttpRequestResponse[0]))
                     : AuditIssue.auditIssue(name, detailHtml, remediationDetail, url, info.severity, AuditIssueConfidence.FIRM,
-                            info.background, info.remediation, info.severity);
+                            info.background, remediationBackground, info.severity);
             api.siteMap().add(issue);
             // Anchor the best evidence request/response into the site map so the issue is visible in
             // Target → Site Map. Filter: only anchor evidence whose host matches the ISSUE URL's host —

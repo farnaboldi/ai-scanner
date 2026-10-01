@@ -308,6 +308,72 @@ public final class IssueLibrary {
                 + "keys from token-controlled URLs (<code>jku</code>/<code>x5u</code>), verify the signature with "
                 + "a strong secret/key, and validate standard claims (iss/aud/exp).</p>");
 
+        // --- Unauthenticated token/key MINTER. Matched BEFORE the disclosure/default-password branches. On its
+        //     OWN this is weak: an anonymous caller mints a FRESH token holding its OWN input (a new token+key
+        //     each call — no third party's secret is exposed), so the standalone impact is anonymous token
+        //     creation (flooding/relay-abuse) + weak crypto if applicable. It becomes HIGH only when CHAINED with
+        //     a matching unauth retrieve/redeem half AND a real credential is staged AND the token id leaks. ---
+        if (v.contains("minter"))
+            return new Info(MEDIUM,
+                "<p>An API endpoint mints a credential/session token to an <b>unauthenticated</b> caller with no "
+                + "credential check. On its own the impact is limited: each call returns a FRESH token bound to the "
+                + "caller's own input (a new id/key each time), so no third party's secret is disclosed directly — "
+                + "the standalone risk is anonymous token creation (resource abuse / flooding of the token "
+                + "subsystem, decoupled from any lockout or rate-limit) plus any weakness in the token crypto "
+                + "(CWE-306: Missing Authentication for a Critical Function; CWE-307/CWE-799 if unthrottled).</p>",
+                "<p>Require an authenticated, authorized session before minting any credential/session token, and "
+                + "rate-limit + monitor the mint path. <b>Critically, review the paired retrieve/redeem endpoint:</b> "
+                + "this minter becomes a full account-credential-theft chain if (a) a matching retrieve half is also "
+                + "unauthenticated, (b) a real credential is ever staged through it (e.g. a login "
+                + "handoff), and (c) the token id can leak (launch URL, referrer, log, or XSS). Gate both halves, "
+                + "bind tokens to the authenticated principal, keep them single-use and short-lived, use unique IVs, "
+                + "and never place the token id in a URL/referrer.</p>");
+
+        // --- Unauthenticated credential / secret / presigned-URL disclosure via an API endpoint. Matched BEFORE
+        //     the generic "credential" (default-password) branch so an endpoint that HANDS OUT secret material to
+        //     anonymous callers is described as a disclosure + broken-access-control issue, not a weak-password one. ---
+        if ((v.contains("disclosure") || v.contains("unauthenticated credential")
+                || v.contains("unauthenticated aws"))
+                && (v.contains("credential") || v.contains("secret") || v.contains("presigned")
+                || v.contains("s3") || v.contains("token")))
+            return new Info(HIGH,
+                "<p>An API endpoint returns credential or secret material — such as cloud access-key IDs, "
+                + "presigned object-storage (S3) upload/download URLs, signing policies, or tokens — to callers "
+                + "that are not (or not sufficiently) authenticated. Because the sensitive material is issued "
+                + "without a proper authentication and authorization check, an attacker can obtain it directly "
+                + "(CWE-306: Missing Authentication for a Critical Function; CWE-522: Insufficiently Protected "
+                + "Credentials; CWE-284: Improper Access Control). Depending on the scope of the returned "
+                + "credential this can permit reading or writing back-end storage, cross-tenant access, or "
+                + "impersonation of the issuing service.</p>",
+                "<p>Require an authenticated, authorized session before the endpoint mints or returns any "
+                + "credential, token, or presigned URL, and enforce the check server-side at a shared filter so it "
+                + "cannot be bypassed per-endpoint. Scope every presigned URL to the caller's own objects with "
+                + "least privilege and the shortest workable expiry, and constrain upload policies to a specific "
+                + "key (avoid broad <code>starts-with</code> prefixes). Never expose long-lived cloud access-key "
+                + "IDs to clients; rotate any key already exposed and review its storage-bucket ACL/policy so the "
+                + "bucket is private and not listable. Log and alert on anonymous credential-minting requests.</p>");
+
+        // --- Missing authentication / broken function-level access control on an API/RPC endpoint: the handler
+        //     executes for unauthenticated callers while sibling endpoints require a session (deterministic
+        //     differential). Impact depends on the handler, so MEDIUM by default (elevate when it returns data). ---
+        if (v.contains("missing authentication") || v.contains("authz gap")
+                || v.contains("missing auth") || v.contains("broken function-level")
+                || v.contains("broken access control"))
+            return new Info(MEDIUM,
+                "<p>The endpoint executes its server-side handler for requests that carry no valid session, while "
+                + "sibling endpoints on the same service correctly reject anonymous callers (HTTP 401/403). The "
+                + "per-endpoint authentication/authorization gate is therefore missing or not uniformly applied "
+                + "(CWE-306: Missing Authentication for a Critical Function; CWE-285: Improper Authorization). An "
+                + "unauthenticated attacker can invoke server functionality that is intended to require a session; "
+                + "the concrete impact depends on what the handler does (data read/write, state change, or "
+                + "resource abuse) and should be assessed per endpoint.</p>",
+                "<p>Enforce authentication and authorization uniformly with a deny-by-default filter/interceptor "
+                + "that covers every RPC/action endpoint, rather than per-handler checks that can be omitted. "
+                + "Verify the caller's session and their permission for the specific object/action before running "
+                + "any handler logic, and return a consistent 401/403 for unauthenticated or unauthorized access "
+                + "across the whole service. Add a regression test asserting each endpoint rejects an anonymous "
+                + "request.</p>");
+
         if (v.contains("credential"))
             return new Info(HIGH,
                 "<p>An account is usable with default or weak credentials, giving an attacker authenticated "

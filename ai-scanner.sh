@@ -294,6 +294,9 @@ exec "$JAVA" \
   ${SEED_COOKIE:+-Daiscanner.cookie="${SEED_COOKIE}"} \
   ${SEED_BEARER:+-Daiscanner.bearer="${SEED_BEARER}"} \
   ${SEED_LANDING:+-Daiscanner.landing="${SEED_LANDING}"} \
+  ${AISCANNER_GWT_FOREIGN_IDS:+-Daiscanner.gwtForeignIds="${AISCANNER_GWT_FOREIGN_IDS}"} \
+  ${AISCANNER_GWT_FOREIGN_KEYS:+-Daiscanner.gwtForeignKeys="${AISCANNER_GWT_FOREIGN_KEYS}"} \
+  ${AISCANNER_GWT_SEED_IDS:+-Daiscanner.gwtSeedIds="${AISCANNER_GWT_SEED_IDS}"} \
   ${REPORT_DIR:+-Daiscanner.reportDir="${REPORT_DIR}"} \
   ${SOURCE_REPO:+-Daiscanner.sourceRepo="${SOURCE_REPO}"} \
   ${AISCANNER_AUTOSCAN_REPOS:+-Daiscanner.autoscanRepos="${AISCANNER_AUTOSCAN_REPOS}"} \
