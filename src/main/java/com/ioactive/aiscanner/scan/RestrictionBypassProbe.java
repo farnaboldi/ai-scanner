@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
@@ -58,7 +57,15 @@ public final class RestrictionBypassProbe extends Probe {
             List<ParsedHttpParameter> params = formParams(req);
             if (params.isEmpty()) return false;
 
-            String baseBody = body(send(req));
+            // The oracle is "a success signal the baseline LACKED", so it needs a REAL baseline. A missing one (a
+            // verb-guard refusal comes back response-less, like a dead send) read as "" and passed it vacuously: every
+            // variant of a refused _method=delete form became a false "bypass". No baseline → skip this form.
+            HttpRequestResponse b0 = send(req);
+            if (b0 == null || b0.response() == null) {   // refused (verb guard) or dead: no baseline, no test
+                scanLog.debug("restriction-bypass: skipped " + Net.stripQuery(req.url()) + " — the baseline got no response");
+                return false;
+            }
+            String baseBody = body(b0);
             if (SUCCESS.matcher(baseBody).find()) return false;   // already "solved" in the baseline → not us
 
             // Variant 1 — bypass: every field gets the restriction-violating BYPASS string. Only fields the
@@ -94,6 +101,9 @@ public final class RestrictionBypassProbe extends Probe {
             if (Evasion.enabled()) {
                 String targetPath = pathOf(req.url());
                 HttpRequest decoyReq = req.withPath("/");
+                for (ParsedHttpParameter p : req.parameters())   // withPath drops the query: keep a URL-placed override
+                    if (p.type() == HttpParameterType.URL && methodOverride(p))
+                        decoyReq = decoyReq.withAddedParameters(HttpParameter.urlParameter(p.name(), safe(p.value())));
                 for (String h : Evasion.pathOverrideHeaders(targetPath)) {
                     String[] kv = h.split(": ", 2);
                     if (kv.length == 2) decoyReq = decoyReq.withHeader(kv[0], kv[1]);
@@ -144,9 +154,34 @@ public final class RestrictionBypassProbe extends Probe {
         for (ParsedHttpParameter p : req.parameters())
             // dedupe by name — a radio/checkbox group repeats a name, and passing it twice to
             // withUpdatedParameters throws, silently aborting the whole probe on that form.
-            if ((p.type() == HttpParameterType.URL || p.type() == HttpParameterType.BODY) && seen.add(p.name()))
+            if ((p.type() == HttpParameterType.URL || p.type() == HttpParameterType.BODY) && !methodOverride(p)
+                    && seen.add(p.name()))
                 out.add(p);
         return out;
+    }
+
+    /** A method override ({@code _method}; Salesforce's {@code _HttpMethod}) is not a form field: it picks the verb
+     *  the server acts on. So it is never an insertion point — overwriting it sent a different request than the one
+     *  captured (a {@code _method=delete} form went out as a plain POST) — and every variant carries it VERBATIM (see
+     *  {@link #bodyOverrides}), so the verb guard judges each variant exactly as it judged the baseline. The name is
+     *  matched the way WriteGuard matches it: URL-decoded, trimmed, case-insensitive. */
+    private static boolean methodOverride(ParsedHttpParameter p) {
+        String n = safe(p.name());
+        try { n = java.net.URLDecoder.decode(n, java.nio.charset.StandardCharsets.UTF_8); } catch (Exception ignore) { }
+        n = n.trim();
+        return n.equalsIgnoreCase("_method") || n.equalsIgnoreCase("_HttpMethod");
+    }
+
+    /** The request's BODY method overrides as raw {@code name=value} pairs (Montoya hands back the undecoded bytes, so
+     *  no re-encoding), '&'-joined — the head of every rebuilt form body. */
+    private static String bodyOverrides(HttpRequest req) {
+        StringBuilder sb = new StringBuilder();
+        for (ParsedHttpParameter p : req.parameters()) {
+            if (p.type() != HttpParameterType.BODY || !methodOverride(p)) continue;
+            if (sb.length() > 0) sb.append('&');
+            sb.append(safe(p.name())).append('=').append(safe(p.value()));
+        }
+        return sb.toString();
     }
 
     /** Rebuild the request with mutated values. Rebuilds the form body / query directly instead of using
@@ -154,7 +189,7 @@ public final class RestrictionBypassProbe extends Probe {
     private static HttpRequest mutate(HttpRequest req, List<ParsedHttpParameter> params,
                                       java.util.function.Function<ParsedHttpParameter, String> valueFn) {
         HttpRequest r = req;
-        StringBuilder body = new StringBuilder();
+        StringBuilder body = new StringBuilder(bodyOverrides(req));   // the body is rebuilt: keep the captured verb
         boolean hasBody = false;
         for (ParsedHttpParameter p : params) {
             if (p.type() != HttpParameterType.BODY) continue;
@@ -174,7 +209,7 @@ public final class RestrictionBypassProbe extends Probe {
      *  keeping their values and every other param intact — a generic field-name-tampering mutation. Other
      *  params (incl. required non-indexed ones like userId) are left untouched so the request still binds. */
     private static HttpRequest mutateNames(HttpRequest req, List<ParsedHttpParameter> params) {
-        StringBuilder body = new StringBuilder();
+        StringBuilder body = new StringBuilder(bodyOverrides(req));   // the body is rebuilt: keep the captured verb
         boolean hasBody = false;
         for (ParsedHttpParameter p : params) {
             if (p.type() != HttpParameterType.BODY) continue;

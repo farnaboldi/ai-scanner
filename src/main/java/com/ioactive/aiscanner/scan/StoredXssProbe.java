@@ -107,6 +107,11 @@ public final class StoredXssProbe extends Probe {
                     if (f.injectable.isEmpty()) continue;
                     if (AuthenticatedExplorer.SESSION_RESET.matcher(stripQ(f.action)).matches()) continue;
                     if (!writtenForms.add(f.action + " " + f.fields.keySet())) continue;   // one write per form shape
+                    // A form whose own submission the verb guard refuses (an edit form's hidden _method=patch|delete) can't
+                    // store a marker: skip it whole, before it eats MAX_WRITES slots as "planted" or puts a never-written
+                    // action among the hot views. Logged and counted once per form shape (the dedup above).
+                    HttpRequest submit = mergeCookies(sess.apply(buildPost(f, null, null)), pageCookies);
+                    if (WriteGuard.blocksDestructiveVerb(submit)) { SafeHttp.noteBlocked(submit, "stored-XSS"); continue; }
                     hotViews.add(f.action);                                             // inline-render pages (guestbook style)
                     scanLog.debug("  stored-xss: form POST " + stripQ(f.action) + " fields=" + f.fields.keySet()
                             + " inject=" + f.injectable + " pageCookies=" + pageCookies.keySet());
@@ -313,7 +318,7 @@ public final class StoredXssProbe extends Probe {
         try {
             syncJar(req);
             return AiScanner.decompress(
-                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
+                    com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
         } catch (Throwable t) { return null; }
     }
 

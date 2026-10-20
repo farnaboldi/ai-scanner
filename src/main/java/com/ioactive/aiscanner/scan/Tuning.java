@@ -18,6 +18,12 @@ public final class Tuning {
     public static int crawlDepth()   { return i("aiscanner.crawlDepth",   "AISCANNER_CRAWL_DEPTH",    3,  1,    8); }
     /** Max seconds to wait for Burp's native crawl to stabilise before proceeding (the waitForCrawl deadline). */
     public static int crawlWaitSec() { return i("aiscanner.crawlWaitSec", "AISCANNER_CRAWL_WAIT_SEC",240, 20, 1800); }
+    /** Minimum ms a crawl must run before a STABLE (unchanging) request count is accepted as "done" — stops a
+     *  JS-heavy/low-request crawl from being declared finished instantly. On a pure-JSON-API target (0 requests
+     *  from the very first poll) this floor is pure dead time with nothing to show for it; lower it when every
+     *  second matters more than crawl thoroughness (e.g. a short-lived-session target where the attack battery
+     *  needs the time instead). Default unchanged from the prior hardcoded 45000. */
+    public static int crawlStableFloorMs() { return i("aiscanner.crawlStableFloorMs", "AISCANNER_CRAWL_STABLE_FLOOR_MS", 45000, 0, 120000); }
 
     // ---- Discovery budgets (EndpointDiscovery) ----
     /** Max client-side sources (pages/scripts) mined per host. */
@@ -53,5 +59,32 @@ public final class Tuning {
         if (v == null || v.isBlank()) return def;
         try { return Math.max(min, Math.min(max, Integer.parseInt(v.trim()))); }
         catch (NumberFormatException e) { return def; }
+    }
+
+    /** Read a boolean knob from {@code -Dprop} / {@code ENV} ("true"/"1"/"yes" = true); the default when unset. */
+    /** A launch string: -D system property first, then the environment variable; null when unset/blank. */
+    public static String str(String prop, String env) {
+        String v = System.getProperty(prop);
+        if (v == null || v.isBlank()) v = System.getenv(env);
+        return (v == null || v.isBlank()) ? null : v.trim();
+    }
+
+    public static boolean b(String prop, String env, boolean def) {
+        String v = System.getProperty(prop);
+        if (v == null || v.isBlank()) v = System.getenv(env);
+        if (v == null || v.isBlank()) return def;
+        v = v.trim().toLowerCase();
+        return v.equals("true") || v.equals("1") || v.equals("yes") || v.equals("on");
+    }
+
+    /** Whether to hand state-changing CREATE/mutation endpoints (…/create, …/add, …/upload, POST/PUT to a
+     *  collection) to Burp's NATIVE active audit. Burp fuzzes each fuzzable field, and when the session can
+     *  legitimately perform the create this manufactures real records in the target (a single create endpoint
+     *  fuzzed by the native audit can produce dozens of real records). Our own write-authz probes (bolawrite
+     *  with restore, xtauthz, massassign) cover these classes without mass-mutating, so DEFAULT the native audit
+     *  OFF for mutating creates — safe for real tenants. Set true (benchmarks / throwaway labs) to restore full
+     *  native fuzzing coverage on create endpoints. {@code -Daiscanner.auditMutatingCreates} / ENV. */
+    public static boolean auditMutatingCreates() {
+        return b("aiscanner.auditMutatingCreates", "AISCANNER_AUDIT_MUTATING_CREATES", false);
     }
 }

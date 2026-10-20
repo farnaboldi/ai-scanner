@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.scan.sast.SourceFindings;
@@ -57,19 +56,28 @@ public final class BflaProbe extends Probe {
         super(api, scanLog);
     }
 
-    public int probe(String host, String cookieHeader, String bearer) {
-        return probe(host, cookieHeader, bearer, "Bearer");
-    }
-
     public int probe(String host, String cookieHeader, String bearer, String bearerPrefix) {
         this.bearerPfx = bearerPrefix != null && !bearerPrefix.isBlank() ? bearerPrefix.trim() : "Bearer";
         int hits = 0;
         try {
             List<Cand> candidates = discover(host);
+            // Only methods whose concrete request the verb guard lets out. DELETE/PATCH are refused everywhere but an
+            // opted-in local lab host, and a refused send comes back response-less for every bogus-id candidate: those
+            // arms could never decide anything, they would only log one refusal per synthetic path. Skip them, and say
+            // so once below.
+            Set<String> guarded = new LinkedHashSet<>();
             for (Cand c : candidates) {
                 for (String method : METHODS) {
+                    if (refused(c, method)) { guarded.add(method); continue; }
                     if (oracle(c, method, cookieHeader, bearer)) { hits++; break; }
                 }
+            }
+            if (!guarded.isEmpty()) {
+                List<String> rest = new ArrayList<>(Arrays.asList(METHODS));
+                rest.removeAll(guarded);
+                scanLog.log("BFLA: " + String.join("/", guarded) + " arm(s) disabled by the verb guard — "
+                        + candidates.size() + " role-substitution candidate(s) tried with "
+                        + (rest.isEmpty() ? "no method" : String.join("/", rest) + " only") + ".");
             }
             hits += probeRoleFunctions(host, cookieHeader, bearer);
             hits += probeLeafAdminHints(host, cookieHeader, bearer);
@@ -311,6 +319,13 @@ public final class BflaProbe extends Probe {
     private static final class Occ {
         final String base; final String[] segs; final int userIdx;
         Occ(String base, String[] segs, int userIdx) { this.base = base; this.segs = segs; this.userIdx = userIdx; }
+    }
+
+    /** True when the verb guard refuses this candidate's oracle request (the session-less R2; R3 and the control differ
+     *  only in auth headers or the noun segment, which never change the verdict). */
+    private static boolean refused(Cand c, String method) {
+        try { return WriteGuard.blocksDestructiveVerb(HttpRequest.httpRequestFromUrl(c.base + c.path()).withMethod(method)); }
+        catch (Throwable t) { return false; }   // unbuildable URL: the oracle's own sends fail the same way, nothing goes out
     }
 
     private boolean oracle(Cand c, String method, String cookie, String bearer) {

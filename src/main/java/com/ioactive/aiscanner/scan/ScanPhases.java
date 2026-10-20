@@ -68,6 +68,11 @@ public final class ScanPhases {
         atk("bolawrite",  "BOLA write (cross-user PUT)",       "bola write"),
         atk("massassign", "Mass-assignment (priv-diff)",       "mass-assignment"),
         atk("bfla",       "BFLA",                              "bfla"),
+        atk("xtauthz",    "Cross-tenant object authz (BOLA)",  "cross-tenant authz"),
+        atk("userenum",   "Username enumeration (login timing/differential)", "login-timing-enum"),
+        atk("enumoracle", "Existence/identity oracle (tenant/resource enumeration)", "existence-oracle"),
+        atk("recoveryenum", "Account enumeration via password-reset/recovery", "recovery-enum"),
+        atk("secheaders", "Missing security response headers (CSP/X-Content-Type-Options/…)", "security-headers"),
         atk("jwt",        "JWT analysis",                      "jwt analysis"),
         atk("unauth",     "Unauthenticated-access",            "unauthenticated-access"),
         atk("webhook",    "Webhook fail-open",                 "webhook"),
@@ -147,7 +152,6 @@ public final class ScanPhases {
         int n = 0; for (Phase q : ALL) if (runsUnderFilter(q, only)) n++; return n;
     }
 
-    public static int totalPhases()   { return ALL.size(); }
     public static int attackCount()   { int n = 0; for (Phase p : ALL) if (p.isAttack()) n++; return n; }
     public static int lifecycleCount(){ return ALL.size() - attackCount(); }
 }

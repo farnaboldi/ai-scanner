@@ -41,9 +41,6 @@ public abstract class Probe {
     /** Set the between-requests politeness delay (ms). Called by AiScanner from ScanConfig.delayMs at scan start. */
     public static void setPolitenessDelayMs(int ms) { politenessDelayMs = Math.max(0, ms); }
 
-    /** The current politeness delay (ms); 0 = none. */
-    public static int politenessDelayMs() { return politenessDelayMs; }
-
     // ---- centralized, Settings-configurable per-request timeout (ScanConfig.requestTimeoutMs) ----------------
     // Single source of truth for the default probe→target response timeout, replacing the ~40 hardcoded 12000L
     // literals that used to live in every probe. AiScanner pushes ScanConfig.requestTimeoutMs here at scan start,
@@ -114,7 +111,7 @@ public abstract class Probe {
             if (!p.contains("/cdn-cgi/") && !p.contains("challenge-platform"))
                 scanLog.debug("[WAF-evasion] " + req.method() + " " + p + "  reason=" + Evasion.autoReason());
         }
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(responseTimeoutMs)); }
+        try { return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(responseTimeoutMs)); }
         catch (Throwable t) { return null; }
     }
 }

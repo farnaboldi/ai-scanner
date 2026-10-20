@@ -96,7 +96,7 @@ public final class RouteHarvester {
                 }
                 String paramName = params.isEmpty() ? field : params.get(0);
                 out.add(new StaticHint("POST", "/graphql", new ArrayList<>(params), paramName,
-                        "", "graphql", prov + " " + kind + "." + field, 0.5, ""));
+                        "", "graphql", prov + " " + kind + "." + field, 0.5));
             }
         }
         return out;
@@ -152,7 +152,7 @@ public final class RouteHarvester {
         Matcher r = RAILS_R.matcher(code);
         while (r.find()) {
             String path = "/" + r.group(1);
-            out.add(new StaticHint("", path, new ArrayList<>(), "", "", "route", prov, 0.5, ""));
+            out.add(new StaticHint("", path, new ArrayList<>(), "", "", "route", prov, 0.5));
         }
         out.addAll(parseAspNet(code, prov));                // ASP.NET Core attribute routing (class [Route] + method [Http*])
         return out;
@@ -183,7 +183,7 @@ public final class RouteHarvester {
             // never reached. Deterministic, steering-only; discovery live-probes and the oracles decide.
             List<String> params = new ArrayList<>(pathParams(path));
             for (String mp : aspNetMethodParams(code, hm.end())) if (!params.contains(mp)) params.add(mp);
-            out.add(new StaticHint(method, path, params, params.isEmpty() ? "" : params.get(0), "", "route", prov, 0.5, ""));
+            out.add(new StaticHint(method, path, params, params.isEmpty() ? "" : params.get(0), "", "route", prov, 0.5));
         }
         return out;
     }
@@ -258,7 +258,7 @@ public final class RouteHarvester {
             String path = normPath(joinSpring(prefix, sub));
             if (path.isBlank()) continue;
             List<String> params = pathParams(path);
-            out.add(new StaticHint(normMethod(verb), path, params, params.isEmpty() ? "" : params.get(0), "", "route", prov, 0.5, ""));
+            out.add(new StaticHint(normMethod(verb), path, params, params.isEmpty() ? "" : params.get(0), "", "route", prov, 0.5));
         }
         return out;
     }
@@ -298,7 +298,7 @@ public final class RouteHarvester {
             if (path.isBlank()) continue;
             List<String> params = pathParams(path);
             String paramName = params.isEmpty() ? "" : params.get(0);
-            out.add(new StaticHint(method, path, params, paramName, "", "route", prov, 0.5, ""));
+            out.add(new StaticHint(method, path, params, paramName, "", "route", prov, 0.5));
         }
     }
 

@@ -5,6 +5,8 @@ import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.engine.AiEngine;
 import com.ioactive.aiscanner.scan.RequestContext;
+import com.ioactive.aiscanner.scan.SafeHttp;
+import com.ioactive.aiscanner.scan.WriteGuard;
 import com.ioactive.aiscanner.ui.ScanLog;
 import com.ioactive.aiscanner.vulns.Signal;
 import com.ioactive.aiscanner.vulns.VulnClass;
@@ -97,13 +99,18 @@ public final class FlowEngine {
         long deadlineMs = System.currentTimeMillis() + Long.getLong("aiscanner.flowBudgetMs", 240_000L);
 
         for (HttpRequest seed : seeds) {
-            if (seedCount++ >= MAX_SEEDS) break;
+            if (seedCount >= MAX_SEEDS) break;
             if (System.currentTimeMillis() >= deadlineMs) {
-                scanLog.debug("  flow: time budget reached — stopping after " + (seedCount - 1) + " seed(s)");
+                scanLog.debug("  flow: time budget reached — stopping after " + seedCount + " seed(s)");
                 break;
             }
+            HttpRequest seedReq = applySession(seed);
+            // A seed the verb guard refuses (DELETE/PATCH/MERGE, incl. via _method or an override header) can never
+            // be observed: skip it BEFORE it takes a MAX_SEEDS slot from a seed that can.
+            if (WriteGuard.blocksDestructiveVerb(seedReq)) { SafeHttp.noteBlocked(seedReq, "flow-engine"); continue; }
+            seedCount++;
 
-            StepResult obs0 = safeSend(applySession(seed));   // OBSERVE step-0: un-mutated, authenticated
+            StepResult obs0 = safeSend(seedReq);   // OBSERVE step-0: un-mutated, authenticated
             if (obs0 == null || !obs0.live()) continue;
             String baselineBody = obs0.body() == null ? "" : obs0.body();
             HttpRequestResponse cursor = obs0.rr();
@@ -113,7 +120,6 @@ public final class FlowEngine {
             for (int step = 1; step <= MAX_STEPS_PER_SEED; step++) {
                 if (System.currentTimeMillis() >= deadlineMs) break;
                 String observation = RequestContext.of(cursor).forLlm();
-                String carriedId = firstIdOrToken(cursor);                 // from the REAL response bytes
 
                 String rawJson = engine.planNextRequest(goal, observation, feedback);   // PLAN
                 PlannedRequest p = PlannedRequest.parse(rawJson);
@@ -128,7 +134,22 @@ public final class FlowEngine {
                     if (++plateau >= MAX_PLATEAU) break; else continue;
                 }
 
-                StepResult act = safeSend(applySession(p.toHttpRequest()));   // ACT
+                HttpRequest planned = applySession(p.toHttpRequest());
+                // Verb guard BEFORE the send: a planned DELETE/PATCH/MERGE (request line, override header, _method,
+                // batch sub-request) is never sent. Tell the planner it is a policy refusal so it re-plans with an
+                // allowed verb, instead of "not real (HTTP 0)", which would wrongly mark the endpoint dead. Nothing was
+                // learned about the target, so the plateau is untouched; the step still counts, which bounds the loop.
+                if (WriteGuard.blocksDestructiveVerb(planned)) {
+                    SafeHttp.noteBlocked(planned, "flow-engine");
+                    scanLog.debug("  flow step " + step + ": " + p.method() + " " + p.url() + " NOT sent (verb guard)");
+                    String claimed = WriteGuard.effectiveMethod(planned);
+                    feedback = "planned " + p.method() + " " + p.url()
+                            + (claimed.equals(p.method()) ? "" : " (carries " + claimed + ")")
+                            + " was NOT sent: DELETE, PATCH and MERGE are disabled on this engagement (directly or via "
+                            + "_method, X-HTTP-Method-Override or a batch sub-request). Plan the next step with GET, POST or PUT.";
+                    continue;
+                }
+                StepResult act = safeSend(planned);   // ACT
                 if (act == null || !act.live()) {
                     feedback = "planned " + p.method() + " " + p.url() + " not real (HTTP "
                             + (act == null ? 0 : act.status()) + ") — do not reuse it";
@@ -147,7 +168,7 @@ public final class FlowEngine {
                     scanLog.debug("  flow: mid-chain bearer updated (step " + step + ")");
                 }
 
-                if (verify(p, baselineBody, act, carriedId)) {
+                if (verify(p, baselineBody, act)) {
                     findings++;
                     break;
                 }
@@ -187,9 +208,9 @@ public final class FlowEngine {
     /** 2xx requests the LLM reached that the crawl/mining didn't — for the caller to bridge into site map + targets. */
     public List<HttpRequestResponse> reachedResponses() { return reached; }
 
-    // ---- VERIFY: deterministic only. vulnClassHint routes which check runs; the comparison is the verdict. ----
+    // ---- VERIFY: deterministic only. Every check runs on each ACT response; the comparison is the verdict. ----
 
-    private boolean verify(PlannedRequest p, String baselineBody, StepResult act, String carriedId) {
+    private boolean verify(PlannedRequest p, String baselineBody, StepResult act) {
         String body = act.body() == null ? "" : act.body();
         String url = act.rr().request().url();
 
@@ -228,31 +249,9 @@ public final class FlowEngine {
 
     // ---- generic helpers (no per-app rules) ----
 
-    private static final Pattern ID_JSON = Pattern.compile(
-            "(?i)\"(?:_?id|token|uuid|guid|order[_]?id|session|access[_]?token)\"\\s*:\\s*\"?([A-Za-z0-9_\\-]{1,64})\"?");
-    private static final Pattern ID_PATH = Pattern.compile(".*/([A-Za-z0-9][A-Za-z0-9_\\-]{3,63})/?$");
-    private static final Pattern LOC_ID = Pattern.compile("([A-Za-z0-9_\\-]{6,64})");
     private static final Pattern ELEVATED = Pattern.compile(
             "(?i)\"(?:role|roles|authority|privilege|group|type)\"\\s*:\\s*\"?(admin|administrator|superuser|root|owner)\"?"
             + "|\"(?:is[_]?admin|admin|superuser|elevated)\"\\s*:\\s*true");
-
-    /** Carry-forward id/token from the REAL prior response: first id/token JSON value, else a Location id,
-     *  else a trailing id-looking path segment. Generic — no app-specific field names. */
-    private static String firstIdOrToken(HttpRequestResponse rr) {
-        try {
-            if (rr.response() != null) {
-                Matcher m = ID_JSON.matcher(rr.response().bodyToString());
-                if (m.find()) return m.group(1);
-                if (rr.response().hasHeader("Location")) {
-                    Matcher lm = LOC_ID.matcher(rr.response().headerValue("Location"));
-                    if (lm.find()) return lm.group(1);
-                }
-            }
-            Matcher pm = ID_PATH.matcher(rr.request().pathWithoutQuery());
-            if (pm.matches()) return pm.group(1);
-        } catch (Throwable ignore) { }
-        return null;
-    }
 
     private static boolean echoesElevatedRole(String body) {
         return body != null && ELEVATED.matcher(body).find();

@@ -38,6 +38,13 @@ LOGIN_PASS="${AISCANNER_LOGIN_PASSWORD:-}"
 # can't replicate the login (client-side-crypto login, SSO, MFA). AISCANNER_LANDING = the post-login entry URL.
 SEED_COOKIE="${AISCANNER_COOKIE:-}"
 SEED_BEARER="${AISCANNER_BEARER:-}"
+# Optional SECOND identity B (a different tenant/user) — enables the cross-tenant object-authz differential
+# (xtauthz) + two-identity BOLA/IDOR oracles. Seed a session owning NONE of A's objects.
+SEED_COOKIE_B="${AISCANNER_COOKIE_B:-}"
+SEED_BEARER_B="${AISCANNER_BEARER_B:-}"
+# Optional anonymous / pre-login client token (no account) — the existence-oracle probe tests it as the tier
+# between "no credentials" and "authenticated session". Same process-table caveat as the other seeds.
+SEED_ANON_BEARER="${AISCANNER_ANON_BEARER:-}"
 SEED_LANDING="${AISCANNER_LANDING:-}"
 # Optional source repo (local path OR git URL) — drives SAST-assisted DAST. A URL is cloned HERE (shallow, temp)
 # and only a LOCAL PATH is handed to the extension, which reads files with java.nio and never clones/spawns.
@@ -93,7 +100,10 @@ for c in "$HOME/.BurpSuite/UserConfigPro.json" "$HOME/.BurpSuite/UserConfig.json
 done
 CONF="${TMPDIR:-/tmp}/aiscanner-burp-conf.$$.json"
 CONF_PROJECT="${TMPDIR:-/tmp}/aiscanner-proj-conf.$$.json"
-PROJECT="${TMPDIR:-/tmp}/aiscanner-project.$$.burp"
+# AISCANNER_PROJECT_FILE: point multiple launches at the SAME .burp project file so the site map +
+# issues ACCUMULATE across runs (e.g. repeated short bursts against a target whose session expires too
+# fast for one long scan). Default: a fresh disposable per-PID file, unchanged from before.
+PROJECT="${AISCANNER_PROJECT_FILE:-${TMPDIR:-/tmp}/aiscanner-project.$$.burp}"
 SRC_CLONE=""   # set if we shallow-clone a source-repo URL; removed on exit
 trap 'rm -f "$CONF" "$CONF_PROJECT"; [ -n "$SRC_CLONE" ] && rm -rf "$SRC_CLONE"' EXIT
 
@@ -254,6 +264,38 @@ if [ -d "$SESS_DIR" ]; then
   fi
 fi
 
+# ---- suppress Burp's own update check + "new version available" dialog ----
+# A modal update prompt blocks unattended launches (the run sits waiting for a click). Burp keeps these switches in
+# the user's Java Preferences (node /burp) — not in the JSON user config we clone — so flip them with java.util.prefs
+# BEFORE launch: burp.suite.suppressupdatedialog=true and every *suite.AUTO_UPDATE_ENABLED_<id>=false.
+# User-level and persistent (your everyday Burp stops prompting too). Opt out: AISCANNER_ALLOW_UPDATE_CHECK=1.
+if [ "${AISCANNER_ALLOW_UPDATE_CHECK:-0}" != "1" ]; then
+  _noupd=$(mktemp -d "${TMPDIR:-/tmp}/aisc-noupd.XXXXXX")
+  cat > "$_noupd/BurpNoUpdate.java" <<'JEOF'
+import java.util.prefs.Preferences;
+public class BurpNoUpdate {
+  public static void main(String[] a) throws Exception {
+    Preferences p = Preferences.userRoot().node("burp");
+    int n = 0;
+    for (String k : p.keys())
+      if (k.matches("(?:[a-z]+\\.)?suite\\.AUTO_UPDATE_ENABLED_.+") && !"false".equals(p.get(k, ""))) { p.put(k, "false"); n++; }
+    for (String k : new String[]{"burp.suite.suppressupdatedialog", "suite.suppressupdatedialog"})
+      if (!"true".equals(p.get(k, ""))) { p.put(k, "true"); n++; }
+    p.flush();
+    System.out.println(n == 0 ? "already off" : n + " setting(s) changed");
+  }
+}
+JEOF
+  _noupd_ok=""
+  # source-file launch needs a full JDK (Burp's bundled runtime may lack the compiler) → try PATH java first
+  for _j in "$(command -v java 2>/dev/null)" "$JAVA"; do
+    [ -n "$_j" ] || continue
+    if _out=$("$_j" "$_noupd/BurpNoUpdate.java" 2>/dev/null); then echo ".. Burp update check + dialog suppressed ($_out)"; _noupd_ok=1; break; fi
+  done
+  [ -n "$_noupd_ok" ] || echo "!! (warning) could not suppress Burp's update dialog (needs a JDK 11+ on PATH) — an update prompt may block this launch" >&2
+  rm -rf "$_noupd"
+fi
+
 # ---- launch Burp (GUI, interactive) with AI Scanner self-configured + auto-scan ----
 # Fully built-in: Burp's OWN native crawler (api.scanner().startCrawl) + pure-Java auth/discovery/probes.
 # No external binaries (no Node/Playwright) — BApp-store compliant.
@@ -293,10 +335,12 @@ exec "$JAVA" \
   ${LOGIN_PASS:+-Daiscanner.loginPassword="${LOGIN_PASS}"} \
   ${SEED_COOKIE:+-Daiscanner.cookie="${SEED_COOKIE}"} \
   ${SEED_BEARER:+-Daiscanner.bearer="${SEED_BEARER}"} \
+  ${SEED_COOKIE_B:+-Daiscanner.cookieB="${SEED_COOKIE_B}"} \
+  ${SEED_BEARER_B:+-Daiscanner.bearerB="${SEED_BEARER_B}"} \
+  ${SEED_ANON_BEARER:+-Daiscanner.anonBearer="${SEED_ANON_BEARER}"} \
   ${SEED_LANDING:+-Daiscanner.landing="${SEED_LANDING}"} \
   ${AISCANNER_GWT_FOREIGN_IDS:+-Daiscanner.gwtForeignIds="${AISCANNER_GWT_FOREIGN_IDS}"} \
   ${AISCANNER_GWT_FOREIGN_KEYS:+-Daiscanner.gwtForeignKeys="${AISCANNER_GWT_FOREIGN_KEYS}"} \
-  ${AISCANNER_GWT_SEED_IDS:+-Daiscanner.gwtSeedIds="${AISCANNER_GWT_SEED_IDS}"} \
   ${REPORT_DIR:+-Daiscanner.reportDir="${REPORT_DIR}"} \
   ${SOURCE_REPO:+-Daiscanner.sourceRepo="${SOURCE_REPO}"} \
   ${AISCANNER_AUTOSCAN_REPOS:+-Daiscanner.autoscanRepos="${AISCANNER_AUTOSCAN_REPOS}"} \

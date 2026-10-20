@@ -202,7 +202,7 @@ public final class PostmanParser {
         }
         params.addAll(bodyKeys(req.optJSONObject("body")));
 
-        return new StaticHint(method, path, new ArrayList<>(params), "", "", "", "postman-collection", 0.5, "");
+        return new StaticHint(method, path, new ArrayList<>(params), "", "", "", "postman-collection", 0.5);
     }
 
     /** Resolve the URL path: prefer the structured {@code url.path} segments, else strip scheme/host/query from raw.

@@ -108,7 +108,6 @@ public final class CommandInjectionProbe extends Probe {
             if (synBody != null && synBody.trim().startsWith("{")) {
                 HttpRequestResponse cur = send(req);
                 if (cur != null && cur.response() != null && cur.response().statusCode() >= 400) {
-                    boolean wrappedTested = false;
                     String[] wrapSeeds = { seed(h.paramName), "uptime", "ls", "id", "whoami", "dir", "" };
                     wrapSearch:
                     for (String wk : WRAP_KEYS) {
@@ -123,13 +122,11 @@ public final class CommandInjectionProbe extends Probe {
                                 if (confirmWith(wrFinal,
                                         v -> setNestedBodyParam(wrFinal, wkFinal, h.paramName, v),
                                         wsFinal, wlabel, true)) hits++;
-                                wrappedTested = true;
                                 break wrapSearch;
                             }
                         }
                     }
-                    if (wrappedTested) continue;   // found a valid wrapper — skip flat confirm
-                    continue;   // no wrapper worked either — endpoint fully rejects our params
+                    continue;   // valid wrapper tested above, or none accepted — either way skip the flat confirm
                 }
             }
 
@@ -210,7 +207,6 @@ public final class CommandInjectionProbe extends Probe {
                 }
                 if (foundSeed == null) return false;   // every seed blocked — not injectable via this oracle
                 seedVal  = foundSeed;
-                baseRR   = foundRR;
                 baseBody = foundRR.response().bodyToString();
             }
 
@@ -358,7 +354,7 @@ public final class CommandInjectionProbe extends Probe {
     protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): custom sleep-tied timeout
         politeness();   // ScanConfig politeness delay
         // Response timeout must exceed the injected sleep so a successful delay is OBSERVED, not cut off.
-        try { return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout((SLEEP_S + 8) * 1000L)); }
+        try { return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout((SLEEP_S + 8) * 1000L)); }
         catch (Throwable t) { return null; }
     }
 }

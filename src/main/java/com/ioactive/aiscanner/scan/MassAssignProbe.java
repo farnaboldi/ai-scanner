@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.ui.ScanLog;
@@ -16,7 +15,9 @@ import java.util.regex.Pattern;
  * (admin/is_admin/role/is_staff/is_superuser), logs it in, then proves the field TOOK EFFECT: an admin-tier
  * action that our existing NORMAL session (N) is DENIED (401/403) SUCCEEDS (2xx) for M. Identical request, the
  * only difference being the injected field ⇒ zero-FP. The destructive verb (DELETE) targets throwaway accounts
- * WE register, so it never touches seeded or other-users' data.
+ * WE register, so it never touches seeded or other-users' data — and it goes out only where the verb guard lets DELETE
+ * through (a local lab host with the opt-in); elsewhere that differential and its sacrificial accounts are skipped,
+ * leaving the JWT-readback differential.
  *
  * <p>Generic: the register/login shapes come from the two auth-candidate requests discovery already found; field
  * names are matched by category (username/password/email), not hardcoded; the user-collection + delete URL are
@@ -69,11 +70,24 @@ public final class MassAssignProbe extends Probe {
 
         int n = Math.abs((host + reg.path()).hashCode() % 9000);
         String mUser = "aiscma" + n, nUser = "aiscmn" + n, sacA = "aiscsa" + n, sacB = "aiscsb" + n, pw = "AiscMa!" + n;
-        // 1. register M (privilege-injected), a NORMAL control N, and two sacrificials — all our own throwaways.
+        // The step-3 admin-tier DELETEs, built up front: the sacrificial accounts exist ONLY for them, so when the verb
+        // guard refuses DELETE (everywhere but an opted-in local lab host) registering sacA/sacB would just leave junk
+        // accounts on the target for a step that can never produce a result. The JWT-readback differential needs only M
+        // and N.
+        String collRoot = reg.url().substring(0, reg.url().lastIndexOf('/'));   // …/register → …/users/v1
+        HttpRequest delA = HttpRequest.httpRequestFromUrl(collRoot + "/" + sacA).withMethod("DELETE");
+        HttpRequest delB = HttpRequest.httpRequestFromUrl(collRoot + "/" + sacB).withMethod("DELETE");
+        boolean deleteDiff = !WriteGuard.blocksDestructiveVerb(delA) && !WriteGuard.blocksDestructiveVerb(delB);
+        if (!deleteDiff) scanLog.log("mass-assign: DELETE differential disabled by the verb guard — no sacrificial "
+                + "accounts registered; JWT-readback differential only.");
+        // 1. register M (privilege-injected), a NORMAL control N, and (DELETE differential only) two sacrificials — all
+        //    our own throwaways.
         int mReg = status(register(reg, mUser, pw, true));
         int nReg = status(register(reg, nUser, pw, false));
-        status(register(reg, sacA, pw, false));
-        status(register(reg, sacB, pw, false));
+        if (deleteDiff) {
+            status(register(reg, sacA, pw, false));
+            status(register(reg, sacB, pw, false));
+        }
         scanLog.debug("  mass-assign: register M(" + mUser + ")->HTTP " + mReg + ", N->HTTP " + nReg);
         // A STRICT / mass-assignment register INSERTs every field it receives, so the full privilege+email superset
         // 500s on columns the app lacks (opposite of a lenient API that ignores extras — e.g. an app that only knows
@@ -85,7 +99,7 @@ public final class MassAssignProbe extends Probe {
                 int ms2 = status(registerMinimal(reg, mu, pw, pf));
                 int ns2 = status(registerMinimal(reg, nu, pw, null));
                 if (ms2 >= 200 && ms2 < 400) {
-                    mUser = mu; nUser = nu; mReg = ms2; nReg = ns2;
+                    mUser = mu; nUser = nu; mReg = ms2;
                     scanLog.debug("  mass-assign: minimal register {" + pf + "} → M HTTP " + ms2 + ", N HTTP " + ns2);
                     break;
                 }
@@ -112,16 +126,15 @@ public final class MassAssignProbe extends Probe {
             scanLog.incFinding();
             return 1;
         }
-        if (tokenM == null || tokenN == null) return 0;
+        if (!deleteDiff || tokenM == null || tokenN == null) return 0;
 
         // 3. privilege differential on an admin-tier DELETE (derived user-collection + {id}): N denied, M allowed.
-        String collRoot = reg.url().substring(0, reg.url().lastIndexOf('/'));   // …/register → …/users/v1
-        int ns = status(send(HttpRequest.httpRequestFromUrl(collRoot + "/" + sacA).withMethod("DELETE"), null, null, tokenN));
-        int ms = status(send(HttpRequest.httpRequestFromUrl(collRoot + "/" + sacB).withMethod("DELETE"), null, null, tokenM));
+        int ns = status(send(delA, null, null, tokenN));
+        int ms = status(send(delB, null, null, tokenM));
         scanLog.debug("  mass-assign: DELETE differential — N->HTTP " + ns + ", M->HTTP " + ms + " @ " + collRoot + "/{user}");
         if (ns >= 200 && ns < 300) return 0;                                     // normal N could ALSO do it ⇒ not a priv escalation (open/BFLA, not mass-assign)
         if (ms >= 200 && ms < 300) {
-            HttpRequestResponse ev = send(HttpRequest.httpRequestFromUrl(collRoot + "/" + sacA).withMethod("DELETE"), null, null, tokenM);
+            HttpRequestResponse ev = send(delA, null, null, tokenM);
             scanLog.found("Mass-assignment — privilege escalation on registration (CWE-915)", reg.url(),
                     "Registering with injected privilege field(s) (admin/is_admin/role/is_staff/is_superuser) produced an "
                     + "account that performs an admin-tier action — DELETE " + collRoot + "/{user} → HTTP " + ms + " — which "
@@ -163,6 +176,14 @@ public final class MassAssignProbe extends Probe {
             } catch (Throwable ignore) { }
         }
         if (upd == null) { scanLog.debug("  mass-assign(form): no form-encoded self-account update request/form observed — skipped"); return 0; }
+        // The exact update step 3 replays. A Rails/Laravel edit form for a persisted record tunnels its verb as
+        // `_method=patch`, which the verb guard refuses — and a differential around an update that was never sent can
+        // only mistake page noise (any href containing "admin") for an escalation. So stop here, before any baseline
+        // traffic.
+        String injected = injectPrivParams(upd.bodyToString());
+        if (injected.equals(upd.bodyToString())) return 0;
+        HttpRequest updInj = upd.withBody(injected);
+        if (WriteGuard.blocksDestructiveVerb(updInj)) { SafeHttp.noteBlocked(updInj, "mass-assign form arm"); return 0; }
 
         // 2. BASELINE: an AUTHENTICATED reference page carrying the app's nav/sidebar, whose admin-only element(s) are
         //    gated by an `is_admin?`-style check. Prefer the form page (updateFromForm sets it); else find an authed
@@ -172,12 +193,10 @@ public final class MassAssignProbe extends Probe {
         java.util.Set<String> adminBefore = adminMarkers(body(send(HttpRequest.httpRequestFromUrl(ref).withMethod("GET"), cookie, bearer, null)));
 
         // 3. replay the account update with injected privilege params (flat + the form's own wrapper, e.g. user[admin]).
-        String injected = injectPrivParams(upd.bodyToString());
-        if (injected.equals(upd.bodyToString())) return 0;
-        int upStatus = status(send(upd.withBody(injected), cookie, bearer, null));
+        int upStatus = status(send(updInj, cookie, bearer, null));
         scanLog.debug("  mass-assign(form): update=" + Net.stripQuery(upd.url()) + " injected → HTTP " + upStatus
                 + " (ref=" + Net.stripQuery(ref) + ", admin-markers-before=" + adminBefore.size() + ")");
-        if (upStatus >= 400) return 0;                                       // update rejected → the field didn't take
+        if (upStatus < 200 || upStatus >= 400) return 0;                     // rejected, or no response (-1: refused/failed send) → the field didn't take
 
         // 4. DIFFERENTIAL: admin-only UI element(s) that appear on the SAME page AFTER but not BEFORE ⇒ the injected
         //    privilege flag took effect (is_admin? now true). Same session; only difference is the injected field.

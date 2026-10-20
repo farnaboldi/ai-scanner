@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
@@ -110,14 +109,6 @@ public final class IdorGetProbe extends Probe {
             if ("IDOR".equalsIgnoreCase(h.vulnClass) && (!h.hasEndpoint() || h.matchesUrl(url)))
                 return "  " + h.provenance();
         return "";
-    }
-
-    public int probe(String host, String cookieHeader, String bearer) {
-        return probe(host, cookieHeader, bearer, null, null, null);   // single-identity (backward-compatible)
-    }
-
-    public int probe(String host, String cookieHeader, String bearer, String cookieB, String bearerB) {
-        return probe(host, cookieHeader, bearer, cookieB, bearerB, null);
     }
 
     /** @param cookieB,bearerB a SECOND distinct authenticated identity B (or null). When present, id-bearing objects

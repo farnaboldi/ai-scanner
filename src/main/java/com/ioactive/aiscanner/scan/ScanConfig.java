@@ -1,10 +1,5 @@
 package com.ioactive.aiscanner.scan;
 
-import com.ioactive.aiscanner.vulns.VulnClass;
-import com.ioactive.aiscanner.vulns.VulnClasses;
-
-import java.util.List;
-
 /** Tunables for the adaptive attack loop (surfaced in the settings tab). */
 public final class ScanConfig {
 
@@ -19,7 +14,6 @@ public final class ScanConfig {
     public volatile int requestTimeoutMs = 12000; // per-request response timeout for probe→target HTTP sends
     public volatile boolean logToFile = false;    // mirror the scan log + chat to a file (Settings toggle / -Daiscanner.logFile)
     public volatile String logFilePath = "";      // destination path when logToFile is on
-    public volatile List<VulnClass> enabledClasses = VulnClasses.all();
 
     /** Hard cap on attack requests per (insertion point, class) to bound cost. */
     public int maxRequestsPerClass() {

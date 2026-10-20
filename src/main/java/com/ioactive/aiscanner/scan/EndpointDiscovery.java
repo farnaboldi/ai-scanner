@@ -44,6 +44,13 @@ public final class EndpointDiscovery {
     // guards enter — the same conditions under which the request was accepted, so no junk/FP surface.
     private final List<HttpRequestResponse> keptResponses = new ArrayList<>();
 
+    // "Wall" signatures: signatures of how the host answers paths that CANNOT exist when that answer is NOT a 2xx — a
+    // uniform 3xx redirect (typically to the login page: every unauthenticated path 307s to /login) or a uniform
+    // 401/403 body (an auth wall in front of the whole app). A guessed path that gets the SAME answer carries no
+    // existence information, so it must not become a "live endpoint" (inventory, probe candidate, derived login).
+    // Learned per host from two nonce probes that must agree; empty ⇒ no effect (normal 404 hosts are untouched).
+    private final Set<String> wallSigs = new java.util.HashSet<>();
+
     // Soft-404 content signature: some APIs answer HTTP 200 for EVERY unknown path (a catch-all like DVCSharp's
     // "DVCSharp API: Route not found!"), which defeats status-based existence probing — phantom paths look LIVE and
     // param reconstruction invents junk fields. We learn the catch-all body from random paths and treat any 2xx
@@ -151,8 +158,11 @@ public final class EndpointDiscovery {
             String base = baseUrl.replaceAll("/+$", "");
             String t1 = "aiscnf" + Long.toString(Math.abs(System.nanoTime()), 36);
             String t2 = "aiscnf" + Long.toString(Math.abs(System.nanoTime()) + 7, 36);
-            HttpRequestResponse r1 = probe(HttpRequest.httpRequestFromUrl(base + "/" + t1).withMethod("GET"));
-            HttpRequestResponse r2 = probe(HttpRequest.httpRequestFromUrl(base + "/api/" + t2).withMethod("GET"));
+            // Learning probes use rawProbe(): they are nonexistent-by-construction paths and must never be registered
+            // in the site map (they used to show up in the inventory and get attacked by the whole battery).
+            HttpRequestResponse r1 = rawProbe(HttpRequest.httpRequestFromUrl(base + "/" + t1).withMethod("GET"));
+            HttpRequestResponse r2 = rawProbe(HttpRequest.httpRequestFromUrl(base + "/api/" + t2).withMethod("GET"));
+            learnWall(base, r1, t1, r2, t2);   // non-2xx catch-alls: uniform redirect / 401-403 wall
             int s1 = statusOf(r1), s2 = statusOf(r2);
             if (s1 < 200 || s1 >= 300 || s2 < 200 || s2 >= 300) return;   // real 404s → status gating already works
             String b1 = normBody(r1, t1), b2 = normBody(r2, t2);
@@ -164,8 +174,80 @@ public final class EndpointDiscovery {
         } catch (Throwable ignore) { }
     }
 
-    /** A 2xx response whose body matches the learned catch-all signature — a content 404, not a real endpoint. */
+    /** Learn non-2xx catch-all ("wall") signatures. For each of the two probe locations (site root, /api/) whose first
+     *  answer is wall-class, send ONE more nonce path at the same location; the signature is kept only when both
+     *  agree — so a path-echoing redirect, a per-path 404 page or a one-off error never yields a signature and
+     *  nothing is over-pruned. Costs 0 extra requests on a normal 404 host (the first answers aren't wall-class). */
+    private void learnWall(String base, HttpRequestResponse r1, String t1, HttpRequestResponse r2, String t2) {
+        if (!Tuning.b("aiscanner.pruneWall", "AISCANNER_PRUNE_WALL", true)) return;
+        try {
+            String[] prefix = { "", "/api" };
+            HttpRequestResponse[] firsts = { r1, r2 };
+            String[] tokens = { t1, t2 };
+            int added = 0;
+            for (int i = 0; i < 2; i++) {
+                String s1 = wallSig(firsts[i], tokens[i]);
+                if (s1 == null) continue;
+                String t = "aiscnf" + Long.toString(Math.abs(System.nanoTime()) + 13 + i, 36);
+                HttpRequestResponse rb = rawProbe(HttpRequest.httpRequestFromUrl(base + prefix[i] + "/" + t).withMethod("GET"));
+                if (s1.equals(wallSig(rb, t)) && wallSigs.add(s1)) added++;
+            }
+            if (added > 0) {
+                StringBuilder sb = new StringBuilder();
+                for (String w : wallSigs) { if (sb.length() > 0) sb.append("  ;  "); sb.append(w.length() > 90 ? w.substring(0, 90) + "…" : w); }
+                scanLog.log("  wall: host answers paths that cannot exist uniformly [" + sb + "] — pruning guessed paths/endpoints that get "
+                        + "the SAME answer (no existence signal: not inventory, not a probe candidate, not a derived login).");
+            }
+        } catch (Throwable ignore) { }
+    }
+
+    /** Signature of a wall-class answer, or null when {@code rr} is not one. 3xx → the redirect target (authority +
+     *  PATH of Location, query/fragment dropped so a {@code callbackUrl=<path>} echo can't vary it; null when the
+     *  target echoes the probed nonce). 401/403 → status + normalized body. 2xx is handled by the soft-404 learner. */
+    private static String wallSig(HttpRequestResponse rr, String stripToken) {
+        if (rr == null || rr.response() == null) return null;
+        int st = rr.response().statusCode();
+        if (st >= 300 && st < 400) {
+            String loc = rr.response().headerValue("Location");
+            if (loc == null || loc.isBlank()) return null;
+            String t = loc.trim();
+            int cut = t.indexOf('?'); if (cut >= 0) t = t.substring(0, cut);
+            cut = t.indexOf('#');     if (cut >= 0) t = t.substring(0, cut);
+            try {
+                URI u = URI.create(t);
+                t = (u.getHost() != null ? u.getHost() : "") + (u.getPath() != null ? u.getPath() : "");
+            } catch (Exception ignore) { /* keep the trimmed raw value */ }
+            if (stripToken != null && t.contains(stripToken)) return null;   // path-echoing redirect → not uniform
+            return "3xx>" + t;
+        }
+        if (st == 401 || st == 403) return st + "|" + normBody(rr, stripToken);
+        return null;
+    }
+
+    /** True when {@code rr} carries a learned wall signature: indistinguishable from the answer to a path that
+     *  cannot exist, so it is NOT evidence that the probed endpoint exists.
+     *
+     *  <p>A learned REDIRECT wall only counts for safe/idempotent methods (GET/HEAD). For POST/PUT/… a redirect to
+     *  that same target is ordinary handler behavior — post-redirect-get, or a FAILED login bouncing back to the login
+     *  page — so treating it as "path doesn't exist" would drop genuine login/form endpoints. A 401/403 auth wall
+     *  applies to every method: a real login endpoint can never sit behind the wall that guards the rest of the app
+     *  (callers must reach it unauthenticated), so a uniform 401/403 is never evidence of a login. */
+    private boolean matchesWall(HttpRequestResponse rr) {
+        if (wallSigs.isEmpty()) return false;
+        String s = wallSig(rr, null);
+        if (s == null || !wallSigs.contains(s)) return false;
+        if (s.startsWith("3xx>")) {
+            String m = "GET";
+            try { m = rr.request().method(); } catch (Throwable ignore) { }
+            return "GET".equalsIgnoreCase(m) || "HEAD".equalsIgnoreCase(m);
+        }
+        return true;
+    }
+
+    /** True when the response is indistinguishable from a path that does not exist: a 2xx body matching the learned
+     *  catch-all (content 404) OR a learned uniform redirect / 401-403 wall — not a real endpoint either way. */
     private boolean isSoftNotFound(HttpRequestResponse rr) {
+        if (matchesWall(rr)) return true;
         if (softNotFound == null || rr == null || rr.response() == null) return false;
         int st = rr.response().statusCode();
         if (st < 200 || st >= 300) return false;
@@ -393,6 +475,7 @@ public final class EndpointDiscovery {
                     probed++;
                     int st = statusOf(rr);
                     if (st >= 200 && st < 300 && isHtmlShell(rr)) { strikes++; continue; }   // SPA catch-all
+                    if (matchesWall(rr)) { strikes++; continue; }                             // uniform redirect/401 wall
                     if (st >= 200 && st < 400) {
                         baseReal = true; found++;
                         HttpRequest keep = authedGet(abs);
@@ -906,6 +989,9 @@ public final class EndpointDiscovery {
                 }
                 // cross-join leaf × service bases; keep the first that a real handler answers (JSON, not HTML shell)
                 boolean keptThis = false;
+                // Set when the verb guard refuses this candidate's concrete request (a PATCH leaf, an override in its
+                // query). Method, query and body are the same under every base, so one refusal settles every base.
+                boolean verbRefused = false;
                 List<String> trail = new ArrayList<>();   // per-base outcome, so a DROPPED candidate is explainable
                 for (String b : bases) {
                     if (probed >= BUDGET) break;
@@ -923,6 +1009,7 @@ public final class EndpointDiscovery {
                         for (String f : fields) {
                             if (!f.isEmpty()) req = req.withAddedParameters(HttpParameter.parameter(f, "1", HttpParameterType.URL));
                         }
+                        if (verbBlocked(req)) { verbRefused = true; break; }
                         rr = probe(req); probed++; st = statusOf(rr);
                     } else {
                         // POST/PUT/PATCH — BODY-MINIMIZATION: PREFER a minimal NUMERIC-ONLY body over the full one.
@@ -947,6 +1034,7 @@ public final class EndpointDiscovery {
                                     .withAddedHeader("Content-Type", "application/json").withBody(jsonBody(fs)));
                             if (session != null && session.hasBearer())
                                 r = r.withHeader("Authorization", "Bearer " + session.bearer());
+                            if (verbBlocked(r)) { verbRefused = true; break; }   // never sent: no probed++, no rank
                             HttpRequestResponse rp = probe(r); probed++;
                             int s = statusOf(rp);
                             int rank = (s >= 200 && s < 300) ? 3
@@ -955,6 +1043,7 @@ public final class EndpointDiscovery {
                             if (rank > bestRank) { bestRank = rank; req = r; rr = rp; st = s; }
                             if (rank == 3) break;   // clean 2xx baseline (minimal body preferred) — stop
                         }
+                        if (verbRefused) break;   // no base can send it — stop trying bases
                         if (req == null) continue;
                     }
                     // Oracle: THIS route exists under THIS base — the handler processed our request (2xx) or
@@ -965,7 +1054,7 @@ public final class EndpointDiscovery {
                     // (the service errored on our dummy input — e.g. validate-coupon 500 on an invalid coupon;
                     // that endpoint is real and its 500→200 flip under {$ne:null} is the NoSQL signal). Reject
                     // 404/405 (wrong base/method) and NON-JSON 5xx (generic crash/route-miss) and the HTML shell.
-                    boolean handlerRan = !isHtmlShell(rr) && ((st >= 200 && st < 300)
+                    boolean handlerRan = !isHtmlShell(rr) && !matchesWall(rr) && ((st >= 200 && st < 300)
                             || st == 400 || st == 401 || st == 403 || st == 409 || st == 422
                             || (st >= 500 && respIsJson(rr)));
                     // trail entry: base + status + why-rejected tag, so DROPPED candidates are fully explainable
@@ -980,7 +1069,9 @@ public final class EndpointDiscovery {
                         break;   // found this leaf's real base — stop trying other bases
                     }
                 }
-                if (!keptThis && !trail.isEmpty())   // TRACE: how far this candidate got before being dropped
+                if (verbRefused)   // not a dead route: the verb guard refused it, so it was never probed or synthesized
+                    scanLog.debug("  -· SKIPPED " + method + " " + leaf + " — verb guard (DELETE/PATCH/MERGE disabled)");
+                else if (!keptThis && !trail.isEmpty())   // TRACE: how far this candidate got before being dropped
                     scanLog.log("  -· DROPPED " + method + " " + leaf
                             + (fields.isEmpty() ? "" : " {" + String.join(",", fields) + "}") + " — " + trail);
             }
@@ -1115,7 +1206,6 @@ public final class EndpointDiscovery {
                     }
                     for (String v : values) {
                         if (submits >= SUBMIT_BUDGET) break;
-                        submits++;
                         StringBuilder enc = new StringBuilder();
                         for (Map.Entry<String, String> e : baseFields.entrySet())
                             enc.append(enc.length() > 0 ? "&" : "").append(urlenc(e.getKey())).append('=').append(urlenc(e.getValue()));
@@ -1124,6 +1214,10 @@ public final class EndpointDiscovery {
                                 ? withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs)).withMethod("POST"))
                                         .withAddedHeader("Content-Type", "application/x-www-form-urlencoded").withBody(enc.toString())
                                 : withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs) + "?" + enc).withMethod("GET"));
+                        // A menu whose form tunnels DELETE/PATCH/MERGE (a hidden _method=patch status picker) is never
+                        // submitted, and the refusal does not count against the submit budget.
+                        if (verbBlocked(req)) continue;
+                        submits++;
                         HttpRequestResponse resp = probe(req);
                         // The navigated page: a same-host redirect Location (POST-redirect-GET), else the GET URL itself.
                         String target = null;
@@ -1241,6 +1335,10 @@ public final class EndpointDiscovery {
                 } else {
                     req = withSessionCookie(HttpRequest.httpRequestFromUrl(Net.stripQuery(abs) + "?" + enc).withMethod("GET"));
                 }
+                // Rails/Laravel edit and delete forms carry a hidden _method=patch|delete, so the request is a PATCH or
+                // DELETE in all but name and the verb guard refuses it. Skip it here, so it neither spends the MAX_FORMS
+                // budget nor shows up as audit surface that can never be sent.
+                if (verbBlocked(req)) continue;
                 live.add(req); added++;
                 scanLog.log("  -> FORM " + method + " " + Net.stripQuery(abs) + " {" + String.join(",", fields.keySet()) + "}");
             }
@@ -1291,6 +1389,13 @@ public final class EndpointDiscovery {
                     if (p.type() == HttpParameterType.URL || p.type() == HttpParameterType.BODY) pn.add(p.name());
                 String key = sample.method() + " " + Net.stripQuery(sample.url()) + " " + pn;
                 if (!seen.add(key)) continue;
+                // Verb guard BEFORE probing: a variant whose concrete request claims DELETE/PATCH/MERGE (a SAST- or
+                // LLM-mined route with that method, an override in its URL) is never sent, so drop it instead of
+                // spending the probe budget on a refusal. A spec left with nothing sendable is skipped outright, NOT
+                // handed to the fallbacks below: they would read the refusal as "a bodyless probe could not resolve
+                // this route" and start POST write-body reconstruction against a DELETE/PATCH-only endpoint.
+                variants.removeIf(this::verbBlocked);
+                if (variants.isEmpty()) { scanLog.debug("  spec skipped (verb guard: DELETE/PATCH/MERGE disabled): " + key); continue; }
 
                 HttpRequest best = null; int bestSt = -1; HttpRequestResponse bestRr = null;
                 for (HttpRequest req : variants) {
@@ -1353,6 +1458,8 @@ public final class EndpointDiscovery {
                 synthesizeEndpointsLlm(host, baseUrl, live, seen);
             ingestApiSpec(host, baseUrl, live, seen);     // OpenAPI/Swagger spec → documented endpoints
             probeWellKnown(host, baseUrl, live, seen);   // standards/infra paths + i18n negative-diff
+            probeOidcDiscovery(host, baseUrl, live, seen);  // RFC 8414 OIDC/OAuth-server discovery document → its own endpoints
+            probeAuthFrameworks(host, baseUrl, live, seen); // fingerprint-gated: a recognized auth library's own documented routes
             probeAiProposedPaths(host, baseUrl, live, seen);   // LLM-proposed UNLINKED sensitive paths (admin/*, etc.)
             discoverClientRouteApis(host, baseUrl, live, seen); // SPA route nouns → API resources (frontend-orphaned endpoints)
             harvestCatalogUrls(host, live, seen);        // same-host URL VALUES in reached JSON/XML (endpoint catalog/HATEOAS) → endpoints
@@ -1694,10 +1801,6 @@ public final class EndpointDiscovery {
      *  access-control differentials. Generalizes B-minting to every spec-driven two-step app (VAmPI/crAPI/
      *  DVRestaurant), including the FastAPI form-token /token pattern the AutonomousAuth B-path can't bridge.
      *  Best-effort and idempotent: no-op if a second identity already exists, on any failure, or if B == A. */
-    private void mintSecondaryViaRecipe(String regUrl, String logUrl, String regPath, String logPath,
-                                        String rpf, String lpf, String aBearer) {
-        mintSecondaryViaRecipe(regUrl, logUrl, regPath, logPath, rpf, lpf, aBearer, "", "");
-    }
     private void mintSecondaryViaRecipe(String regUrl, String logUrl, String regPath, String logPath,
                                         String rpf, String lpf, String aBearer,
                                         String regBodyTemplate, String logBodyTemplate) {
@@ -2096,6 +2199,7 @@ public final class EndpointDiscovery {
                     if (req == null || !host.equalsIgnoreCase(hostOf(req.url()))) continue;
                     if (AuthenticatedExplorer.SESSION_RESET.matcher(req.url()).matches()) continue;
                     if (!seen.add(method.toUpperCase() + " " + Net.stripQuery(req.url()))) continue;
+                    if (verbBlocked(req)) continue;   // a documented DELETE/PATCH op: refused by the verb guard, never sent
                     HttpRequestResponse rr = probe(req);
                     int st = statusOf(rr);
                     if (st <= 0 || st == 404 || st == 405) continue;   // route absent → not real
@@ -2379,6 +2483,141 @@ public final class EndpointDiscovery {
             "/actuator", "/actuator/health", "/swagger.json", "/openapi.json", "/api-docs",
     };
 
+    // ---- RFC 8414 OIDC / OAuth-Authorization-Server discovery document ----------------------------------
+    // Fully generic (zero library/product knowledge): any OIDC provider or OAuth 2.0 authorization server that
+    // follows the standard publishes this document at a FIXED path. One GET on an app that hosts its own IdP
+    // directly yields its authorization/token/userinfo/jwks/end-session endpoints — no guessing, no wordlist.
+    // (An app that only CONSUMES a third-party IdP, e.g. an Entra ID or Okta tenant, won't have one on
+    // its own host — the discovery document lives on the IdP's host instead, which is handled below by only
+    // keeping endpoints that resolve back onto the HOST WE'RE SCANNING.)
+    private static final String[] OIDC_DISCOVERY_DOCS = {
+            "/.well-known/openid-configuration", "/.well-known/oauth-authorization-server",
+    };
+    private static final String[] OIDC_ENDPOINT_KEYS = {
+            "authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri", "end_session_endpoint",
+            "revocation_endpoint", "introspection_endpoint", "registration_endpoint",
+            "device_authorization_endpoint", "pushed_authorization_request_endpoint",
+    };
+
+    private void probeOidcDiscovery(String host, String baseUrl, List<HttpRequest> live, Set<String> seen) {
+        String root = baseUrl.replaceAll("/+$", "");
+        for (String doc : OIDC_DISCOVERY_DOCS) {
+            try {
+                String abs = root + doc;
+                if (!seen.add("GET " + abs)) continue;
+                HttpRequestResponse rr = probe(HttpRequest.httpRequestFromUrl(abs).withMethod("GET"));
+                int st = statusOf(rr);
+                if (st < 200 || st >= 300 || isSoftNotFound(rr)) continue;
+                String body = rr.response() == null ? null : rr.response().bodyToString();
+                if (body == null || !body.trim().startsWith("{")) continue;
+                JSONObject spec;
+                try { spec = new JSONObject(body.trim()); } catch (Exception badJson) { continue; }
+                live.add(withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("GET")));
+                scanLog.log("  -> OIDC-DISCOVERY " + st + "  GET " + doc);
+                int added = 0;
+                for (String key : OIDC_ENDPOINT_KEYS) {
+                    String ep = spec.optString(key, null);
+                    if (ep == null || ep.isBlank()) continue;
+                    // Only keep it when it resolves onto THIS scan's host — an endpoint on a third-party IdP
+                    // (e.g. login.microsoftonline.com) is explicitly out of this scan's scope.
+                    if (!host.equalsIgnoreCase(hostOf(ep)) || !seen.add("GET " + ep)) continue;
+                    live.add(withSessionCookie(HttpRequest.httpRequestFromUrl(ep).withMethod("GET")));
+                    scanLog.log("     + " + key + ": " + ep);
+                    added++;
+                }
+                if (added > 0) scanLog.log("  OIDC discovery document named " + added + " in-scope endpoint(s).");
+            } catch (Exception ignore) { }
+        }
+    }
+
+    // ---- Auth-framework fingerprint → its own documented route table ------------------------------------
+    // Some widely-deployed session/auth libraries mount their OWN internal router under a fixed path that the
+    // app's client-side code never references (the library handles it entirely server-side), so pure JS-mining
+    // discovery can never find it — a login-gated SPA built on one looks, from a black-box crawl, like it has
+    // no auth API at all. Recognizing the library's PUBLIC, STABLE, documented convention (here: its own cookie
+    // names — part of its published contract, unrelated to any one deployment) is the same category of signal
+    // already used above for Spring Boot's /actuator or Swagger's /swagger.json — a widely-deployed OSS
+    // convention, not one customer's app. GATED exactly like OAuthLogicProbe's well-known /authorize paths
+    // (only added once a client_id was already seen): zero effect unless the fingerprint is actually observed.
+    private static final class AuthFramework {
+        final String name; final Pattern fingerprint; final String[] staticPaths;
+        AuthFramework(String name, String fingerprintRegex, String... staticPaths) {
+            this.name = name; this.fingerprint = Pattern.compile(fingerprintRegex); this.staticPaths = staticPaths;
+        }
+    }
+    private static final AuthFramework[] AUTH_FRAMEWORKS = {
+        // NextAuth.js / Auth.js (https://authjs.dev) — cookie naming is part of its published, stable API.
+        // providers/signin/session/csrf/error/signout/_log are its own fixed internal routes (any app built on
+        // it exposes exactly these, regardless of which identity provider(s) it's configured with).
+        new AuthFramework("NextAuth.js/Auth.js",
+                "(?i)^(?:__Secure-|__Host-)?(?:next-auth|authjs)\\.(?:session-token(?:\\.\\d+)?|csrf-token|callback-url|pkce\\.code_verifier|state)$",
+                "/api/auth/providers", "/api/auth/csrf", "/api/auth/session", "/api/auth/signin",
+                "/api/auth/signout", "/api/auth/error", "/api/auth/_log"),
+    };
+
+    private void probeAuthFrameworks(String host, String baseUrl, List<HttpRequest> live, Set<String> seen) {
+        String root = baseUrl.replaceAll("/+$", "");
+        Set<String> cookieNames = new LinkedHashSet<>();
+        try {
+            for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                if (rr.response() == null || !host.equalsIgnoreCase(hostOf(rr.request().url()))) continue;
+                String sc = rr.response().headerValue("Set-Cookie");
+                if (sc == null) continue;
+                int eq = sc.indexOf('=');
+                if (eq > 0) cookieNames.add(sc.substring(0, eq).trim());
+            }
+        } catch (Throwable ignore) { }
+        for (AuthFramework fw : AUTH_FRAMEWORKS) {
+            boolean matched = false;
+            for (String c : cookieNames) if (fw.fingerprint.matcher(c).matches()) { matched = true; break; }
+            if (!matched) continue;
+            scanLog.log("  auth-framework fingerprint: " + fw.name + " recognized (cookie convention) — probing its documented routes.");
+            String providersPath = null;
+            for (String p : fw.staticPaths) {
+                try {
+                    String abs = root + p;
+                    if (!seen.add("GET " + abs)) continue;
+                    HttpRequest req = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("GET"));
+                    HttpRequestResponse wrr = probe(req);
+                    int st = statusOf(wrr);
+                    if (st >= 200 && st < 400 && !isSoftNotFound(wrr)) {
+                        live.add(req);
+                        scanLog.log("  -> AUTH-FW " + st + "  GET " + p);
+                        if (p.endsWith("/providers")) providersPath = p;
+                    }
+                } catch (Exception ignore) { }
+            }
+            // The providers endpoint SELF-DOCUMENTS the provider-specific routes (signinUrl/callbackUrl per
+            // provider, per the library's published response contract) — no need to guess a provider id/name.
+            if (providersPath != null) probeSelfDocumentedProviderRoutes(host, root, providersPath, live, seen);
+        }
+    }
+
+    /** Parse the providers response for per-provider signinUrl/callbackUrl and add any that resolve onto this
+     *  scan's host. Entirely defensive: a missing/renamed field, or a provider hosted elsewhere, is just skipped. */
+    private void probeSelfDocumentedProviderRoutes(String host, String root, String providersPath,
+                                                   List<HttpRequest> live, Set<String> seen) {
+        try {
+            HttpRequestResponse rr = probe(withSessionCookie(HttpRequest.httpRequestFromUrl(root + providersPath).withMethod("GET")));
+            String body = rr == null || rr.response() == null ? null : rr.response().bodyToString();
+            if (body == null || !body.trim().startsWith("{")) return;
+            JSONObject providers = new JSONObject(body.trim());
+            int added = 0;
+            for (String providerId : providers.keySet()) {
+                JSONObject prov = providers.optJSONObject(providerId);
+                if (prov == null) continue;
+                for (String key : new String[]{ "signinUrl", "callbackUrl" }) {
+                    String ep = prov.optString(key, null);
+                    if (ep == null || ep.isBlank() || !host.equalsIgnoreCase(hostOf(ep)) || !seen.add("GET " + ep)) continue;
+                    live.add(withSessionCookie(HttpRequest.httpRequestFromUrl(ep).withMethod("GET")));
+                    scanLog.log("     + provider '" + providerId + "' " + key + ": " + Net.stripQuery(ep));
+                    added++;
+                }
+            }
+            if (added > 0) scanLog.log("  providers response self-documented " + added + " provider-specific route(s).");
+        } catch (Exception ignore) { }
+    }
+
     /** GET a generic well-known wordlist (and an i18n negative-diff); keep live ones. */
     private void probeWellKnown(String host, String baseUrl, List<HttpRequest> live, Set<String> seen) {
         String root = baseUrl.replaceAll("/+$", "");
@@ -2387,8 +2626,9 @@ public final class EndpointDiscovery {
                 String abs = root + p;
                 if (!seen.add("GET " + abs)) continue;
                 HttpRequest req = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("GET"));
-                int st = statusOf(probe(req));
-                if (st >= 200 && st < 400) {
+                HttpRequestResponse wrr = probe(req);
+                int st = statusOf(wrr);
+                if (st >= 200 && st < 400 && !isSoftNotFound(wrr)) {   // a uniform redirect-to-login is NOT "exists"
                     live.add(req);
                     scanLog.log("  -> WELL-KNOWN " + st + "  GET " + p);
                 }
@@ -3103,8 +3343,8 @@ public final class EndpointDiscovery {
     }
 
     // Deterministic FULL-BODY API-path harvest. The 8k per-source truncation + 8-chunk LLM cap can drop
-    // endpoints that live deep in a large minified bundle (this is exactly how /api/v1/items/*,
-    // /api/v1/docs/* and /api/v1/account/chat/* were being missed). Scan EVERY same-host script body
+    // endpoints that live deep in a large minified bundle (endpoints referenced only from inside a
+    // large bundle were being missed). Scan EVERY same-host script body
     // UNTRUNCATED for absolute /api/vN/ path literals — they're exact strings, so this needs no LLM and
     // yields no false positives — and register each as a spec to probe. Dynamic id segments (${id}, :id)
     // simply end the match, leaving the collection root, which is what we want to hit anyway.
@@ -3220,12 +3460,16 @@ public final class EndpointDiscovery {
                     if (vb == null || (!vb.contains("{") && !vb.contains("<"))) break;   // no structured errors to learn from
                     String filled = eng.completeRequestBody("POST", path, body, vb);
                     if (filled == null || filled.isBlank() || filled.equals(body)) break;   // no progress
+                    // The model wrote this body. If it tunnels DELETE/PATCH/MERGE (_method, "method":"PATCH") the
+                    // request is never sent: stop here rather than probe a refusal, or hand the fuzzers a best-effort
+                    // target that can never go out.
+                    HttpRequest next = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
+                            .withAddedHeader("Content-Type", "application/json").withBody(filled));
+                    if (verbBlocked(next)) break;
                     body = filled;
                     // A body that now carries a JSON string field is an injectable SQLi/fuzz target even if the
                     // write keeps erroring on a later column — a quote still reaches the SQL string sink. Remember it.
-                    if (HAS_JSON_STR_FIELD.matcher(body).find())
-                        bestSynth = withSessionCookie(HttpRequest.httpRequestFromUrl(abs).withMethod("POST")
-                                .withAddedHeader("Content-Type", "application/json").withBody(body));
+                    if (HAS_JSON_STR_FIELD.matcher(body).find()) bestSynth = next;
                     continue;
                 }
                 break;   // 404/405 (wrong method)/403 (authz) → not fillable; stop
@@ -3244,7 +3488,7 @@ public final class EndpointDiscovery {
 
     /**
      * A bare endpoint-map leaf (e.g. {@code /orders/status/}) is mounted under the app's API BASE
-     * ({@code /api/v1/account}), not the web root — so probing it bare hits the SPA HTML shell (a false 2xx).
+     * ({@code /api/v1/app}), not the web root — so probing it bare hits the SPA HTML shell (a false 2xx).
      * Re-probe the leaf under each observed API base and keep the one that returns real (non-shell) JSON.
      * Generic: bases are the {@code /api/vN/<seg>} prefixes of paths already seen returning JSON, no hardcoding.
      */
@@ -3474,19 +3718,36 @@ public final class EndpointDiscovery {
         return 0;
     }
 
+    /** Verb guard for a request about to be probed or synthesized: true when it claims DELETE/PATCH/MERGE (request
+     *  line, override header, _method, batch sub-request), and the refusal is then logged + counted via SafeHttp.
+     *  Callers check BEFORE probing, so a refusal never spends a probe budget and is never read as a server answer
+     *  (a "could not resolve" that triggers write-body reconstruction, or a "DROPPED" that blames the handler). */
+    private boolean verbBlocked(HttpRequest req) {
+        if (!WriteGuard.blocksDestructiveVerb(req)) return false;
+        SafeHttp.noteBlocked(req, "endpoint discovery");
+        return true;
+    }
+
     private HttpRequestResponse probe(HttpRequest req) {
+        HttpRequestResponse rr = rawProbe(req);
+        // Register DISCOVERED endpoints into the Target site map so they're visible for manual follow-up.
+        // A non-404 response means the route actually exists (200/401/403/405/…); a 404 is a guess miss and
+        // is left out so the map isn't flooded with negative probes. A learned "wall" answer (uniform redirect-to-login
+        // / 401-403 for ANY path) is the same kind of miss — it says nothing about this path — so it is left out too.
+        // Signed requests register with their X-Signature headers intact. sendRequest() does NOT auto-add to the
+        // site map — this is the hook.
         try {
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
-            rr = AiScanner.decompress(rr);   // plain-text body so HTML/JS mining works behind a compressing proxy/CDN
-            // Register DISCOVERED endpoints into the Target site map so they're visible for manual follow-up.
-            // A non-404 response means the route actually exists (200/401/403/405/…); a 404 is a guess miss and
-            // is left out so the map isn't flooded with negative probes. Signed requests register with their
-            // X-Signature headers intact. sendRequest() does NOT auto-add to the site map — this is the hook.
-            try {
-                if (rr != null && rr.response() != null && rr.response().statusCode() != 404)
-                    api.siteMap().add(rr);
-            } catch (Exception ignore) { }
-            return rr;
+            if (rr != null && rr.response() != null && rr.response().statusCode() != 404 && !matchesWall(rr))
+                api.siteMap().add(rr);
+        } catch (Exception ignore) { }
+        return rr;
+    }
+
+    /** Send without registering the exchange anywhere (learning probes for nonexistent-by-construction paths). */
+    private HttpRequestResponse rawProbe(HttpRequest req) {
+        try {
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return AiScanner.decompress(rr);   // plain-text body so HTML/JS mining works behind a compressing proxy/CDN
         } catch (Throwable t) {
             return null;
         }

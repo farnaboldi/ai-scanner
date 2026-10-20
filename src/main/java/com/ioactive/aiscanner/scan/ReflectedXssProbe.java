@@ -199,7 +199,7 @@ public final class ReflectedXssProbe extends Probe {
         try {
             syncJar(req);
             HttpRequestResponse rr = AiScanner.decompress(
-                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
+                    com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
             // Authenticated POSTs can bounce through an interstitial (Zero Bank redirects to /auth/accept-certs.html
             // when the session needs re-priming) — a 302 whose empty body has no reflection. Walk the interstitial
             // carrying our session cookie, then RE-SEND the original request once so its params actually reach the
@@ -229,7 +229,7 @@ public final class ReflectedXssProbe extends Probe {
                         HttpRequest walk = HttpRequest.httpRequestFromUrl(abs).withMethod("GET");
                         String cookie = req.headerValue("Cookie");
                         if (cookie != null) walk = walk.withHeader("Cookie", cookie);
-                        HttpRequestResponse wr = api.http().sendRequest(walk, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
+                        HttpRequestResponse wr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, walk, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
                         if (dbg && wr != null && wr.response() != null)
                             scanLog.debug("  rxss walk GET " + abs + " → HTTP " + wr.response().statusCode()
                                     + (wr.response().statusCode() >= 300 && wr.response().statusCode() < 400 ? " Location: " + wr.response().headerValue("Location") : ""));
@@ -237,7 +237,7 @@ public final class ReflectedXssProbe extends Probe {
                     } catch (Exception ignore) { }
                     syncJar(req);   // the interstitial walk-GET may have re-polluted the jar — realign before re-send
                     rr = AiScanner.decompress(
-                            api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
+                            com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
                     if (dbg && rr != null && rr.response() != null)
                         scanLog.debug("  rxss re-POST → HTTP " + rr.response().statusCode());
                 }

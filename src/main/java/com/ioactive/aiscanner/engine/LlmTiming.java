@@ -43,9 +43,6 @@ public final class LlmTiming {
     /** Zero THIS scan's counters at run start so the summary is per-scan (drops just the current tag's bucket). */
     public static void reset() { BY_TAG.remove(key()); }
 
-    public static long calls()    { return cur().calls.get(); }
-    public static long totalMs()  { return cur().totalMs.get(); }
-
     /** One-line human summary for the CURRENT scan, or null when it made no LLM call (no-ai / native-only). */
     public static String summary() {
         Bucket b = cur();

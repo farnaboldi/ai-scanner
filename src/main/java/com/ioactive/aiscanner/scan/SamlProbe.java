@@ -130,7 +130,6 @@ public final class SamlProbe extends Probe {
         HttpRequestResponse metadataRr;    // the SP metadata response (evidence for the hardening findings)
         String metadataXml;                // its body
         String acsUrl;                     // Assertion Consumer Service (POST target for SAMLResponse)
-        String acsBinding;                 // the ACS binding URN (if metadata gave one)
         String ssoUrl;                     // SP-initiated SSO endpoint (carries/echoes a return param)
         String ssoReturnParam;             // the discovered return/redirect param name on ssoUrl, or null
         String entityId;                   // the SP entityID (from metadata), or null
@@ -275,15 +274,15 @@ public final class SamlProbe extends Probe {
         s.encryptionKey = Pattern.compile("(?i)<(?:[a-z0-9]+:)?KeyDescriptor\\b[^>]*\\buse\\s*=\\s*\"encryption\"").matcher(xml).find();
         // AssertionConsumerService Location + Binding — take the first non-artifact by default; note artifact.
         Matcher acs = Pattern.compile("(?i)<(?:[a-z0-9]+:)?AssertionConsumerService\\b[^>]*>").matcher(xml);
-        String firstLoc = null, firstBind = null;
+        String firstLoc = null;
         while (acs.find()) {
             String tag = acs.group();
             String loc = attr(tag, "Location");
             String bind = attr(tag, "Binding");
             if (bind != null && bind.toLowerCase().contains("artifact")) { s.artifactBinding = true; continue; }
-            if (firstLoc == null && loc != null) { firstLoc = loc; firstBind = bind; }
+            if (firstLoc == null && loc != null) firstLoc = loc;
         }
-        if (firstLoc != null) { s.acsUrl = firstLoc; s.acsBinding = firstBind; }   // metadata ACS is authoritative
+        if (firstLoc != null) s.acsUrl = firstLoc;   // metadata ACS is authoritative
     }
 
     /** Deterministic metadata-hardening findings (safe reads — always fine to run). The assertion-signing note is
@@ -557,7 +556,7 @@ public final class SamlProbe extends Probe {
     protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): decompresses the response
         politeness();   // ScanConfig politeness delay
         try {
-            return AiScanner.decompress(api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
+            return AiScanner.decompress(com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
         } catch (Throwable t) { return null; }
     }
 

@@ -92,7 +92,7 @@ public final class MontoyaLlmHttp implements LlmHttp {
         // Enforce the HARD deadline: run on a daemon thread, abandon it (best-effort cancel) if it exceeds the bound.
         // Montoya's own timeout can't be trusted for a stalled body, so this is the real guarantee the scan proceeds.
         final HttpRequest fReq = req;
-        Future<HttpRequestResponse> fut = LLM_POOL.submit(() -> api.http().sendRequest(fReq, opts));
+        Future<HttpRequestResponse> fut = LLM_POOL.submit(() -> com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, fReq, opts));
         HttpRequestResponse rr;
         try {
             rr = fut.get(hardDeadline, TimeUnit.MILLISECONDS);
@@ -111,7 +111,7 @@ public final class MontoyaLlmHttp implements LlmHttp {
         // Decode the response as UTF-8 too (bodyToString() would use ISO-8859-1 and corrupt any non-ASCII).
         String body = new String(rr.response().body().getBytes(), StandardCharsets.UTF_8);
         if (code / 100 != 2) {
-            String snippet = body == null ? "" : body.substring(0, Math.min(400, body.length()));
+            String snippet = body.substring(0, Math.min(400, body.length()));
             throw new RuntimeException("HTTP " + code + ": " + snippet);
         }
         return body;

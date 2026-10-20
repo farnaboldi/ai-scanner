@@ -90,9 +90,6 @@ public final class LocalSsrfListener implements AutoCloseable {
     /** True if the given tag was received as an HTTP request path under this listener's nonce (blind SSRF). */
     public boolean received(String tag) { return hits.contains(tag); }
 
-    /** All tags received so far. */
-    public Set<String> received() { return Collections.unmodifiableSet(hits); }
-
     @Override public void close() {
         try { server.stop(0); } catch (Throwable ignore) { }
     }

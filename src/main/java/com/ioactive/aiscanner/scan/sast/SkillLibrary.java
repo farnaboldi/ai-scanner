@@ -75,35 +75,6 @@ public final class SkillLibrary {
         return slug == null ? "" : framework().getOrDefault(slug.trim().toLowerCase(), "");
     }
 
-    /** Skill body for a vuln slug (e.g. {@code "sqli"}), or {@code ""} if unknown. */
-    public static String forVuln(String slug) {
-        return slug == null ? "" : vuln().getOrDefault(slug.trim().toLowerCase(), "");
-    }
-
-    /** Skill body for a canonical vuln id as produced by {@link StaticHint} (e.g. {@code "SQL Injection"}). */
-    public static String forVulnClass(String canonical) {
-        return forVuln(slugForVulnClass(canonical));
-    }
-
-    /** Map a canonical vuln id (see {@code StaticHint.canonicalVulnClass}) to a vuln.md slug, or {@code ""}. */
-    public static String slugForVulnClass(String canonical) {
-        if (canonical == null) return "";
-        String x = canonical.toLowerCase();
-        if (x.contains("sql injection")) return "sqli";
-        if (x.contains("nosql")) return "nosql";
-        if (x.equals("idor")) return "idor";
-        if (x.equals("bfla")) return "bfla";
-        if (x.contains("mass-assign") || x.contains("mass assign")) return "mass-assignment";
-        if (x.contains("path travers") || x.contains("lfi") || x.contains("file inclusion")) return "path-traversal";
-        if (x.contains("command inj")) return "command-injection";
-        if (x.equals("ssrf")) return "ssrf";
-        if (x.equals("xxe")) return "xxe";
-        if (x.contains("deserial")) return "deserialization";
-        if (x.contains("open redirect")) return "open-redirect";
-        if (x.contains("cross-site") || x.contains("xss")) return "xss";
-        return "";
-    }
-
     /**
      * Detect the backend framework(s)/technologies present under {@code root} by ecosystem MARKER files
      * (manifests, entrypoints, schema files) — never by application name. Returns the framework slugs that have a

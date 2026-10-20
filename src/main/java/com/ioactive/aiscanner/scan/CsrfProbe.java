@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.params.HttpParameter;

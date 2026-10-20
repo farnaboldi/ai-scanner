@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.engine.AiEngine;
@@ -67,8 +66,6 @@ public final class AgentFlowProbe extends Probe {
     private static final long POLL_SLEEP_MS = 1500L;
     /** Bound the LLM-planned unlock: a few precondition requests, not an open-ended loop. */
     private static final int MAX_UNLOCK_STEPS = 5;
-
-    public AgentFlowProbe(MontoyaApi api, ScanLog scanLog) { this(api, scanLog, null); }
 
     public AgentFlowProbe(MontoyaApi api, ScanLog scanLog, AiEngine engine) {
         super(api, scanLog);
@@ -244,21 +241,6 @@ public final class AgentFlowProbe extends Probe {
         return null;
     }
 
-    // A leaked system prompt / tool schema: role-preamble or guardrail/tooling markers a normal answer omits.
-    private static final Pattern SYS_MARKER = Pattern.compile(
-            "(?i)(you are (?:an?|the) [a-z]|system prompt|developer (?:message|instruction)|do not reveal|"
-          + "you have access to|available tools?|function(?:s| call| definition)|tool[_ ]?name|parameters?:|"
-          + "your (?:role|instructions|guidelines) (?:are|is))");
-
-    /** True when text looks like a disclosed system prompt / tool listing (not a normal chat answer). */
-    static boolean disclosesSystemPrompt(String text) {
-        if (text == null || text.length() < 80) return false;
-        int markers = 0;
-        Matcher m = SYS_MARKER.matcher(text);
-        while (m.find() && markers < 3) markers++;
-        return markers >= 2;   // require two independent markers so a single incidental phrase can't fire
-    }
-
     // ---- generic LLM-planned unlock (no app-specific knowledge in code) ----
 
     /**
@@ -290,7 +272,24 @@ public final class AgentFlowProbe extends Probe {
             PlannedRequest p = PlannedRequest.parse(rawJson);
             if (p == null) { feedback = "previous output was not a usable JSON request; return {method,url,body} for a concrete on-host endpoint"; continue; }
             if (!host.equalsIgnoreCase(hostOf(p.url()))) { feedback = "off-host url rejected: " + p.url() + " — stay on " + host; continue; }
-            HttpRequestResponse rr = sendReq(withSession, p.toHttpRequest());
+            HttpRequest planned = sessioned(withSession, p.toHttpRequest());
+            // Verb guard BEFORE the send: a planned DELETE/PATCH/MERGE (request line, override header, _method, batch
+            // sub-request) is never sent. Say so in the trace and tell the planner it is a policy refusal, not an
+            // "HTTP -1" from the app, so it picks an allowed precondition step. Nothing was sent, so the rooms
+            // re-check is skipped; the step still counts, like the parse/off-host rejections above.
+            if (planned != null && WriteGuard.blocksDestructiveVerb(planned)) {
+                SafeHttp.noteBlocked(planned, "agent-flow");
+                scanLog.log("  agent-flow unlock step " + (i + 1) + ": " + p.method() + " "
+                        + pathOnly(p.url()) + " NOT sent (verb guard: DELETE/PATCH/MERGE disabled)");
+                String claimed = WriteGuard.effectiveMethod(planned);
+                feedback = "planned " + p.method() + " " + pathOnly(p.url())
+                        + (claimed.equals(p.method()) ? "" : " (carries " + claimed + ")")
+                        + " was NOT sent: DELETE, PATCH and MERGE are disabled on this engagement (directly or via "
+                        + "_method, X-HTTP-Method-Override or a batch sub-request). Pick a GET, POST or PUT precondition "
+                        + "step from the list.";
+                continue;
+            }
+            HttpRequestResponse rr = planned == null ? null : sendReq(planned);
             bridge(rr);
             int sc = rr != null && rr.response() != null ? rr.response().statusCode() : -1;
             scanLog.log("  agent-flow unlock step " + (i + 1) + ": " + p.method() + " "
@@ -307,6 +306,7 @@ public final class AgentFlowProbe extends Probe {
     private String discoveredWrites(String host) {
         StringBuilder sb = new StringBuilder();
         Set<String> seen = new LinkedHashSet<>();
+        Set<String> withheld = new LinkedHashSet<>();
         for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
             try {
                 HttpRequest req = rr.request();
@@ -314,7 +314,13 @@ public final class AgentFlowProbe extends Probe {
                 if (!("POST".equals(m) || "PUT".equals(m) || "PATCH".equals(m))) continue;
                 if (!host.equalsIgnoreCase(hostOf(req.url()))) continue;
                 String path = pathOnly(req.url());
-                if (!seen.add(m + " " + path)) continue;
+                String key = m + " " + path;
+                if (seen.contains(key)) continue;
+                // Don't offer the planner a write the verb guard refuses (a PATCH, a POST tunnelling DELETE/PATCH via
+                // _method or an override header): it would plan it, have it refused, and burn an unlock step on it.
+                // Judged per request, so a plain POST to the same path seen later is still offered.
+                if (WriteGuard.blocksDestructiveVerb(req)) { withheld.add(key); continue; }
+                seen.add(key);
                 String body = "";
                 try { body = req.bodyToString(); } catch (Throwable ignore) { }
                 sb.append(m).append(' ').append("https://").append(host).append(path);
@@ -322,6 +328,12 @@ public final class AgentFlowProbe extends Probe {
                 sb.append('\n');
                 if (seen.size() >= 40) break;   // bound the prompt
             } catch (Throwable ignore) { }
+        }
+        if (!withheld.isEmpty()) {
+            List<String> w = new ArrayList<>(withheld);
+            scanLog.log("agent-flow: " + w.size() + " write endpoint(s) withheld from the unlock planner — "
+                    + "DELETE/PATCH/MERGE are disabled by the verb guard: "
+                    + String.join(", ", w.subList(0, Math.min(8, w.size()))) + (w.size() > 8 ? ", …" : ""));
         }
         return sb.toString();
     }
@@ -342,11 +354,21 @@ public final class AgentFlowProbe extends Probe {
         }
     }
 
-    /** Send an already-materialized request (from the LLM plan) through {@code withSession} (auth + signature). */
-    private HttpRequestResponse sendReq(UnaryOperator<HttpRequest> withSession, HttpRequest req) {
+    /** An LLM-planned request as this probe sends it: Accept + {@code withSession} (auth + signature), so the verb
+     *  guard judges the concrete request, not the plan. null if it can't be built (then treated as a failed send). */
+    private HttpRequest sessioned(UnaryOperator<HttpRequest> withSession, HttpRequest req) {
         try {
             if (!req.hasHeader("Accept")) req = req.withHeader("Accept", "application/json");
-            req = withSession.apply(req);   // sign LAST — covers final method/path/body
+            return withSession.apply(req);   // sign LAST — covers final method/path/body
+        } catch (Throwable t) {
+            scanLog.debug("  agent-flow: planned request could not be built: " + t);
+            return null;
+        }
+    }
+
+    /** Send an LLM-planned request already materialized by {@link #sessioned}. */
+    private HttpRequestResponse sendReq(HttpRequest req) {
+        try {
             return send(req);
         } catch (Throwable t) {
             scanLog.debug("  agent-flow: sendReq failed: " + t);

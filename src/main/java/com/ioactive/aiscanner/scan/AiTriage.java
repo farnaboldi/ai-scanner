@@ -17,10 +17,6 @@ public final class AiTriage implements AuditIssueHandler {
 
     private final ScanLog scanLog;
     private final ScanScope scope;
-    // Dedup: Burp re-reports the same issue across passes (main audit + the separate login audit, confidence
-    // upgrades, …). Log + count each unique issue ONCE. AiTriage is the single real-time logger for
-    // Burp-native issues (reportNewIssues / the end-of-scan recap were removed to stop double-logging).
-    private final java.util.Set<String> seen = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public AiTriage(ScanLog scanLog, ScanScope scope) {
         this.scanLog = scanLog;
@@ -38,8 +34,8 @@ public final class AiTriage implements AuditIssueHandler {
             String line = format(issue);
             // Zero-FP discipline: only FIRM/CERTAIN native issues become COUNTED findings in the report.
             // INFORMATION and TENTATIVE (Burp's own low-confidence guesses) are shown for the analyst with a
-            // lesser marker but NOT counted and NOT written to the findings report — and NOT marked seen, so a
-            // later confidence upgrade (TENTATIVE→FIRM) can still be reported as a real finding.
+            // lesser marker but NOT counted and NOT written to the findings report — and NOT claimed via
+            // scanLog.claimFinding, so a later confidence upgrade (TENTATIVE→FIRM) can still be reported as a real finding.
             if (issue.severity() == AuditIssueSeverity.INFORMATION
                     || issue.confidence() == AuditIssueConfidence.TENTATIVE) {
                 scanLog.log(" ·  " + line);

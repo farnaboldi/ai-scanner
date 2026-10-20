@@ -441,7 +441,7 @@ public final class SpaNavigator {
                 req = req.withBody(normalizeJson(body)).withHeader("Content-Type", ct == null || ct.isBlank() ? "application/json" : ct);
             }
             req = withSession(req);
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(20000L));
+            return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(20000L));
         } catch (Throwable t) { return null; }
     }
 

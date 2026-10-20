@@ -24,16 +24,11 @@ import com.ioactive.aiscanner.ui.ScanLog;
 import com.ioactive.aiscanner.ui.SettingsTab;
 import org.json.JSONObject;
 
-import javax.swing.JPanel;
-import java.awt.BorderLayout;
-import java.awt.CardLayout;
-import java.awt.FlowLayout;
-
 public class AiScannerExtension implements BurpExtension {
 
     public static final String EXT_NAME = "AI Scanner";
     /** Internal build number — bump on every rebuild so the load line tells you which jar is live. */
-    public static final int BUILD = 749;
+    public static final int BUILD = 781;
     private static final String PREF_KEY = "aiscanner.settings";
 
     private MontoyaApi api;
@@ -87,6 +82,8 @@ public class AiScannerExtension implements BurpExtension {
         java.util.function.Consumer<String> logMirror = s -> api.logging().logToOutput(s);
         this.logMirror = logMirror;   // field ref so launchParallel() can build per-target mirrors
         this.scanLog = new ScanLog(logMirror);
+        com.ioactive.aiscanner.scan.SafeHttp.setLog(this.scanLog);   // DELETE/PATCH refusals show in the scan log
+        com.ioactive.aiscanner.scan.ScannerVerbFence.init(api, this.scanLog);   // fences Burp's own crawl/audit DELETE/PATCH
         String logFileProp = System.getProperty("aiscanner.logFile");
         if (logFileProp != null && !logFileProp.isBlank()) scanLog.setLogFile(logFileProp);   // CLI flag → same path
         // Surface the AI Scanner's OWN findings (probes + flow-engine + auth) as Burp AuditIssues so they
@@ -131,6 +128,9 @@ public class AiScannerExtension implements BurpExtension {
         scanLog.setStopHandler(() -> {
             scanLog.log("Stop requested by user — cancelling the current scan…");
             scanner.requestStop();
+            // Burp keeps running any crawl/audit we launched after our threads stop; delete them so nothing keeps
+            // sending once the verb fence comes down.
+            com.ioactive.aiscanner.scan.ScannerVerbFence.deleteTracked("Stop");
             for (Thread t : Thread.getAllStackTraces().keySet()) {
                 String n = t.getName();
                 if (n != null && (n.startsWith("ais-") || n.startsWith("aiscanner-"))) t.interrupt();
@@ -220,7 +220,7 @@ public class AiScannerExtension implements BurpExtension {
             analyzeBtn.setText("🔍 Analyzing…");
             scanLog.appendChat("you", "Analyze new in-scope proxy traffic");
             new Thread(() -> {
-                String r = chatBtn.narrateProxy(false);
+                String r = chatBtn.narrateProxy();
                 // Store in chat history so subsequent "test them" / "scan it" turns have context.
                 if (r != null && !r.isBlank()) chatBtn.addToHistory("Assistant: [proxy analysis]\nSystem: " + r);
                 javax.swing.SwingUtilities.invokeLater(() -> {
@@ -248,8 +248,6 @@ public class AiScannerExtension implements BurpExtension {
         javax.swing.JPanel agentWithBtn = new javax.swing.JPanel(new java.awt.BorderLayout());
         agentWithBtn.add(btnBar, java.awt.BorderLayout.NORTH);
         agentWithBtn.add(agentPanel, java.awt.BorderLayout.CENTER);
-
-        final com.ioactive.aiscanner.ui.ChatAssistant chatRef = chat;
 
         // Three-tab structure: Settings | Log | Agent
         javax.swing.JTabbedPane tabs = new javax.swing.JTabbedPane();
@@ -279,6 +277,7 @@ public class AiScannerExtension implements BurpExtension {
         // chat) so blocking sleeps/HTTP waits abort promptly instead of leaking after unload.
         api.extension().registerUnloadingHandler(() -> {
             unloaded = true;
+            com.ioactive.aiscanner.scan.ScannerVerbFence.shutdown();   // never leave the scanner fence registered
             for (Thread t : Thread.getAllStackTraces().keySet()) {
                 String n = t.getName();
                 if (n != null && (n.startsWith("ais-") || n.startsWith("aiscanner-"))) t.interrupt();
@@ -314,6 +313,11 @@ public class AiScannerExtension implements BurpExtension {
             final String seedCookie  = launchArg("aiscanner.cookie",  "AISCANNER_COOKIE");
             final String seedBearer  = launchArg("aiscanner.bearer",  "AISCANNER_BEARER");
             final String seedLanding = launchArg("aiscanner.landing", "AISCANNER_LANDING");
+            // Optional SECOND identity B (a different tenant/user) — enables the cross-tenant object-authz
+            // differential (CrossTenantAuthzProbe) and the two-identity BOLA/IDOR oracles. Seed with a session
+            // for a genuinely different principal than A (e.g. a second tenant that owns none of A's objects).
+            final String seedCookieB = launchArg("aiscanner.cookieB", "AISCANNER_COOKIE_B");
+            final String seedBearerB = launchArg("aiscanner.bearerB", "AISCANNER_BEARER_B");
             final boolean batch = targets.length > 1;
             String parFlag = launchArg("aiscanner.parallel", "AISCANNER_PARALLEL");
             final boolean parallel = batch && parFlag != null && !"false".equalsIgnoreCase(parFlag) && !"0".equals(parFlag);
@@ -367,6 +371,14 @@ public class AiScannerExtension implements BurpExtension {
                         // scanner considers itself authenticated and skips the register→login flow.
                         scanLog.log("pre-seeded bearer token from AISCANNER_BEARER — authenticated scan (token: "
                                 + seedBearer.substring(0, Math.min(20, seedBearer.length())) + "…)");
+                    }
+                    if ((seedCookieB != null && !seedCookieB.isBlank()) || (seedBearerB != null && !seedBearerB.isBlank())) {
+                        SessionStore b = new SessionStore();
+                        if (seedCookieB != null && !seedCookieB.isBlank()) b.set(seedCookieB);
+                        if (seedBearerB != null && !seedBearerB.isBlank()) b.setBearer(seedBearerB);
+                        session.setSecondary(b);
+                        scanLog.log("pre-seeded SECOND identity B from AISCANNER_COOKIE_B/BEARER_B — cross-tenant"
+                                + " object-authz + two-identity BOLA oracles enabled.");
                     }
                     try { menuProvider.startScanAndWait(url); done++; }
                     catch (Throwable t) { scanLog.log("target failed (" + url + "): " + t + " — continuing."); }
@@ -522,7 +534,11 @@ public class AiScannerExtension implements BurpExtension {
      *  the hosts we are scanning. Named "AI: …" so {@link AiTriage} knows not to re-log/re-count it. */
     private void raiseAiIssue(String vulnClass, String url, String detail, HttpRequestResponse... evidence) {
         try {
-            if (url == null || !scanScope.contains(url)) return;   // only hosts WE are scanning
+            if (url == null || !scanScope.contains(url)) {         // only hosts WE are scanning
+                scanLog.log("dashboard issue NOT raised (host out of scanScope): " + vulnClass + " @ " + url
+                        + " — in-scope hosts: " + scanScope.hosts());
+                return;
+            }
             // keep evidence that carries a request OR a response — a finding may attach several (e.g. BFLA's
             // unauth / our-session / control probes) so Burp shows the full proof across multiple request tabs.
             // We keep a request with a null response too: for an out-of-band finding (OAST SSRF) the request
@@ -566,6 +582,23 @@ public class AiScannerExtension implements BurpExtension {
                             info.background, remediationBackground, info.severity, ev.toArray(new HttpRequestResponse[0]))
                     : AuditIssue.auditIssue(name, detailHtml, remediationDetail, url, info.severity, AuditIssueConfidence.FIRM,
                             info.background, remediationBackground, info.severity);
+            // Cross-run dedup: the in-memory claimFinding() resets every launch, and Burp does NOT consolidate
+            // extension-added issues — so re-scanning a PERSISTENT project re-added the same finding once per run
+            // (observed: 6 identical issues after 6 rescans). Skip when the project already holds this exact
+            // issue (same name + same URL).
+            String normUrl = url.replaceAll("/+$", "");
+            try {
+                int same = 0;
+                for (AuditIssue existing : api.siteMap().issues()) {
+                    if (existing != null && name.equals(existing.name()) && existing.baseUrl() != null
+                            && existing.baseUrl().replaceAll("/+$", "").equals(normUrl)) same++;
+                }
+                if (same > 0) {
+                    scanLog.log("dashboard issue already present in this project (" + same + " cop" + (same == 1 ? "y" : "ies")
+                            + " at this URL) — not re-added: " + name + " @ " + url);
+                    return;
+                }
+            } catch (Throwable ignore) { }
             api.siteMap().add(issue);
             // Anchor the best evidence request/response into the site map so the issue is visible in
             // Target → Site Map. Filter: only anchor evidence whose host matches the ISSUE URL's host —
@@ -619,18 +652,28 @@ public class AiScannerExtension implements BurpExtension {
             }
             // Verify: query the site map immediately to confirm the issue AND the anchor are visible.
             try {
-                boolean issueFound = api.siteMap().issues().stream()
-                        .anyMatch(i -> i.name() != null && i.name().equals(name)
-                                    && i.baseUrl() != null && i.baseUrl().contains(
-                                            com.ioactive.aiscanner.scan.Net.authority(url)));
-                boolean urlInMap = api.siteMap().requestResponses().stream()
-                        .anyMatch(rr -> rr.request() != null
-                                     && rr.request().url().startsWith(url.replaceAll("/$","")));
-                scanLog.debug("siteMap verify [" + com.ioactive.aiscanner.scan.Net.authority(url) + "]"
-                        + " — issue registered: " + issueFound
-                        + " | URL in tree: " + urlInMap);
-            } catch (Throwable ignore) {}
-            scanLog.debug("dashboard issue raised: " + name + " @ " + url);
+                // Burp's OWN read-back (not our bookkeeping): how many copies of THIS issue sit at THIS url, and
+                // whether the url's tree node holds a 2xx entry — Burp's default site-map filter hides 4xx, so a
+                // node with only 4xx entries (typical for access-control evidence) is invisible with its issues.
+                int copies = 0;
+                for (AuditIssue i : api.siteMap().issues())
+                    if (i != null && name.equals(i.name()) && i.baseUrl() != null
+                            && i.baseUrl().replaceAll("/+$", "").equals(normUrl)) copies++;
+                boolean urlInMap = false, urlHas2xx = false;
+                for (HttpRequestResponse rr : api.siteMap().requestResponses()) {
+                    if (rr == null || rr.request() == null || rr.request().url() == null) continue;
+                    if (!com.ioactive.aiscanner.scan.Net.stripQuery(rr.request().url()).replaceAll("/+$", "").equals(normUrl)) continue;
+                    urlInMap = true;
+                    if (rr.response() != null) {
+                        int s = rr.response().statusCode();
+                        if (s >= 200 && s < 300) urlHas2xx = true;
+                    }
+                }
+                scanLog.log("siteMap verify (Burp read-back) — copies of this issue at this URL: " + copies
+                        + " | URL node in tree: " + urlInMap
+                        + " | node has a 2xx entry (shown under Burp's default 'hide 4xx' filter): " + urlHas2xx);
+            } catch (Throwable t) { scanLog.log("siteMap verify failed: " + t); }
+            scanLog.log("dashboard issue add attempted (no exception): " + name + " [" + info.severity + "] @ " + url);
         } catch (Throwable t) {
             scanLog.log("could not raise dashboard issue for " + vulnClass + " @ " + url + ": " + t);
         }

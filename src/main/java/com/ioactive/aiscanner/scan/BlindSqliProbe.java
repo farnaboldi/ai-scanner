@@ -571,13 +571,15 @@ public final class BlindSqliProbe extends Probe {
     private final java.util.concurrent.atomic.AtomicInteger timeouts = new java.util.concurrent.atomic.AtomicInteger();
     private final java.util.concurrent.atomic.AtomicInteger sends = new java.util.concurrent.atomic.AtomicInteger();
     private volatile boolean targetHanging = false;
-    public boolean targetHanging() { return targetHanging; }
-    public int sendCount() { return sends.get(); }
-    public int timeoutCount() { return timeouts.get(); }
 
     private static final long SLOW_SEND_MS = SLEEP_SEC * 1000L + 3_000L;   // sleep + 3s margin = stalling threshold
 
     protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): circuit-breaker + hard Future cap
+        // A verb-guard refusal (the request claims DELETE/PATCH/MERGE) is OUR policy, not the target stalling: skip it
+        // BEFORE any send/stall accounting. SafeHttp hands a refusal back response-less, the same shape as a hung send,
+        // so counting it let 8 refused units trip the breaker below — the shared instance then skipped blind-SQLi on
+        // every later unit and the log blamed the target. A refused baseline makes probe() skip just that target.
+        if (WriteGuard.blocksDestructiveVerb(req)) { SafeHttp.noteBlocked(req, "blind-SQLi"); return null; }
         if (targetHanging) return null;   // circuit open: this target stalls responses → stop hammering it
         politeness();                     // ScanConfig politeness delay (after the circuit-open guard)
         sends.incrementAndGet();
@@ -585,7 +587,7 @@ public final class BlindSqliProbe extends Probe {
         HttpRequestResponse rr = null;
         java.util.concurrent.Future<HttpRequestResponse> f = null;
         try {
-            f = SEND_POOL.submit(() -> api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(9000L)));
+            f = SEND_POOL.submit(() -> com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(9000L)));
             rr = f.get(SEND_HARD_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException te) {
             if (f != null) f.cancel(true);   // Burp's Socket.read may ignore interrupt (daemon worker leaks) — scan proceeds

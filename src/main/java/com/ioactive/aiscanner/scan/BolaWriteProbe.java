@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import com.ioactive.aiscanner.scan.sast.SourceFindings;
@@ -44,10 +43,6 @@ public final class BolaWriteProbe extends Probe {
         super(api, scanLog);
     }
 
-    public int probe(String host, SourceFindings hints, String baseUrl, List<HttpRequest> targets, String cookie, String bearer) {
-        return probe(host, hints, baseUrl, targets, cookie, bearer, null, null);
-    }
-
     /** @param cookieB,bearerB a SECOND distinct identity B. When present, the victim object is read back AS B after
      *  A's write: if B — a genuinely different user — witnesses A's marker, a SINGLE victim is a definitive cross-user
      *  write (no need for the statistical "&ge;2 distinct victims" gate). */
@@ -87,14 +82,22 @@ public final class BolaWriteProbe extends Probe {
         Set<String> tried = new LinkedHashSet<>();
         int seen = 0;
         for (String[] ep : writeEps) {
-            if (seen++ >= MAX_ENDPOINTS) break;
+            if (seen >= MAX_ENDPOINTS) break;
             String method = ep[1];
             String norm = ep[0].replaceAll("\\{[^/}]+\\}", "__ID__");   // {username}/{id} placeholder → id slot
+            // A write the verb guard refuses (PATCH, everywhere but an opted-in local lab host) can never land a marker,
+            // so it takes no MAX_ENDPOINTS slot (refused writes, duplicates included, can't crowd testable PUTs out) and
+            // is skipped below, before it costs a listing GET plus a GET per victim. Judged on the write's method + URL:
+            // its one-field JSON body can't carry a method claim.
+            HttpRequest write = writeShape(norm, method);
+            boolean refused = WriteGuard.blocksDestructiveVerb(write);
+            if (!refused) seen++;
             Matcher sm = SUBRES.matcher(norm);
             if (!sm.matches()) continue;
             String root = sm.group(1), field = sm.group(3);
             if (!WRITABLE_FIELD.matcher(field).find()) continue;
             if (!tried.add(method + " " + root + "*/" + field)) continue;
+            if (refused) { SafeHttp.noteBlocked(write, "BOLA write"); continue; }   // once per write this probe would run
 
             Set<String> landedVictims = new LinkedHashSet<>();
             HttpRequestResponse[] firstEvidence = null;
@@ -155,6 +158,15 @@ public final class BolaWriteProbe extends Probe {
             }
         }
         return hits;
+    }
+
+    /** The JSON sub-resource write as the verb guard sees it, or null when the URL can't be parsed (then it is not
+     *  refused here — SafeHttp still vets every write this probe actually sends). */
+    private static HttpRequest writeShape(String url, String method) {
+        try {
+            return HttpRequest.httpRequestFromUrl(url).withMethod(method)
+                    .withBody("{}").withHeader("Content-Type", "application/json");
+        } catch (Throwable t) { return null; }
     }
 
     private HttpRequestResponse send(HttpRequest req, String cookie, String bearer) {

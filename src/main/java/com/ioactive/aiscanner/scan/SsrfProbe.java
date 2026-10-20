@@ -390,7 +390,7 @@ public final class SsrfProbe extends Probe {
         politeness();   // ScanConfig politeness delay
         HttpRequest s = withSession != null ? withSession.apply(req) : req;
         try {
-            return api.http().sendRequest(s, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
+            return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, s, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
         } catch (Throwable t) {
             try { return HttpRequestResponse.httpRequestResponse(s, null); } catch (Throwable ignore) { return null; }
         }

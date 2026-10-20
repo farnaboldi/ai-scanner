@@ -143,13 +143,7 @@ public final class SettingsTab {
     // ---- Modules panel (right half): which scan modules run, reflecting -Daiscanner.only ----
     // The phase/module list lives in ONE place — com.ioactive.aiscanner.scan.ScanPhases — which this panel AND the
     // status-bar step counter (ScanLog) both read, so there is no second list to drift out of sync (that drift is
-    // exactly what left "Source analysis (SAST)" showing as a step with no Modules entry). These counts derive from it.
-    /** Attack modules a full scan runs (the filterable probe battery). */
-    public static int attackModuleCount()  { return com.ioactive.aiscanner.scan.ScanPhases.attackCount(); }
-    /** Always-run lifecycle phases (pre-attack + post-attack). */
-    public static int lifecyclePhaseCount() { return com.ioactive.aiscanner.scan.ScanPhases.lifecycleCount(); }
-    /** Total phases a full run performs = pre-attack + attack + post-attack. */
-    public static int fullRunPhaseCount()  { return com.ioactive.aiscanner.scan.ScanPhases.totalPhases(); }
+    // exactly what left "Source analysis (SAST)" showing as a step with no Modules entry).
 
     private final java.util.Map<String, JCheckBox> moduleBoxes = new java.util.LinkedHashMap<>();
     // The whole "Attack modules" block (its section header + every probe checkbox + its spacer): HIDDEN in SAST
@@ -161,11 +155,6 @@ public final class SettingsTab {
         JPanel p = new JPanel();
         p.setLayout(new BoxLayout(p, BoxLayout.Y_AXIS));
         p.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
-        // JLabel title = new JLabel("Modules");
-        // title.setFont(title.getFont().deriveFont(Font.BOLD, title.getFont().getSize() + 2f));
-        // p.add(title);
-        // JLabel hint = new JLabel("Uncheck to skip on the scan");
-        // hint.setForeground(Color.GRAY); p.add(hint); p.add(Box.createVerticalStrut(6));
 
         // Laid out top-to-bottom in the ORDER they execute — ALL derived from the ONE registry (ScanPhases), so
         // this panel, the progress total, and the status-bar step names can never drift apart.
@@ -468,7 +457,7 @@ public final class SettingsTab {
         status.setWrapStyleWord(true);
         status.setOpaque(false);
         status.setBorder(null);
-        g.gridx = 1; g.gridy = y++; panel.add(status, g);
+        g.gridx = 1; g.gridy = y; panel.add(status, g);
 
         setLocalEnabled(local);
         updateBurpAiStatus();

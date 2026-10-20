@@ -41,12 +41,6 @@ public final class DisposableMailbox {
     public String providerName() { return provider.name(); }
     public String awaitMessage(int seconds) { return provider.awaitMessage(seconds); }
 
-    /** First healthy mailbox across the configured providers (null if none could be established). */
-    public static DisposableMailbox mint(MontoyaApi api) {
-        List<DisposableMailbox> all = mintAll(api);
-        return all.isEmpty() ? null : all.get(0);
-    }
-
     /** One mailbox per configured provider, in order — the caller tries each until sign-up verification
      *  completes, so a throttled/blocked provider is transparently skipped. */
     public static List<DisposableMailbox> mintAll(MontoyaApi api) {
@@ -126,8 +120,8 @@ public final class DisposableMailbox {
                 String domain = doms.getJSONObject(0).getString("domain");
                 String local = "ais" + Long.toString(Math.abs(System.nanoTime()), 36);
                 String addr = local + "@" + domain, pw = "AiScan!" + local;
-                post(api, BASE + "/accounts", "{\"address\":\"" + addr + "\",\"password\":\"" + pw + "\"}", null);
-                String tokRaw = post(api, BASE + "/token", "{\"address\":\"" + addr + "\",\"password\":\"" + pw + "\"}", null);
+                post(api, BASE + "/accounts", "{\"address\":\"" + addr + "\",\"password\":\"" + pw + "\"}");
+                String tokRaw = post(api, BASE + "/token", "{\"address\":\"" + addr + "\",\"password\":\"" + pw + "\"}");
                 if (tokRaw == null) return null;
                 String token = new JSONObject(orEmpty(tokRaw)).optString("token", "");
                 return token.isBlank() ? null : new MailTm(api, addr, token);
@@ -165,16 +159,15 @@ public final class DisposableMailbox {
         try {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod("GET").withHeader("Accept", "application/json");
             if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            HttpRequestResponse rr = api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, r, RequestOptions.requestOptions().withResponseTimeout(12000L));
             return rr == null || rr.response() == null ? null : rr.response().bodyToString();
         } catch (Throwable t) { return null; }
     }
-    private static String post(MontoyaApi api, String url, String json, String bearer) {
+    private static String post(MontoyaApi api, String url, String json) {
         try {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
                     .withHeader("Accept", "application/json").withHeader("Content-Type", "application/json").withBody(json);
-            if (bearer != null && !bearer.isBlank()) r = r.withHeader("Authorization", "Bearer " + bearer);
-            HttpRequestResponse rr = api.http().sendRequest(r, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, r, RequestOptions.requestOptions().withResponseTimeout(12000L));
             return rr == null || rr.response() == null ? null : rr.response().bodyToString();
         } catch (Throwable t) { return null; }
     }

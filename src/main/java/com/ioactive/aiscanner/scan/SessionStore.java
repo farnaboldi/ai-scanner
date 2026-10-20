@@ -79,7 +79,7 @@ public final class SessionStore {
     // ---- SECOND identity B (a distinct registered user) — enables TRUE cross-user access-control differentials
     // (BOLA/BFLA/mass-assignment/GraphQL-authz): "A reads/writes B's exact object" instead of a single-session
     // distinctness+PII heuristic. Populated by a second registration pass; empty when only one identity was minted.
-    private volatile String cookieHeaderB = "", bearerB = "", signingKeyB = "";
+    private volatile String cookieHeaderB = "", bearerB = "";
     /** This session's OWN registered handle (username/email tag from auto-registration) — lets a probe target the
      *  identity's PROVABLY-OWN object (e.g. /users/{ownIdentity}) for a rigorous cross-user test. "" if unknown. */
     private volatile String ownIdentity = "";
@@ -105,14 +105,10 @@ public final class SessionStore {
     /** Identity B's own registered handle (copied from B's session by {@link #setSecondary}). "" if unknown. */
     private volatile String identityB = "";
     public String identityB() { return identityB; }
-    public boolean hasIdentityB() { return !identityB.isBlank(); }
     /** True once a second, DISTINCT authenticated identity is available. */
     public boolean hasSecondIdentity() { return !cookieHeaderB.isBlank() || !bearerB.isBlank(); }
     public String cookieHeaderB() { return cookieHeaderB; }
     public String bearerB() { return bearerB; }
-    public boolean hasBearerB() { return !bearerB.isBlank(); }
-    public String signingKeyB() { return signingKeyB; }
-    public boolean hasSigningKeyB() { return !signingKeyB.isBlank(); }
     /** Adopt a second identity from a separate SessionStore that a second auth pass authenticated. No-op if that
      *  store isn't authenticated or duplicates identity A (same cookie AND same bearer ⇒ not a distinct user). */
     public void setSecondary(SessionStore other) {
@@ -122,7 +118,6 @@ public final class SessionStore {
         if (sameCookie && sameBearer) return;   // not actually a different identity
         this.cookieHeaderB = other.cookieHeader();
         this.bearerB = other.bearer();
-        this.signingKeyB = other.signingKey();
         this.identityB = other.ownIdentity();   // B's provably-own handle → target /coll/{identityB} in the rigorous BOLA test
     }
 
@@ -147,6 +142,6 @@ public final class SessionStore {
     public void reset() {
         cookieHeader = ""; landingUrl = ""; bearer = ""; signingKey = ""; adopted = false;
         loginPageUrl = ""; loginUser = ""; loginPass = "";
-        cookieHeaderB = ""; bearerB = ""; signingKeyB = ""; ownIdentity = ""; identityB = "";
+        cookieHeaderB = ""; bearerB = ""; ownIdentity = ""; identityB = "";
     }
 }

@@ -65,6 +65,7 @@ public final class XxeProbe extends Probe {
         }
 
         List<String> testedUrls = new ArrayList<>();
+        int notTested = 0;                                               // refused by the verb guard (never sent)
         Map<String, String> tagToUrl = new LinkedHashMap<>();   // short customData tag -> endpoint URL
         Map<String, HttpRequestResponse> tagToInj = new LinkedHashMap<>();   // tag -> the injection req/resp (evidence)
         int idx = 0;
@@ -73,18 +74,23 @@ public final class XxeProbe extends Probe {
                 HttpRequest req = e.getValue();
                 String url = req.url();
                 String tag = "xxe" + (idx++);                            // ≤16 alphanumeric (Collaborator limit)
-                tagToUrl.put(tag, url);
                 CollaboratorPayload payload = client.generatePayload(tag);
                 String domain = payload.toString();
                 String xxe = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
                         + "<!DOCTYPE r [<!ENTITY xxe SYSTEM \"http://" + domain + "/x\">]>"
                         + "<root><user>&xxe;</user></root>";
                 HttpRequest inj = req.withBody(xxe).withUpdatedHeader("Content-Type", "application/xml");
+                // A PATCH (or override-tunnelled DELETE/PATCH) XML write is refused by the verb guard and never reaches
+                // the parser: count it as NOT tested instead of claiming coverage — and a "no blind XXE" verdict — for it.
+                if (WriteGuard.blocksDestructiveVerb(inj)) { notTested++; SafeHttp.noteBlocked(inj, "XXE"); continue; }
+                tagToUrl.put(tag, url);
                 HttpRequestResponse injRr = send(inj);
                 tagToInj.put(tag, injRr);                                // keep the payload request as attachable evidence
                 testedUrls.add(url);
             } catch (Throwable t) { scanLog.log("XXE probe send error: " + t); }
         }
+        if (notTested > 0) scanLog.log("XXE probe: " + notTested + " XML endpoint(s) not tested (DELETE/PATCH disabled).");
+        if (testedUrls.isEmpty()) return 0;                              // nothing was sent: no callback to poll for, no verdict
         scanLog.log("XXE probe: sent OOB payloads to " + testedUrls.size()
                 + " XML endpoint(s); polling Collaborator…");
 

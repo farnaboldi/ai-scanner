@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
@@ -62,7 +61,15 @@ public final class PathTraversalProbe extends Probe {
     public boolean probe(HttpRequest req) {
         try {
             if (SKIP.matcher(req.url()).matches()) return false;
-            String baseBody = body(send(req));
+            // A REAL baseline, or skip the target: a missing one (a verb-guard refusal comes back response-less, like a
+            // dead send) read as "" and silently passed the signature-already-present guard below — then every param of
+            // the refused request, its _method included, was mutated and sent anyway.
+            HttpRequestResponse b0 = send(req);
+            if (b0 == null || b0.response() == null) {   // refused (verb guard) or dead: no baseline, no test
+                scanLog.debug("path-traversal: skipped " + Net.stripQuery(req.url()) + " — the baseline got no response");
+                return false;
+            }
+            String baseBody = body(b0);
             if (SIG.matcher(baseBody).find()) return false;   // page already contains the signature → skip
             for (ParsedHttpParameter p : req.parameters()) {
                 if (p.type() != HttpParameterType.URL && p.type() != HttpParameterType.BODY) continue;

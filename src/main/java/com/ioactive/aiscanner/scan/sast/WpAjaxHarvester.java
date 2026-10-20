@@ -118,8 +118,6 @@ public final class WpAjaxHarvester {
                     } else if (hasPostAny) {
                         method = "POST";
                         paramName = hasPostLiteral ? pp.group(1) : null;
-                    } else if (hasGetAny) {
-                        method = "GET";
                     }
                 }
             }
@@ -133,7 +131,7 @@ public final class WpAjaxHarvester {
             List<String> params = new ArrayList<>();
             if (paramName != null && !paramName.isBlank()) params.add(paramName);
             out.add(new StaticHint(method, path, params, paramName == null ? "" : paramName,
-                    vulnClass, sinkType, path + (paramName == null ? "" : ":" + paramName), 0.5, ""));
+                    vulnClass, sinkType, path + (paramName == null ? "" : ":" + paramName), 0.5));
             if (log != null) log.debug("SAST(wp-ajax): " + method + " " + path
                     + " param=" + (paramName == null ? "(mine)" : paramName)
                     + (vulnClass.isEmpty() ? "" : " class=" + vulnClass));

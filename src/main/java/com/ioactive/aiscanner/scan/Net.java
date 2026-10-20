@@ -78,12 +78,6 @@ public final class Net {
         return out.toString();
     }
 
-    /** Bare hostname (no port) — for eTLD/registrable-domain and cookie-domain logic where the port is irrelevant. */
-    public static String hostName(String url) {
-        if (url == null) return "";
-        try { String h = URI.create(url).getHost(); return h == null ? "" : h; } catch (Exception e) { return ""; }
-    }
-
     /** Response SHAPE = status + sorted top-level JSON keys (value/order-insensitive), or a path-stripped token
      *  signature for non-JSON — so a real handler's response is distinguishable from a route-not-found without any
      *  framework-specific strings, and reorder/value noise can't move it. Consolidates the byte-identical private

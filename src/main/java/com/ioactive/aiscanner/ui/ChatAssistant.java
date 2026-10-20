@@ -358,7 +358,7 @@ public final class ChatAssistant {
             reply = reply == null ? "" : reply.trim();
             // NARRATE: proxy — read proxy traffic and feed result back.
             if (reply.matches("(?s)(?i)\\s*NARRATE:\\s*proxy\\s*")) {
-                String narration = narrateProxy(false);
+                String narration = narrateProxy();
                 history.add("Assistant: [analyzed proxy traffic]");
                 history.add("System: " + narration);
                 convo += "\n" + reply + "\n[NARRATE RESULT]\n" + narration + "\nAssistant:";
@@ -424,7 +424,7 @@ public final class ChatAssistant {
         try {
             burp.api.montoya.http.message.requests.HttpRequest req =
                     burp.api.montoya.http.message.requests.HttpRequest.httpRequestFromUrl(url);
-            HttpRequestResponse rr = api.http().sendRequest(req,
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req,
                     burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(15000L));
             rr = com.ioactive.aiscanner.scan.AiScanner.decompress(rr);
             int code = rr.response() == null ? -1 : rr.response().statusCode();
@@ -462,7 +462,7 @@ public final class ChatAssistant {
         try {
             burp.api.montoya.http.message.requests.HttpRequest req =
                     burp.api.montoya.http.message.requests.HttpRequest.httpRequestFromUrl(url);
-            HttpRequestResponse rr = api.http().sendRequest(req,
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req,
                     burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(15000L));
             rr = com.ioactive.aiscanner.scan.AiScanner.decompress(rr);   // ungzip so the body is readable
             String rawReq  = rr.request()  == null ? "(no request)"  : rr.request().toString();
@@ -572,7 +572,7 @@ public final class ChatAssistant {
                 + "\n=== Recent scan log ===\n" + scanLog.recentLog(60);
         String out;
         try { out = e.chat(sys, message); } catch (Throwable t) { return "(pick failed: " + t.getMessage() + ")"; }
-        int idx = -1;
+        int idx;
         java.util.Set<String> want = new java.util.LinkedHashSet<>();
         try {
             String json = out.substring(out.indexOf('{'), out.lastIndexOf('}') + 1);
@@ -781,7 +781,7 @@ public final class ChatAssistant {
                 burp.api.montoya.http.message.requests.HttpRequest req =
                         burp.api.montoya.http.message.requests.HttpRequest.httpRequestFromUrl(url);
                 long t0 = System.nanoTime();
-                HttpRequestResponse rr = api.http().sendRequest(req,
+                HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req,
                         burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(5000L));
                 long ms = (System.nanoTime() - t0) / 1_000_000L;
                 if (rr.response() == null) continue;
@@ -887,13 +887,9 @@ public final class ChatAssistant {
     /**
      * Reads the proxy history (in-scope only), builds an attacker-focused prompt for the LLM, and returns
      * a narration describing what the user browsed: interesting parameters, auth tokens, API patterns,
-     * response anomalies, and concrete attack surface hints. Called on-demand ("narrate" keyword) and by
-     * the passive watcher in the extension.
-     *
-     * @param passiveMode true when called by the background watcher (shorter, non-conversational output);
-     *                    false when the user explicitly asked (full analysis, added to chat history).
+     * response anomalies, and concrete attack surface hints. Called on-demand ("narrate" keyword).
      */
-    public String narrateProxy(boolean passiveMode) {
+    public String narrateProxy() {
         AiEngine e = engine.get();
         if (e == null || !e.isConfigured())
             return "(AI not available — configure Local LLM or Burp AI in Settings)";
@@ -919,10 +915,9 @@ public final class ChatAssistant {
             } catch (Throwable ignore) { }
         }
         narratedUpTo.set(all.size());
-        if (fresh.isEmpty()) return passiveMode ? null
-                : scope.hosts().isEmpty()
-                    ? "(no scope defined — add targets in Burp Target → Scope first)"
-                    : "(no new in-scope traffic to analyze)";
+        if (fresh.isEmpty()) return scope.hosts().isEmpty()
+                ? "(no scope defined — add targets in Burp Target → Scope first)"
+                : "(no new in-scope traffic to analyze)";
 
         // Build the prompt context: method + path + status + key headers + truncated body per request.
         // Skip static assets (JS/CSS/images) to keep context focused on app logic.
@@ -989,9 +984,9 @@ public final class ChatAssistant {
                 + "(numeric/guessable IDs in paths/bodies), injection (SQLi/XSS/SSTI/SSRF/template/cmdi), "
                 + "privilege escalation, mass assignment in JSON, info disclosure in errors, CORS, redirects. "
                 + "Skip static assets (JS bundles, CSS, images, fonts). Be blunt and specific — no generic advice. "
-                + (passiveMode ? "Max 5 bullet points, lead with the highest-value finding." : "Group by endpoint, end with a 'Cross-request observations' section.");
+                + "Group by endpoint, end with a 'Cross-request observations' section.";
 
-        String prompt = (passiveMode ? "New proxy traffic captured:\n" : "Here is my recent proxy traffic:\n")
+        String prompt = "Here is my recent proxy traffic:\n"
                 + ctx.toString()
                 + "\nNarrate this from an attacker's perspective.";
 

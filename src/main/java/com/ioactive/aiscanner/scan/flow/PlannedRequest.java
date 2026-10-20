@@ -11,9 +11,7 @@ import java.util.Map;
  * into a Montoya request; carries a signature for anti-loop dedup. Nothing here decides a verdict —
  * every materialized request is live-probed and then handed to a deterministic oracle.
  */
-public record PlannedRequest(String method, String url, String body,
-                             Map<String, String> headers, String intent,
-                             String vulnClassHint, String extractHint) {
+public record PlannedRequest(String method, String url, String body, Map<String, String> headers, String intent) {
 
     /** Tolerant parse of one JSON object (already sliced by LocalAiEngine.firstJsonObject). null on junk. */
     public static PlannedRequest parse(String rawJson) {
@@ -27,7 +25,7 @@ public record PlannedRequest(String method, String url, String body,
             JSONObject hj = o.optJSONObject("headers");
             if (hj != null) for (String k : hj.keySet()) h.put(k, hj.optString(k, ""));
             return new PlannedRequest(method, url, o.optString("body", ""), h,
-                    o.optString("intent", ""), o.optString("vulnClassHint", ""), o.optString("extractHint", ""));
+                    o.optString("intent", ""));
         } catch (Exception e) {
             return null;
         }

@@ -224,7 +224,32 @@ public final class IssueLibrary {
                 + "string concatenation. Apply least-privilege database accounts and validate input types and "
                 + "ranges server-side.</p>");
 
-        if (v.contains("idor") || v.contains("direct object") || v.contains("object-level") || v.contains("bfla") || v.contains("function level"))
+        // --- Cross-principal object authorization (CrossTenantAuthzProbe): a second, distinct principal replayed
+        //     the owner's request on the owner's object. Matched before the generic access-control entry below. ---
+        if (v.contains("cross-tenant access confirmed"))
+            return new Info(HIGH,
+                "<p>The endpoint performed an operation on an object for a principal that does not own it. A second, "
+                + "distinct principal (a different user or tenant) replayed the owner's request against the owner's "
+                + "object and received a successful response, while an anonymous caller is rejected. Authorization is "
+                + "therefore enforced at the authentication level only, not per object (OWASP API1:2023 Broken Object "
+                + "Level Authorization; CWE-639, CWE-285). Any authenticated principal that learns an object's "
+                + "identifier can read or modify it across the user/tenant boundary.</p>",
+                OBJECT_AUTHZ_REMEDIATION);
+        if (v.contains("cross-principal"))
+            return new Info(MEDIUM,
+                "<p>The endpoint resolves an object identified by a client-supplied id and starts processing the request "
+                + "for a principal that does not own it. A second, distinct principal (a different user or tenant) "
+                + "replaying the owner's request against the owner's object was not rejected with 401/403: it reached "
+                + "business logic (for example a billing, quota, validation or conflict check), while the same request "
+                + "against a non-existent id fails earlier and differently. The per-object ownership or tenant check is "
+                + "therefore missing, or is evaluated after other logic (OWASP API1:2023 Broken Object Level "
+                + "Authorization; CWE-639, CWE-285). Whether that principal can complete the operation depends only on "
+                + "satisfying the unrelated downstream control, not on being authorized for the object, so confirm "
+                + "the impact with a principal that satisfies it.</p>",
+                OBJECT_AUTHZ_REMEDIATION);
+
+        if (v.contains("idor") || v.contains("direct object") || v.contains("object-level") || v.contains("object level")
+                || v.contains("bola") || v.contains("bfla") || v.contains("function level"))
             return new Info(HIGH,
                 "<p>The endpoint returns or acts on an object identified by a client-supplied id without checking "
                 + "that the caller owns or may access that object. Enumerating the id therefore exposes other "
@@ -234,6 +259,78 @@ public final class IssueLibrary {
                 + "permitted to act on the specific object, server-side, for reads and writes alike. Prefer "
                 + "unguessable identifiers as defence-in-depth, but never rely on them in place of an "
                 + "authorization check.</p>");
+
+        // --- Existence/identity oracle (ExistenceOracleProbe): a name-keyed lookup confirms whether a tenant/account/
+        //     resource name exists and discloses its internal identifier. MEDIUM when reachable without an account
+        //     (unauthenticated / anonymous client token) or when it enumerates tenants/accounts; LOW otherwise. ---
+        if (v.contains("existence/identity oracle")) {
+            boolean noAccount = v.contains("(unauthenticated)") || v.contains("(anonymous client token)");
+            boolean tenants = v.contains("tenant/account enumeration");
+            return new Info((noAccount || tenants) ? MEDIUM : LOW,
+                "<p>A lookup endpoint keyed by a human-meaningful name answers an existing name with its record and internal "
+                + "identifier (UUID/id) and a non-existent name with a distinct application-level not-found. Anyone able to reach "
+                + "it can therefore test candidate names (organization, tenant, account or resource names) and learn which exist, "
+                + "harvesting their internal identifiers — the inputs for targeted follow-on attacks such as tenant-scoped "
+                + "credential attacks, object-reference guessing and phishing (CWE-204 Observable Response Discrepancy; CWE-200 "
+                + "Exposure of Sensitive Information). The finding records the weakest credential level at which it works.</p>",
+                "<p>Do not expose a name→identifier resolver to callers that have not proven a relationship with the named "
+                + "entity. If a pre-login lookup is required (e.g. to route a user to their organization), return only what the "
+                + "next step needs — not the internal identifier or descriptive metadata — and answer existing and non-existing "
+                + "names identically (same status, body shape and timing), deferring the real check to after authentication. "
+                + "Rate-limit and monitor the endpoint, and prefer high-entropy or user-supplied secrets (invite codes, SSO "
+                + "discovery by verified email domain) over guessable names.</p>");
+        }
+
+        // --- Missing security response headers (SecurityHeadersProbe): passive, zero-FP. HSTS and clickjacking
+        //     are deliberately NOT handled here — both are standard Burp-native passive-scanner issues already
+        //     (both are standard Burp-native passive issues; see SecurityHeadersProbe's class doc). ---
+        if (v.equals("missing recommended security headers"))
+            return new Info(LOW,
+                "<p>The application does not send one or more standard, browser-enforced hardening headers "
+                + "(Content-Security-Policy, X-Content-Type-Options, Referrer-Policy, Permissions-Policy — see the "
+                + "evidence for exactly which). None of these is independently exploitable, but each is a recognized "
+                + "defense-in-depth layer: CSP constrains what a page may load/execute (limiting the impact of any "
+                + "injection); X-Content-Type-Options stops MIME-type sniffing into an executable type; "
+                + "Referrer-Policy limits how much of this site's URLs leak to third parties via Referer; "
+                + "Permissions-Policy disables browser APIs the app does not use.</p>",
+                "<p>Add the missing header(s) at the application or edge/proxy layer. A reasonable baseline: a "
+                + "Content-Security-Policy scoped to the script/style/connect sources the app actually uses (start in "
+                + "report-only mode to tune it), <code>X-Content-Type-Options: nosniff</code>, "
+                + "<code>Referrer-Policy: strict-origin-when-cross-origin</code>, and a <code>Permissions-Policy</code> "
+                + "that disables APIs (camera, microphone, geolocation, etc.) the application does not need.</p>");
+
+        // --- Account / privileged-account enumeration through password reset (RecoveryEnumProbe). Must precede the
+        //     generic "account enumeration" (login) entry below, which would otherwise capture this title. ---
+        if (v.contains("account-recovery response")) {
+            boolean priv = v.contains("privileged-account");
+            return new Info(MEDIUM,
+                "<p>The account-recovery (\"forgot password\") endpoint answers an account that exists differently from one that "
+                + "does not" + (priv ? " — it returns a privilege attribute (for example an administrator flag) for the queried "
+                + "identifier" : "") + ". The login form may hide whether an account exists, but this flow does not: any caller "
+                + "can submit candidate usernames or emails and learn which are registered" + (priv ? " and which belong to "
+                + "administrators, the highest-value targets for password spraying, credential stuffing and phishing" : "")
+                + " (CWE-204 Observable Response Discrepancy; CWE-200 Exposure of Sensitive Information).</p>",
+                "<p>Make the recovery endpoint answer every request identically — same status, body and timing — whether or not "
+                + "the identifier exists (for example: \"If an account exists for this address, we have sent instructions\"), and "
+                + "never include account attributes such as role or administrator status in a pre-authentication response; "
+                + "decide any admin-specific recovery path server-side and out of band. Send the email asynchronously so timing "
+                + "cannot leak, and rate-limit and monitor recovery requests per source and per identifier.</p>");
+        }
+
+        // --- Username / account enumeration (LoginTimingEnumProbe): existing vs non-existing accounts are
+        //     distinguishable by response timing or a different failure, even with an identical error message. ---
+        if (v.contains("username enumeration") || v.contains("account enumeration") || v.contains("user enumeration"))
+            return new Info(MEDIUM,
+                "<p>The login endpoint lets an unauthenticated attacker determine whether a given username/email is a "
+                + "valid account — via a response-time difference (the password hash runs only for real accounts) or a "
+                + "different failure for existing vs non-existing users — even when the displayed error text is identical "
+                + "(CWE-204 Observable Response Discrepancy; CWE-208 Observable Timing Discrepancy). This reveals the valid "
+                + "account list and, combined with any weakness in rate-limiting/lockout, turns credential-stuffing and "
+                + "password brute-forcing into targeted attacks against confirmed accounts.</p>",
+                "<p>Make the authentication failure path indistinguishable for existing and non-existing accounts: perform "
+                + "a dummy password hash of equivalent cost for unknown usernames so timing is constant, and return the "
+                + "exact same status code, body and headers in every failure case. Add per-account and per-source "
+                + "rate-limiting plus lockout/backoff so enumeration and brute-forcing cannot be scaled, and prefer MFA.</p>");
 
         if (v.contains("mass assignment") || v.contains("input validation"))
             return new Info(HIGH,
@@ -385,6 +482,15 @@ public final class IssueLibrary {
             "<p>Reported by the AI Scanner extension after observing a deterministic server-side effect from a "
             + "benign proof payload.</p>", "");
     }
+
+    private static final String OBJECT_AUTHZ_REMEDIATION =
+            "<p>Authorize every object access before any other processing: resolve the object, verify that the "
+            + "authenticated principal (and its tenant) may perform this action on that specific object, and reject "
+            + "otherwise with a uniform 403/404 that does not reveal whether the object exists. Scope object lookups "
+            + "to the caller's tenant (for example include the tenant id in the query) so a foreign id cannot resolve "
+            + "at all. Apply the check to create, update and delete operations that take a parent object id, not only "
+            + "to reads, and add regression tests that call each object-scoped endpoint as a principal from another "
+            + "tenant.</p>";
 
     private IssueLibrary() { }
 }

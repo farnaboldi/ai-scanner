@@ -237,7 +237,7 @@ public final class AuthenticatedExplorer {
                 req = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey()).sign(req);
             // Decompress so crawl/mining parses real HTML (not gzip bytes) behind a compressing proxy/CDN.
             return AiScanner.decompress(
-                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                    com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
         } catch (Throwable t) {
             return null;
         }
@@ -254,7 +254,7 @@ public final class AuthenticatedExplorer {
             if (session != null && session.hasSigningKey())
                 req = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey()).sign(req);
             return AiScanner.decompress(
-                    api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                    com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L)));
         } catch (Throwable t) {
             return null;
         }

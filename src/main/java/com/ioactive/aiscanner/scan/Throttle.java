@@ -31,8 +31,6 @@ public final class Throttle {
         this.log = log;
     }
 
-    public int concurrency() { return effective.get(); }
-
     /** Acquire a slot before running one unit; waits out any active backoff window and respects a shrunk pool. */
     public void acquire() throws InterruptedException {
         long wait = backoffUntilMs - System.currentTimeMillis();

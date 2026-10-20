@@ -148,16 +148,6 @@ public final class AiScanner {
     public ScanConfig config() { return config; }
 
     public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
-                     SessionStore session) {
-        this(api, engine, config, scanLog, session, null, null);
-    }
-
-    public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
-                     SessionStore session, java.util.function.BooleanSupplier cancelled) {
-        this(api, engine, config, scanLog, session, cancelled, null);
-    }
-
-    public AiScanner(MontoyaApi api, Supplier<AiEngine> engine, ScanConfig config, ScanLog scanLog,
                      SessionStore session, java.util.function.BooleanSupplier cancelled,
                      java.util.function.Function<String, String> repoResolver) {
         this.api = api;
@@ -174,7 +164,7 @@ public final class AiScanner {
      *  so the Settings sliders actually change the LLM-driven attack surface. Default 20 either way. */
     private int llmInsertCap() {
         if (LLM_INSERT_CAP_PROP != null) return LLM_INSERT_CAP_PROP;
-        return config != null ? config.maxRequestsPerClass() : 20;
+        return config.maxRequestsPerClass();
     }
 
     /** Re-authentication callback (set by the orchestrator). The captured session can go stale DURING the long
@@ -217,13 +207,6 @@ public final class AiScanner {
 
     // ---- entry points ----
 
-    /** Submit one request's real parameters to Burp's native active audit. */
-    public Audit scanRequest(HttpRequest req) {
-        List<HttpRequest> one = new ArrayList<>();
-        one.add(req);
-        return scanRequests(one, "selected request");
-    }
-
     /** Submit a batch of requests as a single native audit task. Returns the Audit, or null if nothing was queued. */
     public Audit scanRequests(List<HttpRequest> reqs, String label) {
         try {
@@ -233,11 +216,19 @@ public final class AiScanner {
                         + " is covered by the extension's own HTTP probes + local-LLM discovery instead.");
                 return null;
             }
-            int added = 0;
+            int added = 0, skippedCreates = 0;
+            boolean auditCreates = Tuning.auditMutatingCreates();
             llmInsertBudget.set(llmInsertCap());   // bound the per-request LLM insertion-point calls for THIS phase (ScanConfig)
             for (HttpRequest req : reqs) {
+                // Safety: Burp's native audit fuzzes every field, so submitting a state-changing CREATE with a
+                // session that can perform it manufactures real records in the target. Skip such endpoints by
+                // default (our bolawrite/xtauthz/massassign probes cover the write-authz classes non-destructively).
+                if (!auditCreates && isMutatingCreate(req)) { skippedCreates++; continue; }
                 if (addToAudit(audit, req)) added++;
             }
+            if (skippedCreates > 0) scanLog.log("native audit: skipped " + skippedCreates + " state-changing CREATE "
+                    + "endpoint(s) to avoid manufacturing records in the target (set -Daiscanner.auditMutatingCreates=true "
+                    + "to override; our write-authz probes still cover them).");
             if (added == 0) {
                 audit.delete();
                 scanLog.log("nothing to audit (" + label + "): no app parameters found.");
@@ -309,7 +300,7 @@ public final class AiScanner {
         // 3. AISCANNER_SEED_URLS — comma-separated list of URLs to pre-populate into Burp's site map
         //    before the scan starts. Use when the crawl is blocked (e.g. CF challenge) but you know the
         //    real application endpoints from manual browsing, Postman, or a prior authenticated session.
-        //    Example: AISCANNER_SEED_URLS="https://target.example/api/v1/login,https://target.example/api/v1/signin"
+        //    Example: AISCANNER_SEED_URLS="https://app.example.com/api/v1/login,https://app.example.com/api/v1/signin"
         String cfClearance = cfgVal("AISCANNER_CF_CLEARANCE", "aiscanner.cfClearance");
         String uaOverride  = cfgVal("AISCANNER_USER_AGENT",   "aiscanner.userAgent");
         String seedUrls    = cfgVal("AISCANNER_SEED_URLS",    "aiscanner.seedUrls");
@@ -492,7 +483,7 @@ public final class AiScanner {
                 try {
                     for (String cand : cands) {
                         String u = scheme + "://" + host + cand;
-                        burp.api.montoya.http.message.HttpRequestResponse pr = api.http().sendRequest(
+                        burp.api.montoya.http.message.HttpRequestResponse pr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, 
                                 HttpRequest.httpRequestFromUrl(u).withMethod("GET"),
                                 burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(4000L));
                         if (pr == null || pr.response() == null) continue;
@@ -964,6 +955,66 @@ public final class AiScanner {
             scanLog.log("BFLA probe: " + hits + " admin-tier function(s) reachable by a non-privileged user.");
         });
 
+        // Cross-tenant OBJECT authorization differential (the BOLA case the 2xx-only oracles miss): with a
+        // second identity B, replay A's id-bearing requests as B and flag when B reaches business logic on A's
+        // object (402/409/422/2xx — distinct from a non-existent-id control) while an anonymous caller is denied.
+        // No-op without a second identity B (seed AISCANNER_COOKIE_B/AISCANNER_BEARER_B, e.g. a second tenant).
+        attackActions.put("xtauthz", () -> {
+            String cookie = session != null ? session.cookieHeader() : "";
+            String bearer = session != null ? session.bearer() : "";
+            String cookieB = session != null ? session.cookieHeaderB() : "";
+            String bearerB = session != null ? session.bearerB() : "";
+            int hits = new CrossTenantAuthzProbe(api, scanLog).probe(host, cookie, bearer, cookieB, bearerB, targets);
+            scanLog.log("cross-tenant authz probe: " + hits + " endpoint(s) resolved another principal's object without an ownership check (CWE-639/285)"
+                    + (session != null && session.hasSecondIdentity() ? "." : " — second identity B required, skipped."));
+        });
+
+        // Username/account enumeration on a login endpoint: a wrong-password login against an existing account is
+        // uniformly slower (password hash runs) or returns a different error than against a non-existent username.
+        // Reads a captured login POST from the site map (gives the known-valid username); sends only wrong-password
+        // attempts. No-op when no login request was captured.
+        attackActions.put("userenum", () -> {
+            String cookie = session != null ? session.cookieHeader() : "";
+            String bearer = session != null ? session.bearer() : "";
+            int hits = new LoginTimingEnumProbe(api, scanLog).probe(host, cookie, bearer);
+            scanLog.log("login-timing-enum probe: " + hits + " login endpoint(s) leak account existence (timing/response differential, CWE-204/208).");
+        });
+
+        // Existence/identity oracle on a name-keyed lookup (GET …/<collection>/<name>): a real name → 2xx + internal
+        // identifier, an invented one → app-level not-found (distinct from an unknown route) ⇒ tenants/accounts can be
+        // enumerated and their ids harvested. Credential ladder: none → optional anonymous/pre-login client token
+        // (-Daiscanner.anonBearer / AISCANNER_ANON_BEARER) → session A confirmed by identity B. One invented name per
+        // endpoint; never enumerates real names.
+        attackActions.put("enumoracle", () -> {
+            String cookie = session != null ? session.cookieHeader() : "";
+            String bearer = session != null ? session.bearer() : "";
+            String cookieB = session != null ? session.cookieHeaderB() : "";
+            String bearerB = session != null ? session.bearerB() : "";
+            String anon = Tuning.str("aiscanner.anonBearer", "AISCANNER_ANON_BEARER");
+            int hits = new ExistenceOracleProbe(api, scanLog).probe(host, cookie, bearer, cookieB, bearerB, anon);
+            scanLog.log("existence-oracle probe: " + hits + " name-keyed lookup(s) disclose existence + identifier of tenants/resources (CWE-204/200)"
+                    + (anon != null ? " [anonymous client token tier enabled]." : "."));
+        });
+
+        // Account / privileged-account enumeration through password-reset / recovery: a captured recovery request is
+        // replayed for an account KNOWN to exist (a captured successful login, else AISCANNER_LOGIN_EMAIL) and for two
+        // invented identifiers; a stable difference (status / shape / a field such as an admin flag) enumerates accounts.
+        // Exactly one recovery request per endpoint for the known (operator's own) account.
+        attackActions.put("recoveryenum", () -> {
+            String cookie = session != null ? session.cookieHeader() : "";
+            String bearer = session != null ? session.bearer() : "";
+            String anon = Tuning.str("aiscanner.anonBearer", "AISCANNER_ANON_BEARER");
+            int hits = new RecoveryEnumProbe(api, scanLog).probe(host, cookie, bearer, anon);
+            scanLog.log("recovery-enum probe: " + hits + " account-recovery endpoint(s) disclose account existence/privilege (CWE-204/200).");
+        });
+
+        // Missing security response headers (HSTS/CSP/X-Content-Type-Options/Referrer-Policy/Permissions-Policy):
+        // passive, reads only responses already captured in the site map — zero new requests.
+        attackActions.put("secheaders", () -> {
+            int hits = new SecurityHeadersProbe(api, scanLog).probe(host);
+            scanLog.log("security-headers probe: " + hits + " finding(s) (missing HSTS and/or other recommended headers).");
+        });
+
         // JWT implementation analysis: harvest tokens the app used, decode them, and run deterministic
         // oracle-gated checks (alg:none active replay, weak/known HMAC secret, missing exp, sensitive claims).
         attackActions.put("jwt", () -> {
@@ -1273,6 +1324,7 @@ public final class AiScanner {
                 List<Range> ranges = fuzzableRanges(r);
                 ranges.addAll(jsonBodyRanges(r));            // login SQLi/auth-bypass lives in JSON creds
                 if (ranges.isEmpty()) continue;
+                if (WriteGuard.blocksDestructiveVerb(r)) { SafeHttp.noteBlocked(r, "native audit"); continue; }
                 audit.addRequest(r, ranges);
                 added++;
                 scanLog.log("  audit (auth page, separate) @ " + r.method() + " "
@@ -1318,6 +1370,7 @@ public final class AiScanner {
             List<Range> ranges = fuzzableRanges(req);
             ranges.addAll(jsonBodyRanges(req));
             if (ranges.isEmpty()) continue;
+            if (WriteGuard.blocksDestructiveVerb(req)) { SafeHttp.noteBlocked(req, "native audit"); continue; }
             try { audit.addRequest(req, ranges); added++; } catch (Throwable ignore) { }
         }
         scanLog.log("native baseline: submitted " + added + " crawled request(s) to Burp's built-in "
@@ -1861,8 +1914,10 @@ public final class AiScanner {
     /** Native active audit — Pro/Enterprise only. Returns null on Community; callers then rely on own probes. */
     private Audit newAudit() {
         if (communityEdition()) return null;
-        return api.scanner().startAudit(
-                AuditConfiguration.auditConfiguration(BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS));
+        // Burp executes this audit itself and it may outlive our job (late findings): track it so the fence stays
+        // up until the audit is deleted (Stop) or AI Scanner unloads.
+        return ScannerVerbFence.track(api.scanner().startAudit(
+                AuditConfiguration.auditConfiguration(BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS)));
     }
 
     /**
@@ -1886,6 +1941,36 @@ public final class AiScanner {
             }
         } catch (Throwable t) { }
         return false;
+    }
+
+    // A state-changing CREATE endpoint: a mutating verb to a path whose leaf is a create action (create…, add,
+    // upload, new, register, import, clone, invite) OR a bare plural-collection POST (…/members, …/roles). Burp's
+    // native audit fuzzes such an endpoint's body fields and, with a session authorized to create, manufactures
+    // real records in the target — so these are withheld from the native audit by default (see Tuning).
+    private static final java.util.regex.Pattern CREATE_LEAF = java.util.regex.Pattern.compile(
+            "(?i)^(create[A-Za-z0-9]*|add|adds|new|upload[A-Za-z0-9]*|register|import|clone|duplicate|invite|insert)$");
+    private static final java.util.regex.Pattern READ_LEAF = java.util.regex.Pattern.compile(
+            "(?i)^(search[A-Za-z0-9]*|query|list|fetch[A-Za-z0-9]*|get[A-Za-z0-9]*|view|calculate[A-Za-z0-9]*|verify[A-Za-z0-9]*|poll|download|find[A-Za-z0-9]*|validate[A-Za-z0-9]*|current[A-Za-z0-9]*|summary|all)$");
+    static boolean isMutatingCreate(HttpRequest req) {
+        try {
+            String m = req.method();
+            if (!"POST".equals(m) && !"PUT".equals(m)) return false;   // creates are POST/PUT; leave reads + updates/deletes to the normal path
+            String path = URI.create(req.url()).getPath();
+            if (path == null || path.isEmpty()) return false;
+            String[] segs = path.replaceAll("/+$", "").split("/");
+            if (segs.length == 0) return false;
+            String leaf = segs[segs.length - 1];
+            if (READ_LEAF.matcher(leaf).matches()) return false;        // POST search/query/list → safe, keep auditing
+            if (CREATE_LEAF.matcher(leaf).matches()) return true;       // explicit create verb leaf
+            // Bare plural-collection POST (…/members, …/roles, …/permalinks) with a JSON body = create-to-collection.
+            if ("POST".equals(m) && leaf.matches("(?i)[a-z][a-z]+s")) {
+                String body = req.bodyToString();
+                boolean json = (req.hasHeader("Content-Type") && req.headerValue("Content-Type").toLowerCase().contains("json"))
+                        || (body != null && body.trim().startsWith("{"));
+                if (json) return true;
+            }
+            return false;
+        } catch (Throwable t) { return false; }
     }
 
     private boolean addToAudit(Audit audit, HttpRequest req) {
@@ -1917,6 +2002,9 @@ public final class AiScanner {
     /** Submit one request to the audit over its fuzzable ranges. {@code llm} adds LLM-suggested
      *  insertion points (skipped on the seeded twin to avoid a duplicate model call). */
     private boolean submitToAudit(Audit audit, HttpRequest finalReq, boolean llm) {
+        // Burp's native audit replays the base request with its own method; a DELETE/PATCH base would be
+        // re-sent once per insertion point against live data. Never hand those over.
+        if (WriteGuard.blocksDestructiveVerb(finalReq)) { SafeHttp.noteBlocked(finalReq, "native audit"); return false; }
         List<Range> ranges = fuzzableRanges(finalReq);
         ranges.addAll(jsonBodyRanges(finalReq));   // JSON body fields Montoya's parameters() misses
         ranges.addAll(pathSegmentRanges(finalReq)); // id-looking URL path segments (NoSQL/SQLi/XSS/IDOR)
@@ -1944,7 +2032,7 @@ public final class AiScanner {
         String text = req.toString();
         List<String> values;
         try {
-            values = eng.suggestInsertionValues(trunc(text, 4000), config != null ? config.payloadsPerRound : 6);
+            values = eng.suggestInsertionValues(trunc(text, 4000), config.payloadsPerRound);
         } catch (Throwable t) {
             return 0;
         }
@@ -1982,7 +2070,7 @@ public final class AiScanner {
             String origin = u.getScheme() + "://" + u.getAuthority();
             // an app-independent path that no real router should have a handler for
             String probe = origin + "/aiscanner-nonexistent-" + Integer.toHexString(("probe" + sampleUrl).hashCode());
-            HttpRequestResponse r = api.http().sendRequest(
+            HttpRequestResponse r = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, 
                     withSession(HttpRequest.httpRequestFromUrl(probe).withMethod("GET")),
                     RequestOptions.requestOptions().withResponseTimeout(12000L));
             if (r == null || r.response() == null) return "";
@@ -2032,6 +2120,9 @@ public final class AiScanner {
         // Parallel isolation: Burp scope is ADDITIVE across concurrent scans, so isInScope() alone lets the OTHER
         // target's requests in. Keep every audit target on THIS scan's own authority (no-op in single-target runs).
         if (!inScanHost(req.url())) { scanLog.debug("  skip other-target host: " + Net.stripQuery(req.url())); return false; }
+        // Verb guard at the source: a DELETE/PATCH (or an override/batch carrying one) never becomes an audit target,
+        // so no probe or native audit spends its per-host caps on a request that can never be sent.
+        if (WriteGuard.blocksDestructiveVerb(req)) { SafeHttp.noteDroppedTarget(req); return false; }
         // NEVER put login/logout/signin in the probe surface: a probe fuzzing them submits credentials / hits the
         // logout, which INVALIDATES our authenticated session mid-battery — every authenticated endpoint tested
         // afterwards then bounces to login (302) and its sink is missed (observed: reflected-XSS on Zero Bank's
@@ -2161,7 +2252,7 @@ public final class AiScanner {
     StepResult sendAndMeasure(HttpRequest req) {
         long t0 = System.nanoTime();
         HttpRequestResponse r;
-        try { r = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
+        try { r = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L)); }
         catch (Throwable t) { return StepResult.dead((System.nanoTime() - t0) / 1_000_000L); }
         long ms = (System.nanoTime() - t0) / 1_000_000L;
         if (r == null || r.response() == null) return StepResult.dead(ms);

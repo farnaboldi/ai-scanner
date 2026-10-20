@@ -1,5 +1,5 @@
 #!/bin/bash
-# verify-waf.sh: post-scan log analysis for target.example. Checks key improvements hold.
+# verify-waf.sh: post-scan log analysis for a Cloudflare-fronted target. Checks key improvements hold.
 # Usage: bench/verify-waf.sh [/tmp/aiscanner.log]
 LOG="${1:-/tmp/aiscanner.log}"
 [ -f "$LOG" ] || { echo "ERROR: log not found: $LOG"; exit 1; }

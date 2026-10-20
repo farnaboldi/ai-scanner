@@ -65,7 +65,10 @@ public final class GwtRpcDiscovery {
             + "generate|make|schedule|initiate|confirm|perform|apply|cancel|disable|enable|authorize|unauthorize|"
             + "force|restore|freeze|import|upload|register|deregister|become|accept|clear)");
 
-    private static final int MAX_PERM_BYTES = 6_000_000;   // a permutation cache.js is ~2-3MB
+    private static final int MAX_PERM_BYTES = 6_000_000;       // a permutation cache.js is ~2-3MB
+    private static final int MAX_PERMUTATIONS = 6;             // bound how many permutations we fetch
+    private static final int MAX_TOTAL_PERM_BYTES = 10_000_000; // bound the concatenated multi-perm blob
+    private static final int MAX_LOGIN_ATTEMPTS = 20;           // bound the GWT auto-login live-POST search
     private static final int MAX_CONFIRM = 200;            // cap live confirmation requests
     private static final long TIMEOUT_MS = 12_000L;
     private static final long PROBE_DELAY_MS = 300L;       // politeness between probes (avoid target rate-limit)
@@ -76,14 +79,11 @@ public final class GwtRpcDiscovery {
         this.scanLog = scanLog;
     }
 
-    /** Request/response pairs for live-confirmed RPC/JSON servlets — drain into the site map + targets. */
-    public List<HttpRequestResponse> confirmed() { return confirmed; }
-
     /**
      * Detect + map + live-confirm the GWT surface for {@code host}.
      * @param host        the target authority (host[:port]) or a base URL
      * @param withSession applies the captured session (cookie/bearer) to probe requests; may be null
-     * @return live-confirmed servlet request/response pairs (also accumulated in {@link #confirmed()})
+     * @return live-confirmed servlet request/response pairs
      */
     public List<HttpRequestResponse> discover(String host, UnaryOperator<HttpRequest> withSession) {
         try {
@@ -99,31 +99,17 @@ public final class GwtRpcDiscovery {
             scanLog.log("gwt-rpc: GWT app detected (module '" + module + "') — parsing client service registry "
                     + "(native crawl cannot see GWT-RPC servlets).");
 
-            // 2) nocache bootstrap -> a permutation strong-name -> the compiled permutation.
-            String nocache = fetchText(base + "/" + module + "/" + module + ".nocache.js", withSession);
-            if (nocache == null) { scanLog.debug("  gwt-rpc: nocache bootstrap unreadable."); return confirmed; }
-            String perm = firstMatch(HEX32, nocache);
-            if (perm == null) { scanLog.debug("  gwt-rpc: no permutation strong-name in nocache."); return confirmed; }
-            String permJs = fetchText(base + "/" + module + "/" + perm + ".cache.js", withSession);
-            if (permJs == null || permJs.length() < 10_000) {
-                scanLog.debug("  gwt-rpc: permutation " + perm + " unreadable/too small."); return confirmed;
-            }
-            if (permJs.length() > MAX_PERM_BYTES) permJs = permJs.substring(0, MAX_PERM_BYTES);
-            String moduleBase = base + "/" + module + "/";
+            // 2) nocache bootstrap -> EVERY permutation strong-name it lists -> fetch each compiled permutation,
+            //    merged into the UNION surface (see fetchGwtSurface: permutations are not guaranteed equivalent).
+            GwtSurface surf = fetchGwtSurface(base, module, withSession);
+            if (surf == null) return confirmed;
+            String moduleBase = surf.moduleBase, perm = surf.perm, permJs = surf.allJs;
+            Set<String> services = surf.services;
+            Map<String,String> ctorBase = surf.ctorBase;
+            Set<String> endpoints = surf.endpoints;
 
-            // 3) Parse the SERVICE-ENTRY-POINT CONSTRUCTORS -> exact endpoint URLs (base + relpath). This is the
-            //    authoritative surface: GWT binds each servlet via a constructor that concatenates a base path
-            //    with the relpath (`this.a='/rpc/'+a`, or a shared base var `_x='/svc/'`). Extracting those
-            //    gives precise, correctly-based endpoints with NO widget/CSS/method-name noise and NO base
-            //    guessing — so the site map only ever grows with REAL endpoints, never phantoms.
-            Set<String> services = allMatches(SERVICE, permJs, 0);
-            Map<String,String> ctorBase = extractCtorBases(permJs);
-            Set<String> endpoints = new LinkedHashSet<>();
-            for (Map.Entry<String,String> e : ctorBase.entrySet()) {
-                Matcher m = Pattern.compile("new " + Pattern.quote(e.getKey()) + "\\('([a-zA-Z0-9_/]+)'\\)").matcher(permJs);
-                while (m.find()) endpoints.add(e.getValue() + m.group(1));
-            }
-            scanLog.log("gwt-rpc: registry parsed — " + services.size() + " service interface(s), "
+            scanLog.log("gwt-rpc: registry parsed — fetched " + surf.fetchedCount + " of " + surf.totalPerms
+                    + " permutation(s) (union surface) — " + services.size() + " service interface(s), "
                     + endpoints.size() + " exact servlet endpoint(s) from " + ctorBase.size()
                     + " entry-point constructor(s). Native crawl saw 0.");
             for (String s : services) scanLog.debug("  gwt-rpc service: " + s);
@@ -131,26 +117,38 @@ public final class GwtRpcDiscovery {
 
             // 4) Live-confirm + AUTHZ-DIFFERENTIAL each REAL endpoint. One non-mutating probe never carries valid
             //    method args, so a mutating endpoint just rejects it ("too few tokens"/400/401) — no state change.
-            //    For the JSON "JSON-action" bases (/api, /app2, /app3) we also run the endpoint UNAUTHENTICATED and
+            //    For JSON/form action bases (non-GWT-RPC servlets) we also run the endpoint UNAUTHENTICATED and
             //    compare to the base's blanket unknown-action response: a specific action that reaches its handler
             //    with NO session (non-401 while the base 401s bogus actions) is a MISSING-AUTHENTICATION finding —
-            //    the generalized /issueUploadCredentials-style leak, emitted automatically. GWT-RPC bases (/rpc,/svc)
+            //    the generalized "anonymous endpoint hands out credentials" leak, emitted automatically. GWT-RPC bases
             //    reject the empty body pre-auth ("too few tokens"), so their unauth response is not authz-conclusive
             //    here — those are only confirmed as servlets (real arg-level authz testing is GwtRpcProbe/v2).
+            //    Which bases are GWT-RPC is learned from the servlets' own responses (isGwtRpcResponse), never
+            //    from path names.
             // The differential is inherently UNAUTHENTICATED ("does this endpoint process an anonymous request?"),
             // so we probe each endpoint exactly ONCE with no session — one request per endpoint keeps coverage
             // stable under the target's rate-limit (an authed second probe per endpoint doubled the burst and
             // collapsed coverage). Per JSON base we learn the blanket unknown-action response once (cached).
             int tested = 0, live = 0, servletReached = 0, gated = 0, findings = 0;
             Map<String,Kind> jsonBaseBogus = new LinkedHashMap<>();
+            Set<String> gwtRpcBases = new LinkedHashSet<>();   // bases whose servlets answered as GWT-RPC
             for (String ep : endpoints) {
                 if (tested >= MAX_CONFIRM) break;
                 tested++;
                 String url = base + ep;
-                boolean gwtRpc = ep.startsWith("/rpc/") || ep.startsWith("/svc/");
+                String jb = baseOf(ep);   // e.g. /api/
+                // A form probe answered with a GWT-RPC signature marks the whole base GWT-RPC: this endpoint is
+                // re-confirmed with a well-formed GWT-RPC body, and later endpoints under that base go straight to
+                // the GWT-RPC probe (only the first endpoint of a GWT-RPC base costs a second request).
+                boolean gwtRpc = gwtRpcBases.contains(jb);
                 HttpRequestResponse rr = gwtRpc
                         ? sendGwtRpc(url, moduleBase, perm, emptyRpcBody(moduleBase), null)   // unauth
                         : sendJson(url, "{}", null);                                          // unauth
+                if (!gwtRpc && isGwtRpcResponse(rr)) {
+                    gwtRpc = true;
+                    gwtRpcBases.add(jb);
+                    rr = sendGwtRpc(url, moduleBase, perm, emptyRpcBody(moduleBase), null);   // unauth
+                }
                 Kind k = classify(rr);
                 if (k != Kind.SERVLET && k != Kind.AUTH_GATED) continue;   // drop dead/shell/405 only
                 live++;
@@ -161,9 +159,9 @@ public final class GwtRpcDiscovery {
                 // AUTHZ DIFFERENTIAL (JSON endpoints only — the GWT-RPC empty body errors "too few tokens"
                 // pre-auth, so its unauth response is not authz-conclusive; arg-level GWT-RPC authz = v3).
                 // A specific action that REACHES ITS HANDLER unauthenticated, while the base gates unknown
-                // actions (bogus -> 401/403), is a missing-authentication finding (the generalized credential-leak class).
+                // actions (bogus -> 401/403), is a missing-authentication finding (the generalized
+                // unauthenticated credential-leak class).
                 if (!gwtRpc && k == Kind.SERVLET) {
-                    String jb = ep.substring(0, ep.indexOf('/', 1) + 1);   // e.g. /api/
                     Kind baseBogus = jsonBaseBogus.computeIfAbsent(jb,
                             b -> classify(sendJson(base + b + "aiscnf0zq9x", "{}", null)));
                     if (baseBogus == Kind.AUTH_GATED) {
@@ -214,10 +212,10 @@ public final class GwtRpcDiscovery {
                     + servletReached + " handler-reached, " + gated + " auth-gated); " + findings
                     + " missing-authentication finding(s) — surface bridged into the audit battery.");
 
-            // 5b·) AUTO-SEED the cross-account BOLA probes: harvest foreign identifiers/keys the authenticated
-            //      session can already see (drives the app's own lookup/list endpoints, excludes our own identity),
-            //      so the BOLA differential fires with zero operator setup. Operator -D/env seeds still take
-            //      priority and are UNIONed in. Read-only, bounded.
+            // 5b) AUTO-SEED the cross-account BOLA probes: harvest foreign identifiers/keys the authenticated
+            //     session can already see (drives the app's own lookup/list endpoints, excludes our own identity),
+            //     so the BOLA differential fires with zero operator setup. Operator -D/env seeds still take
+            //     priority and are UNIONed in. Read-only, bounded.
             List<String> harvestIds = new ArrayList<>(), harvestKeys = new ArrayList<>();
             harvestForeignSeeds(base, endpoints, withSession, harvestIds, harvestKeys);
             List<String> readSeeds = resolveSeeds("aiscanner.gwtForeignIds", "AISCANNER_GWT_FOREIGN_IDS", harvestIds);
@@ -229,18 +227,18 @@ public final class GwtRpcDiscovery {
             //     with 401/403 or a clean not-found, the ownership check is missing or runs AFTER the datastore
             //     load — an attacker of tenant A can make the server operate on tenant B's objects. Needs a
             //     session (withSession) + a foreign object key (auto-seeded or -Daiscanner.gwtForeignKeys). Read-only.
-            findings += probeCrossAccountLoad(base, endpoints, withSession, loadSeeds);
+            probeCrossAccountLoad(base, endpoints, withSession, loadSeeds);
 
             // 5d) CROSS-ACCOUNT DATA READ (BOLA that RETURNS another tenant's record, not just a load error).
             //     With our session, request a FOREIGN identifier (email/id — auto-seeded or -Daiscanner.gwtForeignIds)
             //     and confirm the endpoint returns that account's populated data (differs from a bogus id, echoes
             //     the foreign id, and unauth→401). Covers account-lookup-by-email and config-by-foreign-group-id.
-            findings += probeCrossAccountRead(base, endpoints, withSession, readSeeds);
+            probeCrossAccountRead(base, endpoints, withSession, readSeeds);
 
             // 5e) UNAUTH CREDENTIAL/TOKEN MINT. Endpoints named like a token/key minter that return credential
-            //     material to an ANONYMOUS caller (like issueUploadCredentials, but a bespoke key/token). Probe UNAUTH
-            //     with a benign marker value; raise ONLY if a credential field/secret is in the response.
-            findings += exploitCredentialMint(base, endpoints);
+            //     material to an ANONYMOUS caller (e.g. an endpoint that mints a key/token or presigned URL).
+            //     Probe UNAUTH with a benign marker value; raise ONLY if a credential field/secret is in the response.
+            exploitCredentialMint(base, endpoints, gwtRpcBases);
 
             // 6) Catalogue method-level surface for the operator (mutating methods flagged, never auto-fired).
             catalogMethods(permJs, services);
@@ -277,6 +275,23 @@ public final class GwtRpcDiscovery {
         // A non-HTML 2xx/4xx with a real body (e.g. a JSON action returning data or a typed error) = servlet.
         if (bl.trim().length() >= 2 && (ct == null || !ct.toLowerCase().contains("html"))) return Kind.SERVLET;
         return Kind.DEAD;
+    }
+
+    /** True when the response carries a GWT-RPC servlet signature: an //OK or //EX payload, a GWT RPC exception,
+     *  or GWT's generic "call failed on the server" failure (what a GWT-RPC servlet answers to a non-GWT-RPC
+     *  body). This is GWT's own wire format, so it classifies a servlet without relying on its path name. */
+    private static boolean isGwtRpcResponse(HttpRequestResponse rr) {
+        if (rr == null || rr.response() == null) return false;
+        String b = rr.response().bodyToString();
+        if (b == null) return false;
+        return b.startsWith("//OK") || b.startsWith("//EX")
+                || b.contains("RpcTokenException") || b.contains("IncompatibleRemoteServiceException")
+                || b.contains("call failed on the server");
+    }
+
+    /** The servlet base an endpoint sits under: its first path segment, e.g. /api/getItem -> /api/. */
+    private static String baseOf(String ep) {
+        return ep.substring(0, ep.indexOf('/', 1) + 1);
     }
 
     // Response markers that prove the server LOADED a (foreign) entity from the datastore before any ownership
@@ -362,7 +377,7 @@ public final class GwtRpcDiscovery {
         // XHR calls this plain-JSON harvest cannot make — e.g. the post-login account tree / summaries) and
         // records those responses in the site map. It is the richest generic source of related-account
         // identifiers the session has ALREADY legitimately seen. Scrape same-host, non-asset responses for
-        // foreign emails (lookupAccountByEmail is email-keyed → a foreign email is exactly the read-probe seed)
+        // foreign emails (an email-keyed account lookup takes a foreign email directly as the read-probe seed)
         // and JSON *key* values, excluding our own identity. Bounded; FP-safe (probe controls still gate).
         try {
             int scraped = 0;
@@ -392,10 +407,10 @@ public final class GwtRpcDiscovery {
 
     /**
      * Cross-account object-level authorization test (BOLA / CWE-639 + CWE-285). With OUR authenticated session,
-     * submit ANOTHER account's object reference to fetch-shaped /api endpoints. If the server loads that foreign
+     * submit ANOTHER account's object reference to fetch-shaped JSON endpoints. If the server loads that foreign
      * entity (type/kind/cast error) rather than rejecting (401/403) or returning a clean not-found, the ownership
      * check is missing or post-load. Read-only. Gated on: an authenticated session AND a seeded foreign key
-     * (-Daiscanner.gwtForeignKeys / AISCANNER_GWT_FOREIGN_KEYS = comma-separated foreign object keyText values,
+     * (-Daiscanner.gwtForeignKeys / AISCANNER_GWT_FOREIGN_KEYS = comma-separated foreign object key values,
      * harvested from a victim account). Zero-FP: fires only on the loaded-entity marker AND requires the SAME
      * bogus key to NOT produce that marker (so it is entity-specific, not a generic 500).
      */
@@ -414,7 +429,7 @@ public final class GwtRpcDiscovery {
         for (String ep : endpoints) {
             String leaf = ep.substring(ep.lastIndexOf('/') + 1).toLowerCase();
             if (leaf.matches(".*(fetch|get|retrieve|load|resolve|view|read).*")
-                    && leaf.matches(".*(account|entity|object|file|group|chain|key|token).*")) {
+                    && leaf.matches(".*(account|entity|object|record|file|group|key|token).*")) {
                 targets.add(ep);
             }
         }
@@ -503,8 +518,8 @@ public final class GwtRpcDiscovery {
             for (String fid : seeds) {
                 if (epHit) break;
                 fid = fid.trim(); if (fid.isEmpty()) continue;
-                // Body encodings: raw JSON string (lookupAccountByEmail), then form named-param — the disclosed name
-                // if any, else a wordlist of common id params (getPrivacySettings doesn't disclose its 'groupId').
+                // Body encodings: raw JSON string, then form named-param — the disclosed name if any, else a
+                // wordlist of common id params (some endpoints never disclose their param name).
                 String pname = discoverParamName(base + ep, withSession);   // may be null
                 java.util.LinkedHashMap<String,HttpRequestResponse> tries = new java.util.LinkedHashMap<>();
                 tries.put("<json-string>", jsonAuthed(base + ep, "\"" + fid.replace("\"", "\\\"") + "\"", withSession));
@@ -549,7 +564,7 @@ public final class GwtRpcDiscovery {
                             + "tenant's data — the object-level authorization check is missing).\n\n"
                             + "Impact: any authenticated user can read another tenant's account/config record by "
                             + "supplying its identifier (often a guessable email/id) — cross-tenant data disclosure "
-                            + "(CWE-639, CWE-285). This can expose PII/config and can harvest the "
+                            + "(CWE-639, CWE-285). This can expose PII/configuration and harvest the "
                             + "object handles that seed further object-level attacks.",
                             foreign, bogus != null ? bogus : foreign);
                     scanLog.incFinding(); hits++; epHit = true;
@@ -581,11 +596,12 @@ public final class GwtRpcDiscovery {
      * material to an anonymous caller. Probe UNAUTH with a benign marker on the disclosed param; raise ONLY when
      * a credential field or secret is present (detectSecret). Read-only: a benign marker mints a throwaway token,
      * no real credential is submitted or exposed. Generic — the endpoint-name shape + the secret-in-body oracle.
+     * Only JSON/form endpoints are probed: those under a base learned as GWT-RPC ({@code gwtRpcBases}) are skipped.
      */
-    private int exploitCredentialMint(String base, Set<String> endpoints) {
+    private int exploitCredentialMint(String base, Set<String> endpoints, Set<String> gwtRpcBases) {
         int hits = 0;
         for (String ep : endpoints) {
-            if (!ep.startsWith("/api/")) continue;
+            if (gwtRpcBases.contains(baseOf(ep))) continue;
             String leaf = ep.substring(ep.lastIndexOf('/') + 1).toLowerCase();
             if (!(leaf.matches(".*(request|get|create|mint|new|issue).*")
                     && leaf.matches(".*(token|key|credential|secret|keypair).*"))) continue;
@@ -624,14 +640,13 @@ public final class GwtRpcDiscovery {
             "The '([A-Za-z0-9_]+)' parameter was not set|Parameter ([A-Za-z0-9_]+) was (?:not set|null)");
     /** Common object-identifier param names to try form-encoded when the server does NOT disclose its param. */
     private static final String[] COMMON_ID_PARAMS = {
-        "id","groupId","accountId","userId","key","keyString","keyText","email","shareKey",
-        "dbId","recordKeyId","entityId","itemId","objectId","uid"};
+        "id","groupId","accountId","userId","key","email","dbId","entityId","objectId","uid"};
     /** Common credential-mint param names for the benign token/key-minter probe. */
     private static final String[] COMMON_MINT_PARAMS = {"password","key","secret","credential","data","value","token"};
     /** Auto-seed harvest: an email address, and the VALUE of any JSON field named like an object key/handle/ref. */
     private static final Pattern EMAIL = Pattern.compile("[A-Za-z0-9._%+\\-]+@[A-Za-z0-9.\\-]+\\.[A-Za-z]{2,}");
     private static final Pattern KEYVAL = Pattern.compile(
-            "\"[A-Za-z0-9_]*(?:[Kk]ey(?:[Ss]tring)?|[Hh]andle|[Rr]ef(?:erence)?)\"\\s*:\\s*\"([A-Za-z0-9_\\-]{16,})\"");
+            "\"[A-Za-z0-9_]*(?:[Kk]ey|[Hh]andle|[Rr]ef(?:erence)?)\"\\s*:\\s*\"([A-Za-z0-9_\\-]{16,})\"");
     private static final int HARVEST_MAX_CALLS = 10;   // bound the auto-seed request burst
     private static final int SITEMAP_MAX = 400;        // bound the auto-seed site-map scrape
     private static final Pattern ASSET_URL = Pattern.compile(
@@ -671,7 +686,7 @@ public final class GwtRpcDiscovery {
         return key.substring(0, 6) + "…" + key.substring(key.length() - 4);
     }
 
-    /** POST form body with N robust retries (Burp's HTTP client intermittently drops some responses). */
+    /** POST form body with N robust retries (some hosts intermittently drop responses). */
     private HttpRequestResponse robustFormPost(String url, String body, int attempts) {
         for (int i = 0; i < attempts; i++) {
             try { Thread.sleep(i == 0 ? PROBE_DELAY_MS : RETRY_BACKOFF_MS); }
@@ -680,7 +695,7 @@ public final class GwtRpcDiscovery {
                 HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
                         .withBody(body)
                         .withHeader("Content-Type", "application/x-www-form-urlencoded");
-                HttpRequestResponse rr = api.http().sendRequest(req,
+                HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req,
                         RequestOptions.requestOptions().withResponseTimeout(TIMEOUT_MS));
                 if (rr != null && rr.response() != null && detectSecret(rr) != null) return rr;  // got the secret
                 if (rr != null && rr.response() != null && i >= attempts - 1) return rr;          // last: return whatever
@@ -700,7 +715,7 @@ public final class GwtRpcDiscovery {
             );
     /** A JSON credential-material field: "decryptionKey"/"encryptionKey"/"apiKey"/"privateKey"/"accessToken"/
      *  "sessionKey"/"authToken"/"credential" : "<>=8 chars>" — a key/token MINTED in a response body. Distinct
-     *  from SECRETS (which are recognisable literals); this catches a bespoke key-mint like a one-time token. */
+     *  from SECRETS (which are recognisable literals); this catches a bespoke key/token mint. */
     private static final Pattern CRED_FIELD = Pattern.compile(
             "\"(decryption[Kk]ey|encryption[Kk]ey|api[Kk]ey|private[Kk]ey|access[Tt]oken|session[Kk]ey|"
             + "auth[Tt]oken|refresh[Tt]oken|credential|bearer)\"\\s*:\\s*\"[^\"]{8,}\"");
@@ -778,7 +793,7 @@ public final class GwtRpcDiscovery {
     }
 
     private HttpRequestResponse sendJson(String url, String body, UnaryOperator<HttpRequest> withSession) {
-        // The /api "JSON-action" API reads standard servlet params (Content-Type form-urlencoded), NOT a JSON body —
+        // Many JSON-action servlets read standard servlet params (Content-Type form-urlencoded), NOT a JSON body —
         // probing with application/json left the body unread (and, on some endpoints, made Burp's HTTP client
         // drop the response). Form-encoded is the native content type: correct + reliable.
         HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
@@ -789,17 +804,17 @@ public final class GwtRpcDiscovery {
     }
 
     /**
-     * Send with politeness + one retry on a dead/throttled response. Live targets may rate-limit
-     * a burst of scan requests, degrading later probes to timeouts — which silently shrinks coverage and
-     * makes findings non-deterministic run-to-run. A small inter-request delay + a single back-off retry keeps
+     * Send with politeness + one retry on a dead/throttled response. Live targets may rate-limit a burst of
+     * scan requests, degrading later probes to timeouts — which silently shrinks coverage and makes findings
+     * non-deterministic run-to-run. A small inter-request delay + a single back-off retry keeps
      * coverage stable without hammering the host.
      */
     private HttpRequestResponse sendPolite(HttpRequest req) {
-        for (int attempt = 0; attempt < 3; attempt++) {   // 3 tries: Burp's HTTP to the hosting platform intermittently drops
+        for (int attempt = 0; attempt < 3; attempt++) {   // 3 tries: some hosts intermittently drop responses
             try { Thread.sleep(attempt == 0 ? PROBE_DELAY_MS : RETRY_BACKOFF_MS * attempt); }
             catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
             try {
-                HttpRequestResponse rr = api.http().sendRequest(req,
+                HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req,
                         RequestOptions.requestOptions().withResponseTimeout(TIMEOUT_MS));
                 if (rr != null && rr.response() != null) {
                     int st = rr.response().statusCode();
@@ -829,7 +844,7 @@ public final class GwtRpcDiscovery {
         try {
             String base = resolveBase(host);
             if (base == null) return null;
-            HttpRequestResponse rr = api.http().sendRequest(
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, 
                     HttpRequest.httpRequestFromUrl(base + "/").withMethod("GET"),
                     RequestOptions.requestOptions().withResponseTimeout(TIMEOUT_MS));
             if (rr == null || rr.response() == null) return null;
@@ -845,7 +860,7 @@ public final class GwtRpcDiscovery {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (withSession != null) req = withSession.apply(req);
-            HttpRequestResponse rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(TIMEOUT_MS));
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(TIMEOUT_MS));
             if (rr == null || rr.response() == null) return null;
             if (rr.response().statusCode() != 200) return null;
             String ct = header(rr, "Content-Type");
@@ -856,6 +871,319 @@ public final class GwtRpcDiscovery {
         } catch (Throwable t) { return null; }
     }
 
+    // ---- GWT-RPC autonomous login (operator-supplied credentials) --------------------------------
+    //
+    // Same trust boundary as AutonomousAuth's REST login strategies: this NEVER invents or guesses
+    // credentials — it only fires when the operator already supplied email+password
+    // (-Daiscanner.loginEmail/.loginPassword), and it only assembles the correctly-formed GWT-RPC wire
+    // request for THOSE credentials. The one piece that looked like it needed guessing — which of the
+    // ~30 embedded serialization-policy strong-names belongs to the login method — is resolved by
+    // CALL-GRAPH TRACING, not by trying candidates against the live server:
+    //
+    //   (a) every RPC proxy constructor the GWT compiler emits has the stable shape
+    //         function CTOR(){ ...; SUPER.call(this, BASEFN(), 'POLICY', TYPEARR) }
+    //   (b) every RPC method-invocation helper has the stable shape
+    //         function METHODFN(inst,arg1,...,argN,callback){ ...; new STREAMWRITER(inst,SVCVAR,'methodName'); ... }
+    //       where `inst` is literally METHODFN's own first declared parameter;
+    //   (c) METHODFN is invoked elsewhere as METHODFN(SINGLETON, realArgs..., cb) — SINGLETON is the
+    //       module-level variable holding the one shared proxy instance for that service;
+    //   (d) SINGLETON is lazily constructed exactly once: SINGLETON = new CTOR (CTOR from step a).
+    //
+    // Chasing (b)->(c)->(d)->(a) backward from a target method name deterministically resolves the one
+    // correct policy for that exact method — pure static analysis of the already-downloaded permutation
+    // JS, zero extra requests to the target, zero brute force.
+    //
+    // This generalizes to ANY GWT app's login (or any other RPC method) — nothing here names a specific
+    // product, service, or method; only structural shape + a login-shaped NAME heuristic.
+
+    /** Method-name shapes that plausibly mean "authenticate with a credential" — CONTAINS-match (methods
+     *  are routinely named with a suffix/prefix around the verb, e.g. "userLogin", "doLogin",
+     *  "authenticateUser"), not an exact match. Generic, not app-specific. */
+    private static final Pattern LOGIN_METHOD_NAME = Pattern.compile("(?i)login|logon|signin|sign_in|authenticate");
+    /** Service/class-name shapes that plausibly host a login method — used only to disambiguate when a
+     *  method-name match alone is ambiguous across several declared service interfaces. */
+    private static final Pattern LOGIN_SERVICE_NAME = Pattern.compile("(?i)login|auth|session|account");
+
+    /** The parsed/fetched GWT client surface — shared between {@link #discover} and {@link #autoLogin} so
+     *  the permutation-union fetch + registry extraction happens exactly once per call, in one place. */
+    private static final class GwtSurface {
+        final String moduleBase, perm, allJs;
+        final Set<String> services, endpoints;
+        final Map<String,String> ctorBase;
+        final int fetchedCount, totalPerms;
+        GwtSurface(String moduleBase, String perm, String allJs, Set<String> services, Set<String> endpoints,
+                   Map<String,String> ctorBase, int fetchedCount, int totalPerms) {
+            this.moduleBase = moduleBase; this.perm = perm; this.allJs = allJs;
+            this.services = services; this.endpoints = endpoints; this.ctorBase = ctorBase;
+            this.fetchedCount = fetchedCount; this.totalPerms = totalPerms;
+        }
+    }
+
+    /**
+     * Fetch EVERY permutation {@code nocache.js} lists and merge the UNION of their service registries.
+     * GWT emits one permutation per deferred-binding axis (browser/locale/...); which one a real browser
+     * loads is decided by runtime UA/locale sniffing this scanner doesn't replicate, and permutations are
+     * NOT guaranteed equivalent — some permutations ship a reduced surface (an entire service registry,
+     * e.g. login/account, missing) while a sibling permutation has the full app. Picking "the first one"
+     * silently truncates discovery; the union is the only way to guarantee full coverage. Bounded
+     * ({@link #MAX_PERMUTATIONS} fetches, {@link #MAX_TOTAL_PERM_BYTES} concatenated).
+     */
+    private GwtSurface fetchGwtSurface(String base, String module, UnaryOperator<HttpRequest> withSession) {
+        String moduleBase = base + "/" + module + "/";
+        String nocache = fetchText(moduleBase + module + ".nocache.js", withSession);
+        if (nocache == null) { scanLog.debug("  gwt-rpc: nocache bootstrap unreadable."); return null; }
+        List<String> perms = new ArrayList<>(allMatches(HEX32, nocache, 0));
+        if (perms.isEmpty()) { scanLog.debug("  gwt-rpc: no permutation strong-name in nocache."); return null; }
+
+        List<String> fetchedHashes = new ArrayList<>();
+        Set<String> services = new LinkedHashSet<>();
+        Map<String,String> ctorBase = new LinkedHashMap<>();
+        Set<String> endpoints = new LinkedHashSet<>();
+        StringBuilder allJs = new StringBuilder();
+        for (String p : perms) {
+            if (fetchedHashes.size() >= MAX_PERMUTATIONS) break;
+            String js = fetchText(moduleBase + p + ".cache.js", withSession);
+            if (js == null || js.length() < 10_000) continue;
+            if (js.length() > MAX_PERM_BYTES) js = js.substring(0, MAX_PERM_BYTES);
+            fetchedHashes.add(p);
+            services.addAll(allMatches(SERVICE, js, 0));
+            Map<String,String> cb = extractCtorBases(js);
+            for (Map.Entry<String,String> e : cb.entrySet()) {
+                ctorBase.putIfAbsent(e.getKey(), e.getValue());   // base paths are stable across permutations
+                Matcher m = Pattern.compile("new " + Pattern.quote(e.getKey()) + "\\('([a-zA-Z0-9_/]+)'\\)").matcher(js);
+                while (m.find()) endpoints.add(e.getValue() + m.group(1));
+            }
+            if (allJs.length() < MAX_TOTAL_PERM_BYTES) allJs.append(js).append('\n');
+        }
+        if (fetchedHashes.isEmpty()) { scanLog.debug("  gwt-rpc: no permutation fetched/parseable."); return null; }
+        return new GwtSurface(moduleBase, fetchedHashes.get(0), allJs.toString(), services, endpoints, ctorBase,
+                fetchedHashes.size(), perms.size());
+    }
+
+    /** One resolved GWT-RPC login candidate: method name, its serialization policy, and how many string
+     *  arguments its invocation helper declares (proxy instance + N args + callback). */
+    private static final class GwtLoginCandidate {
+        final String methodName, policy; final int argCount;
+        GwtLoginCandidate(String methodName, String policy, int argCount) {
+            this.methodName = methodName; this.policy = policy; this.argCount = argCount;
+        }
+    }
+
+    /**
+     * Call-graph-resolve every login-shaped RPC method in {@code js} to its serialization policy + arg
+     * count. Pure static analysis (see the block comment above for the 4-step trace). Returns candidates
+     * in the order found; the caller tries each until one authenticates.
+     */
+    private static List<GwtLoginCandidate> findGwtLoginCandidates(String js) {
+        List<GwtLoginCandidate> out = new ArrayList<>();
+        Map<String,String> ctorPolicy = buildProxyCtorPolicyTable(js);
+        if (ctorPolicy.isEmpty()) return out;
+
+        // (b) RPC method-invocation call sites: new STREAMWRITER(instParam, svcVar, 'methodName')
+        Matcher invM = Pattern.compile("new [A-Za-z0-9_$]+\\(([a-z][A-Za-z0-9_$]*),[A-Za-z0-9_$]+,'([A-Za-z0-9_.]+)'\\)").matcher(js);
+        Set<String> seenMethods = new java.util.HashSet<>();
+        while (invM.find()) {
+            String instParam = invM.group(1), methodName = invM.group(2);
+            if (!LOGIN_METHOD_NAME.matcher(methodName).find()) continue;
+            if (!seenMethods.add(methodName)) continue;   // one candidate per distinct method name
+            String fnName = enclosingFunctionWithFirstParam(js, invM.start(), instParam);
+            if (fnName == null) continue;
+            int argCount = declaredParamCount(js, fnName);
+            if (argCount < 3) continue;   // need at least (instance, 1 real arg, callback)
+            int realArgs = argCount - 2; // minus the proxy instance + trailing AsyncCallback
+
+            // (c) find where fnName(...) is called; the first actual argument there is the proxy SINGLETON.
+            Matcher callM = Pattern.compile("(?<![A-Za-z0-9_$.])" + Pattern.quote(fnName) + "\\(([A-Za-z0-9_$]+)").matcher(js);
+            while (callM.find()) {
+                int cs = callM.start();
+                if (cs >= 9 && js.regionMatches(cs - 9, "function ", 0, 9)) continue;   // skip its own declaration
+                String singleton = callM.group(1);
+                // (d) resolve the singleton's one-time construction: SINGLETON=new CTOR
+                Matcher initM = Pattern.compile(Pattern.quote(singleton) + "=new ([A-Za-z0-9_$]+)").matcher(js);
+                if (initM.find()) {
+                    String policy = ctorPolicy.get(initM.group(1));
+                    if (policy != null) { out.add(new GwtLoginCandidate(methodName, policy, realArgs)); break; }
+                }
+            }
+        }
+        return out;
+    }
+
+    /** (a) Build the table of every RPC proxy constructor function -> its embedded serialization policy. */
+    private static Map<String,String> buildProxyCtorPolicyTable(String js) {
+        Map<String,String> table = new LinkedHashMap<>();
+        Matcher m = Pattern.compile("[A-Za-z0-9_$]+\\.call\\(this,[A-Za-z0-9_$]+\\(\\),'([0-9A-F]{32})',[A-Za-z0-9_$]+\\)").matcher(js);
+        while (m.find()) {
+            String policy = m.group(1);
+            String fn = nearestEnclosingZeroArgFunction(js, m.start());
+            if (fn != null) table.putIfAbsent(fn, policy);
+        }
+        return table;
+    }
+
+    /** Nearest {@code function NAME(){...}} (zero-arg) declaration opening before {@code pos} — the proxy
+     *  constructor shape (GWT proxy ctors always take no arguments). */
+    private static String nearestEnclosingZeroArgFunction(String js, int pos) {
+        int from = Math.max(0, pos - 300);
+        Matcher m = Pattern.compile("function ([A-Za-z0-9_$]+)\\(\\)\\{").matcher(js.substring(from, pos));
+        String last = null;
+        while (m.find()) last = m.group(1);
+        return last;
+    }
+
+    /** Nearest {@code function NAME(PARAM,...)} declaration opening before {@code pos} whose FIRST declared
+     *  parameter is exactly {@code param} — ties an inner call site back to its enclosing helper function. */
+    private static String enclosingFunctionWithFirstParam(String js, int pos, String param) {
+        int from = Math.max(0, pos - 2000);
+        Matcher m = Pattern.compile("function ([A-Za-z0-9_$]+)\\(" + Pattern.quote(param) + "[,)]").matcher(js.substring(from, pos));
+        String last = null;
+        while (m.find()) last = m.group(1);
+        return last;
+    }
+
+    /** Declared parameter count of {@code function fnName(...)}; -1 if not found. */
+    private static int declaredParamCount(String js, String fnName) {
+        Matcher m = Pattern.compile("function " + Pattern.quote(fnName) + "\\(([^)]*)\\)").matcher(js);
+        if (!m.find()) return -1;
+        String params = m.group(1).trim();
+        return params.isEmpty() ? 0 : params.split(",").length;
+    }
+
+    /**
+     * Build a GWT-RPC wire body for a method taking {@code argCount} java.lang.String arguments, the
+     * first two bound to {@code email}/{@code password} and any remaining args defaulted to "" (the
+     * common trailing-optional-param convention on login methods). String-typed-args only — covers the
+     * realistic login-method shape; a non-String-shaped login (rare) simply fails closed (no crash, no
+     * corrupt request — the caller just gets no account-shaped response and moves on).
+     */
+    private static String buildGwtLoginBody(String moduleBase, String policy, String serviceFqn, String methodName,
+                                             String email, String password, int argCount) {
+        List<String> table = new ArrayList<>(List.of(moduleBase, policy, serviceFqn, methodName,
+                "java.lang.String/2004016611", email, password));
+        StringBuilder inv = new StringBuilder("1|2|3|4|").append(argCount).append('|');
+        for (int i = 0; i < argCount; i++) inv.append("5|");           // every arg shares the one String-type entry
+        inv.append("6|7|");                                             // email, password refs
+        if (argCount > 2) {
+            table.add("");                                              // one shared empty-string table entry
+            int emptyRef = table.size();
+            for (int i = 2; i < argCount; i++) inv.append(emptyRef).append('|');
+        }
+        StringBuilder body = new StringBuilder("7|0|").append(table.size()).append('|');
+        for (String s : table) body.append(gwtEscape(s)).append('|');
+        return body.append(inv).toString();
+    }
+
+    /**
+     * Autonomous GWT-RPC login with OPERATOR-SUPPLIED credentials. Detects every login-shaped RPC method
+     * via {@link #findGwtLoginCandidates}, pairs each with a declared service interface whose simple name
+     * looks login/auth-shaped, and POSTs the assembled request — trying candidates in order until one
+     * response contains the caller's own email (proof the server accepted the credential) and sets a
+     * session cookie. Read-only from the scanner's perspective: it submits exactly the credential pair the
+     * operator already gave it, nothing invented. Returns the raw {@code Set-Cookie} header on success, or
+     * null (the caller falls back to an operator-supplied cookie, unchanged).
+     */
+    public String autoLogin(String host, String email, String password) {
+        try {
+            String base = resolveBase(host);
+            if (base == null || email == null || email.isBlank() || password == null) return null;
+            String module = detectModule(host);
+            if (module == null) return null;
+
+            GwtSurface surf = fetchGwtSurface(base, module, null);
+            if (surf == null) return null;
+            List<GwtLoginCandidate> candidates = findGwtLoginCandidates(surf.allJs);
+            if (candidates.isEmpty()) {
+                scanLog.debug("  gwt-rpc: auto-login found no login-shaped RPC method (call-graph trace empty).");
+                return null;
+            }
+
+            // Servlet URL candidates: REAL entry-point-constructor-derived endpoints (the same authoritative
+            // extraction discover() uses — no guessing) whose relpath looks login-shaped. NEVER fall back to
+            // the full endpoint set (can be 100+ on a real app) — that turns this into an unbounded, impolite
+            // sweep against a live target. No login-shaped relpath found = no guess; bail out cleanly instead.
+            List<String> servletUrls = new ArrayList<>();
+            for (String ep : surf.endpoints) if (LOGIN_METHOD_NAME.matcher(ep).find()) servletUrls.add(base + ep);
+            if (servletUrls.isEmpty()) {
+                scanLog.debug("  gwt-rpc: auto-login found login method candidate(s) but no login-shaped servlet "
+                        + "endpoint among the " + surf.endpoints.size() + " discovered — not guessing further.");
+                return null;
+            }
+
+            List<String> loginServices = new ArrayList<>();
+            for (String s : surf.services) if (LOGIN_SERVICE_NAME.matcher(s.substring(s.lastIndexOf('.') + 1)).find()) loginServices.add(s);
+            if (loginServices.isEmpty()) loginServices.addAll(surf.services);   // fall back to trying all known services
+
+            // Bounded, polite search: URL outermost (the most promising/login-shaped servlet first — if it's
+            // right, success lands within the first few attempts regardless of candidate/service count), a
+            // small delay between live POSTs, and a hard cap on total requests so a target with many declared
+            // services can never turn this into an unbounded sweep. MAX_LOGIN_ATTEMPTS bounds the worst case
+            // to a couple dozen requests — once, for the whole scan, not per endpoint.
+            int attempts = 0;
+            AuthSessionGwt sess = new AuthSessionGwt(api);
+            outer:
+            for (String url : servletUrls) {
+                for (GwtLoginCandidate c : candidates) {
+                    for (String svcFqn : loginServices) {
+                        if (attempts >= MAX_LOGIN_ATTEMPTS) {
+                            scanLog.debug("  gwt-rpc: auto-login hit its " + MAX_LOGIN_ATTEMPTS + "-attempt cap "
+                                    + "(" + servletUrls.size() + " login-shaped url(s) x " + candidates.size()
+                                    + " method candidate(s) x " + loginServices.size() + " service(s) was too "
+                                    + "large to exhaust) — bailing out, no further guessing.");
+                            break outer;
+                        }
+                        attempts++;
+                        String body = buildGwtLoginBody(surf.moduleBase, c.policy, svcFqn, c.methodName, email, password, c.argCount);
+                        HttpRequestResponse rr = sess.postGwtRpc(url, surf.moduleBase, surf.perm, body);
+                        try { Thread.sleep(PROBE_DELAY_MS); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break outer; }
+                        if (rr == null || rr.response() == null) continue;
+                        String rb = rr.response().bodyToString();
+                        boolean hasCookie = rr.response().headers().stream()
+                                .anyMatch(h -> h.name().equalsIgnoreCase("Set-Cookie") && h.value().contains("="));
+                        if (rb != null && rb.contains(email) && hasCookie) {
+                            scanLog.log("gwt-rpc: auto-login OK — " + svcFqn.substring(svcFqn.lastIndexOf('.') + 1)
+                                    + "." + c.methodName + "() accepted the supplied credential (call-graph-resolved "
+                                    + "policy, " + c.argCount + "-arg signature; servlet " + url.substring(base.length())
+                                    + "; " + attempts + " attempt(s)).");
+                            return sess.cookieHeader();
+                        }
+                    }
+                }
+            }
+            scanLog.debug("  gwt-rpc: auto-login tried " + candidates.size() + " method candidate(s) x "
+                    + loginServices.size() + " service(s) x " + servletUrls.size() + " servlet path(s) — none authenticated.");
+            return null;
+        } catch (Throwable t) { scanLog.debug("gwt-rpc auto-login error: " + t); return null; }
+    }
+
+    /** Minimal cookie-accumulating sender for the GWT-RPC login POST (mirrors AuthSession's jar-merge, kept
+     *  local so GwtRpcDiscovery has no dependency on the scan.auth package). */
+    private static final class AuthSessionGwt {
+        private final MontoyaApi api;
+        private final Map<String,String> jar = new LinkedHashMap<>();
+        AuthSessionGwt(MontoyaApi api) { this.api = api; }
+        String cookieHeader() {
+            StringBuilder sb = new StringBuilder();
+            for (Map.Entry<String,String> e : jar.entrySet()) { if (sb.length() > 0) sb.append("; "); sb.append(e.getKey()).append('=').append(e.getValue()); }
+            return sb.toString();
+        }
+        HttpRequestResponse postGwtRpc(String url, String moduleBase, String perm, String body) {
+            HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("POST")
+                    .withBody(body)
+                    .withHeader("Content-Type", "text/x-gwt-rpc; charset=utf-8")
+                    .withHeader("X-GWT-Module-Base", moduleBase)
+                    .withHeader("X-GWT-Permutation", perm);
+            HttpRequestResponse rr;
+            try {
+                rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12_000L));
+            } catch (Throwable t) { return null; }
+            if (rr != null && rr.response() != null) {
+                try { for (var c : rr.response().cookies()) if (c.name() != null && !c.name().isBlank()) jar.put(c.name(), c.value() == null ? "" : c.value()); }
+                catch (Throwable ignore) { }
+            }
+            return rr;
+        }
+    }
+
     // ---- small utilities -------------------------------------------------------------------------
 
     private static String resolveBase(String host) {
@@ -864,7 +1192,7 @@ public final class GwtRpcDiscovery {
                 URI u = URI.create(host);
                 return u.getScheme() + "://" + u.getAuthority();
             }
-            // bare authority: default https for the hosting platform / modern hosts, caller usually passes a URL anyway
+            // bare authority: default https; the caller usually passes a URL anyway
             return "https://" + host;
         } catch (Exception e) { return null; }
     }
@@ -884,7 +1212,7 @@ public final class GwtRpcDiscovery {
 
     /**
      * Extract the GWT service-entry-point constructors and the base path each binds. Two compiled patterns:
-     *  (1) inline base literal:  {@code function Ab1(a){...this.a='/api/'+a}}
+     *  (1) inline base literal:  {@code function Ab1(a){...this.a='/rpc/'+a}}
      *  (2) shared base variable:  {@code _x='/svc/'} + {@code function Cd2(a){...this.b=_x+a}}
      * Returns constructorClassName -> basePath (e.g. Cd2 -> /svc/).
      */
@@ -902,11 +1230,6 @@ public final class GwtRpcDiscovery {
                 "function ([A-Za-z0-9_$]+)\\(([a-z])\\)\\{[^}]{0,200}?this\\.[a-z]=([A-Za-z0-9_$]{1,4})\\+\\2").matcher(js);
         while (m2.find()) { String bv = baseVar.get(m2.group(3)); if (bv != null) out.putIfAbsent(m2.group(1), bv); }
         return out;
-    }
-
-    private static String firstMatch(Pattern p, String s) {
-        Matcher m = p.matcher(s);
-        return m.find() ? m.group() : null;
     }
 
     private static Set<String> allMatches(Pattern p, String s, int group) {

@@ -128,8 +128,6 @@ public final class MontoyaAiEngine extends PromptAiEngine {
     /** Retry attempts for a single prompt (flaky connectivity to Burp AI is common — a dropped call is wasted). */
     private static final int MAX_ATTEMPTS = 3;
     private static final long[] BACKOFF_MS = { 3000L, 8000L, 15000L };
-    private static final AtomicLong TRANSIENT_FAILS = new AtomicLong();
-    public static long totalTransientFails() { return TRANSIENT_FAILS.get(); }
 
     @Override
     public String chat(String systemPrompt, String userPrompt) {
@@ -217,7 +215,6 @@ public final class MontoyaAiEngine extends PromptAiEngine {
                 boolean transientErr = m.contains("try again") || m.contains("connect") || m.contains("tim")
                         || m.contains("temporar") || m.contains("unavailable") || m.contains("reset");
                 if (attempt < MAX_ATTEMPTS && transientErr) {
-                    TRANSIENT_FAILS.incrementAndGet();
                     long wait = BACKOFF_MS[Math.min(attempt - 1, BACKOFF_MS.length - 1)];
                     logger.accept("Burp AI transient failure (attempt " + attempt + "/" + MAX_ATTEMPTS
                             + ", connectivity): " + lastError() + " — retrying in " + (wait / 1000) + "s");

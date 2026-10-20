@@ -118,9 +118,7 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         if (anyInline) {
             for (Map.Entry<String, Path> ef : entryFilePaths.entrySet()) {
                 if (childSrc.size() + inlineSrc.size() >= MAX_CHILDREN) break;
-                if (!inlineSrc.containsKey(ef.getKey())) {
-                    inlineSrc.put(ef.getKey(), ef.getKey() + "\n" + readBounded(ef.getValue()));
-                }
+                inlineSrc.put(ef.getKey(), ef.getKey() + "\n" + readBounded(ef.getValue()));
             }
         }
         scanLog.log("SAST(agentic): mapped " + entries.size() + " entry point(s); following "
@@ -180,7 +178,6 @@ public final class AgenticSourceAnalyzer implements SourceAnalyzer {
         try {
             if (!p.toRealPath().startsWith(root)) return;      // symlink escape guard
             if (Files.size(p) > MAX_FILE_BYTES) return;
-            if (chars[0] >= MAX_ENTRY_CHARS) return;
             String rel = root.relativize(p).toString().replace('\\', '/');
             String[] lines = new String(Files.readAllBytes(p), StandardCharsets.UTF_8).split("\n", -1);
             boolean contributed = false;

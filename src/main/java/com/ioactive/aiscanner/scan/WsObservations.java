@@ -31,7 +31,5 @@ public final class WsObservations {
         synchronized (HANDSHAKES) { return new ArrayList<>(HANDSHAKES); }
     }
 
-    public static int size() { return HANDSHAKES.size(); }
-
     private WsObservations() {}
 }

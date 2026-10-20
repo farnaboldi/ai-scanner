@@ -91,14 +91,6 @@ public final class RequestSigner {
         catch (Exception e) { int i = url.indexOf('?'); return i < 0 ? "" : url.substring(i + 1); }
     }
 
-    /** Standalone header computation (for a raw proof/probe that isn't built as an HttpRequest). */
-    public String[] headers(String method, String url, String body) {
-        String ts = Long.toString(System.currentTimeMillis() / 1000L);
-        String reqId = UUID.randomUUID().toString();
-        String canonical = ts + ":" + method + ":" + normalizePath(pathOf(url)) + ":" + sha256Hex(body == null ? "" : body) + ":" + reqId;
-        return new String[]{ hmacSha256Hex(signingKey, canonical), ts, reqId };   // X-Signature, X-Timestamp, X-Request-ID
-    }
-
     static String pathOf(String url) {
         try {
             String p = URI.create(url).getRawPath();

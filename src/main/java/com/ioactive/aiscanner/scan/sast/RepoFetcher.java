@@ -154,7 +154,7 @@ public final class RepoFetcher {
                     .withAddedHeader("Accept", "application/zip, application/octet-stream, */*");
             if (tok != null && !tok.isBlank() && hostOf(current).equalsIgnoreCase(originHost))
                 req = req.withAddedHeader("Authorization", "token " + tok.trim());
-            HttpRequestResponse rr = api.http().sendRequest(req,
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req,
                     RequestOptions.requestOptions().withResponseTimeout(120_000L));
             if (rr.response() == null) return null;
             int code = rr.response().statusCode();

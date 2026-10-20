@@ -1,7 +1,6 @@
 package com.ioactive.aiscanner.scan;
 
 import burp.api.montoya.MontoyaApi;
-import burp.api.montoya.http.RequestOptions;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.params.HttpParameter;
 import burp.api.montoya.http.message.params.HttpParameterType;
@@ -76,8 +75,15 @@ public final class SstiProbe extends Probe {
     public boolean probe(HttpRequest req) {
         try {
             if (req == null || !req.hasParameters()) return false;
+            // A REAL baseline, or skip the target: a missing one (a verb-guard refusal comes back response-less, like a
+            // dead send) used to leave baseBody null, which silently skipped BOTH "already present" guards — the product
+            // here and the RCE canary in escalateToRce — and fuzzed a request the guard had just refused.
             HttpRequestResponse base = send(req);
-            String baseBody = base != null && base.response() != null ? base.response().bodyToString() : null;
+            if (base == null || base.response() == null) {   // refused (verb guard) or dead: no baseline, no test
+                scanLog.debug("ssti: skipped " + Net.stripQuery(req.url()) + " — the baseline got no response");
+                return false;
+            }
+            String baseBody = base.response().bodyToString();
             if (baseBody != null && baseBody.contains(String.valueOf(PRODUCT))) return false;   // product already present → FP guard
             String prov = prov(req.url());
             for (ParsedHttpParameter p : req.parameters()) {

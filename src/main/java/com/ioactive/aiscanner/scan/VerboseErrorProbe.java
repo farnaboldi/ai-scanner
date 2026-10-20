@@ -152,7 +152,7 @@ final class VerboseErrorProbe extends Probe {
     protected HttpRequestResponse send(HttpRequest req) {   // overrides Probe.send(req): decompresses the response
         politeness();   // ScanConfig politeness delay
         try {
-            return AiScanner.decompress(api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
+            return AiScanner.decompress(com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs())));
         } catch (Throwable t) { return null; }
     }
 

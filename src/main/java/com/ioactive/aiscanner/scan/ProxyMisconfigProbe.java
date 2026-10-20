@@ -387,10 +387,8 @@ public final class ProxyMisconfigProbe extends Probe {
 
         String label = proxyId.isEmpty() ? "reverse proxy" : proxyId;
         int hits = 0;
-        Set<String> fired = new LinkedHashSet<>();
         for (String[] pair : tests) {
             String encoded = pair[0], expected = pair[1];
-            if (!fired.add(encoded)) continue;
             HttpRequestResponse rr = getRaw(base + encoded, withSession); // don't follow redirects
             if (rr == null || rr.response() == null) continue;
             int st = rr.response().statusCode();
@@ -400,7 +398,6 @@ public final class ProxyMisconfigProbe extends Probe {
             // Confirm the redirect target is the decoded/normalized form of what we sent.
             boolean normalizes = loc.endsWith(expected) || loc.contains(expected + "?") || loc.contains(expected + "#");
             if (!normalizes) continue;
-            if (!fired.add("redirect:" + encoded)) continue;
             scanLog.found("Reverse proxy path normalization redirect"
                     + (proxyId.isEmpty() ? "" : " [" + proxyId + "]"),
                     base + encoded,
@@ -523,7 +520,7 @@ public final class ProxyMisconfigProbe extends Probe {
                       + "Host: " + proxyHost + ":" + proxyPort + "\r\n"
                       + "User-Agent: Mozilla/5.0\r\n"
                       + "Connection: close\r\n\r\n";
-        HttpRequestResponse rr = null;
+        HttpRequestResponse rr;
         try {
             HttpService proxySvc = HttpService.httpService(proxyHost, proxyPort, secure);
             HttpRequest req = HttpRequest.httpRequest(proxySvc, rawReq);
@@ -662,7 +659,7 @@ public final class ProxyMisconfigProbe extends Probe {
             HttpRequest r = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (ws != null) r = ws.apply(r);
             politeness();
-            return api.http().sendRequest(r,
+            return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, r,
                 burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(requestTimeoutMs()));
         } catch (Throwable t) { return null; }
     }

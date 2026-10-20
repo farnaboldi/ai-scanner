@@ -253,19 +253,8 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         return out;
     }
 
-    /**
-     * Exclude ANY logout URL from Burp's scope with a single regex rule (no route list) — Burp's
-     * advanced scope is regex-based, so {@code .*logout.*} etc. fences off logout for the whole host
-     * up front, so the crawler NEVER visits it. Re-auth + our own filters remain as backstops.
-     */
-    private void excludeLogoutFromScope(String seed) {
-        // Montoya's Scope.excludeFromScope(String) takes a URL PREFIX, not a regex — a ".*logout.*" pattern
-        // throws "URL is invalid" and silently no-ops. There's no regex scope in Montoya, and pre-crawl we
-        // don't know the concrete logout URL, so we DON'T fence logout here. It's fenced where it matters:
-        // AuthenticatedExplorer.SESSION_RESET filters logout/login out of everything we probe or submit to
-        // the audit, so Burp never receives a session-destroying request from us. (startCrawl also returns
-        // 0 requests on these SPAs, so the native crawler won't reach logout either.)
-    }
+    // No logout/login scope exclusions here: Montoya's Scope.excludeFromScope takes a URL PREFIX, not a regex.
+    // AuthenticatedExplorer.SESSION_RESET keeps logout/login out of everything we probe or submit to the audit.
 
     /**
      * Restrict Burp's scope to the TARGET only. Without an include rule Burp's scope is "everything", so
@@ -293,19 +282,6 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         } catch (Exception e) {
             scanLog.log("includeInScope failed: " + e);
         }
-    }
-
-    /**
-     * Post-auth: also fence login/signin out of Burp's scope so its crawler/scanner never re-hits
-     * them (each hit resets our session). Safe to call only AFTER authenticating — the initial crawl
-     * has already discovered login.html by then. Our own login (sendRequest) ignores scope, and the
-     * end-of-scan login audit uses explicit addRequest, so both still work.
-     */
-    private void excludeAuthPagesFromScope() {
-        // (Same Montoya limitation as excludeLogoutFromScope: excludeFromScope takes a URL PREFIX, not a
-        // regex — "(?i).*(signin|/login|…).*" throws "URL is invalid" and no-ops.) login/signin are fenced
-        // where it matters: AuthenticatedExplorer.SESSION_RESET filters them out of everything we probe or
-        // submit to the audit, and our own login uses sendRequest (ignores scope), so the session is safe.
     }
 
     // A response that says the request must be SIGNED (bearer alone is not enough): common wordings/headers
@@ -359,7 +335,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // 1b) If we captured a signing key at auth, reproduce the signature and PROVE it unlocks the gate.
             // Test the missing-signature endpoints first, then invalid ones, and report the FIRST that flips to
             // 2xx (and how many of each unlocked). Each tested pair is registered to the site map for follow-up.
-            if (session != null && session.hasSigningKey() && gateHits > 0) {
+            if (session != null && session.hasSigningKey()) {
                 try {
                     var signer = new com.ioactive.aiscanner.scan.auth.RequestSigner(session.signingKey());
                     // First: how many endpoints did signing ALREADY unlock during the authenticated explore?
@@ -394,8 +370,8 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                             HttpRequest base = HttpRequest.httpRequestFromUrl(u).withMethod("GET");
                             if (session.hasBearer()) base = base.withHeader("Authorization", "Bearer " + session.bearer());
                             if (session.has()) base = base.withHeader("Cookie", session.cookieHeader());
-                            HttpRequestResponse unsigned = api.http().sendRequest(base, RequestOptions.requestOptions().withResponseTimeout(12000L));
-                            HttpRequestResponse signed   = api.http().sendRequest(signer.sign(base), RequestOptions.requestOptions().withResponseTimeout(12000L));
+                            HttpRequestResponse unsigned = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, base, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                            HttpRequestResponse signed   = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, signer.sign(base), RequestOptions.requestOptions().withResponseTimeout(12000L));
                             su = unsigned.response() != null ? unsigned.response().statusCode() : -1;
                             ss = signed.response()   != null ? signed.response().statusCode()   : -1;
                             try { api.siteMap().add(signed); } catch (Exception ignore) { }
@@ -583,7 +559,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 if (session.hasBearer()) req = req.withAddedHeader("Authorization", "Bearer " + session.bearer());
             }
             HttpRequestResponse rr;
-            try { rr = api.http().sendRequest(req); }
+            try { rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req); }
             catch (Exception e) { return last; }
             if (rr == null || rr.response() == null) return last;
             // Decompress so the seed page's HTML (and its <script src> refs) is mined, not gzip bytes, behind a
@@ -635,6 +611,8 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         Thread t = new Thread(() -> {
             // WAF-block accounting for the whole scan (our probes + Burp's own audit). Deregistered in finally.
             com.ioactive.aiscanner.scan.WafObserver waf = new com.ioactive.aiscanner.scan.WafObserver(api, scanLog, host);
+            // Verb guard for Burp's OWN crawl/audit of this job (SafeHttp already gates our sends). Closed in finally.
+            if (com.ioactive.aiscanner.scan.ScannerVerbFence.open() == 1) com.ioactive.aiscanner.scan.SafeHttp.resetForScan();
             try {
                 com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.incrementAndGet();   // live concurrent-scan count → LLM timeouts scale by it (correct even when scans are added at will)
                 scanLog.log("=== run start (build "
@@ -656,12 +634,27 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                         }
                     }
                 }
-                // Record the exact LLM sampling config in EVERY run.
+                // Record the exact LLM sampling config in EVERY run — and the EFFECTIVE scan mode, not just the
+                // configured enum: DAST_SAST degrades to plain DAST when no source repo is associated (SAST has
+                // nothing to analyse), and the engine string states whether AI is actually active. So the run-start
+                // line never claims "DAST+SAST" / an AI pipeline it isn't running.
                 {
                     com.ioactive.aiscanner.engine.AiEngine e0 = scanner.engine();
-                    scanLog.log("engine: " + (e0 == null ? "none (no-ai / deterministic only)" : e0.paramSummary())
+                    String repoPath = repoForHost == null ? null : repoForHost.apply(host);
+                    boolean hasSource = repoPath != null && !repoPath.isBlank();
+                    com.ioactive.aiscanner.scan.ScanConfig.ScanMode cfgMode = scanner.config().scanMode;
+                    String effMode;
+                    switch (cfgMode) {
+                        case SAST: effMode = "SAST (source-only)"; break;
+                        case DAST: effMode = "DAST (black-box)"; break;
+                        default:   effMode = hasSource ? "DAST+SAST (source: " + repoPath + ")"
+                                                       : "DAST (black-box — no source repo associated; SAST inactive)";
+                    }
+                    boolean aiOn = e0 != null;
+                    scanLog.log("engine: " + (aiOn ? e0.paramSummary() : "none (no-ai / deterministic only)")
                             + "  |  discovery rounds=" + com.ioactive.aiscanner.scan.EndpointDiscovery.discoveryRoundsPublic()
-                            + "  |  scan mode=" + scanner.config().scanMode.name());
+                            + "  |  scan mode=" + effMode + " (configured " + cfgMode.name() + ")"
+                            + "  |  AI=" + (aiOn ? "on" : "OFF (deterministic probes only)"));
                 }
                 // Burp AI is PAID — show the REAL credit balance UP FRONT (Burp caches it in WorkspaceConfig.json;
                 // this is the true pre-scan number, before any prompt bills). end-of-scan logAiUsage() prints the
@@ -695,7 +688,6 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // Global session propagation
                 session.setOnCookieUpdate(c -> pushSessionToCookieJar(c, host));
                 if (session.has()) pushSessionToCookieJar(session.cookieHeader(), host);
-                excludeLogoutFromScope(seed);
 
                 scanLog.phase("Crawling " + host);
                 burp.api.montoya.scanner.Crawl crawl = null;
@@ -708,10 +700,15 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                         scanLog.log("Burp Community edition: native crawler unavailable — using the "
                                 + "extension's own authenticated explorer + JS/OpenAPI discovery for the attack surface.");
                     } else {
-                        crawl = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed));
-                        waitForCrawl(crawl);
-                        logCrawlInventory(host, crawl.requestCount());
-                        stopTask(crawl, "crawl");
+                        crawl = com.ioactive.aiscanner.scan.ScannerVerbFence.track(
+                                api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed)));
+                        // finally: a Stop, unload or exception mid-wait must not leave Burp's crawl running.
+                        try {
+                            waitForCrawl(crawl);
+                            logCrawlInventory(host, crawl.requestCount());
+                        } finally {
+                            stopTask(crawl, "crawl");
+                        }
                     }
                 }
                 // Prime the site map with the seed page when the crawler didn't populate it — Community has no
@@ -760,6 +757,37 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                     // whose custom body shape (nested/stringified credential wrappers) the generic body can't build.
                     new AutonomousAuth(api, session, scanLog, host, seed)
                             .withEngine(scanner.engine()).loginWithProvidedCreds(loginEps);
+                }
+
+                // GWT-RPC autonomous login (same operator-supplied credentials as just above): the REST-shaped
+                // strategy finds nothing to try on a compiled-SPA GWT app — it serves one shell for every path,
+                // no HTML <form>, no JSON /login. GwtRpcDiscovery.autoLogin resolves the correct GWT-RPC login
+                // method + its serialization policy via static call-graph tracing of the compiled client (never
+                // guesses/brute-forces against the live server) and submits exactly the credential pair the
+                // operator already gave it. No-op (fast) on any non-GWT target or when creds are unset.
+                if (!session.authenticated() && !session.hasBearer()) {
+                    String gEmail = System.getProperty("aiscanner.loginEmail",
+                            System.getenv("AISCANNER_LOGIN_EMAIL") == null ? "" : System.getenv("AISCANNER_LOGIN_EMAIL"));
+                    String gPass = System.getProperty("aiscanner.loginPassword",
+                            System.getenv("AISCANNER_LOGIN_PASSWORD") == null ? "" : System.getenv("AISCANNER_LOGIN_PASSWORD"));
+                    if (gEmail != null && !gEmail.isBlank() && gPass != null && !gPass.isBlank()) {
+                        String cookie = new com.ioactive.aiscanner.scan.GwtRpcDiscovery(api, scanLog).autoLogin(host, gEmail, gPass);
+                        if (cookie != null && !cookie.isBlank()) {
+                            session.set(cookie);
+                            session.setOwnIdentity(gEmail);
+                            for (String part : cookie.split(";")) {
+                                String s = part.trim(); int eq = s.indexOf('=');
+                                if (eq > 0) {
+                                    try {
+                                        api.http().cookieJar().setCookie(s.substring(0, eq).trim(), s.substring(eq + 1).trim(),
+                                                "/", host, ZonedDateTime.now().plusDays(1));
+                                    } catch (Exception ignore) { }
+                                }
+                            }
+                            scanLog.log("gwt-rpc: autonomous login succeeded with operator-supplied credentials "
+                                    + "(call-graph-resolved request — no manual cookie/payload needed).");
+                        }
+                    }
                 }
 
                 // CHEAPEST auth FIRST — a classic HTML login FORM (WordPress/DVWA/most CMSes) almost always takes
@@ -868,7 +896,6 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                                 if (!capLogged) {
                                     scanLog.log("default-creds: reached " + cap + " login-endpoint cap — stopping"
                                             + " (further aliases won't authenticate with default creds).");
-                                    capLogged = true;
                                 }
                                 break;
                             }
@@ -918,18 +945,17 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 // <script src> authenticated so EndpointDiscovery can mine their AJAX/data endpoints
                 // (where injectable vulns like SQLi live).
                 if (session.authenticated() && !wasAuthed) {
-                    // Now that we're authenticated, fence login/signin out of Burp's scope too — the
-                    // initial crawl already found login.html (that's how we authed), so from here on
-                    // Burp's crawler/scanner must never re-hit login/signin (each hit resets the session).
-                    excludeAuthPagesFromScope();
-
                     scanLog.phase("Re-crawling authenticated (general pass)");
                     scanLog.log("general authenticated pass over " + host + " …");
                     if (!scanner.communityEdition()) {
-                        var crawl2 = api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed));
-                        waitForCrawl(crawl2);
-                        logCrawlInventory(host, crawl2.requestCount());
-                        stopTask(crawl2, "authenticated crawl");
+                        var crawl2 = com.ioactive.aiscanner.scan.ScannerVerbFence.track(
+                                api.scanner().startCrawl(CrawlConfiguration.crawlConfiguration(seed)));
+                        try {
+                            waitForCrawl(crawl2);
+                            logCrawlInventory(host, crawl2.requestCount());
+                        } finally {
+                            stopTask(crawl2, "authenticated crawl");
+                        }
                     }
                     // ALWAYS run the session-carrying self-crawl too (BOTH editions, not just Community). Burp's
                     // native crawler does NOT read our captured session from the cookie jar at crawl start, so on Pro
@@ -1017,6 +1043,12 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.decrementAndGet();   // this scan ended → drop the live concurrent count
                 try { waf.summary(); } catch (Throwable ignore) { }
                 waf.close();
+                try {
+                    String vg = com.ioactive.aiscanner.scan.SafeHttp.summaryLine(
+                            Math.max(0, com.ioactive.aiscanner.engine.MontoyaLlmHttp.PARALLELISM.get()));   // already decremented: = other scans
+                    if (vg != null) scanLog.log(vg);
+                } catch (Throwable ignore) { }
+                com.ioactive.aiscanner.scan.ScannerVerbFence.close();
                 scanLog.setScanActive(false);   // scan finished/stopped → the Stop button goes inactive
             }
         }, "ais-crawl-scan");
@@ -1054,6 +1086,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
     private void stopTask(burp.api.montoya.scanner.Crawl task, String label) {
         try {
             task.delete();
+            com.ioactive.aiscanner.scan.ScannerVerbFence.untrack(task);   // deleted: it can no longer send
             scanLog.debug("stopped " + label + " task (audit runs alone).");
         } catch (Throwable t) {
             scanLog.debug("could not stop " + label + " task: " + t);
@@ -1071,9 +1104,12 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             Thread.sleep(3000);
             int c = pollCrawlCount(crawl, last);   // BOUNDED poll: a hung requestCount() must not defeat the deadline
             long elapsed = System.currentTimeMillis() - begin;
-            // requestCount stability = done, but only after a 45s floor so a JS-heavy / low-request crawl isn't
-            // declared finished instantly (statusMessage — the accurate signal — is unavailable on this build).
-            if (c == last) { if (++stable >= 6 && elapsed > 45000) break; } else { stable = 0; last = c; }
+            // requestCount stability = done, but only after a floor (default 45s) so a JS-heavy / low-request
+            // crawl isn't declared finished instantly (statusMessage — the accurate signal — is unavailable on
+            // this build). Configurable (Tuning.crawlStableFloorMs): a pure-JSON-API target crawls to 0 requests
+            // from the very first poll, so the floor is pure dead time there — lower it when the attack battery
+            // needs that time more than extra crawl patience (e.g. a short-lived-session target).
+            if (c == last) { if (++stable >= 6 && elapsed > com.ioactive.aiscanner.scan.Tuning.crawlStableFloorMs()) break; } else { stable = 0; last = c; }
             if (++ticks % 5 == 0) scanLog.debug("crawl… requests: " + c);
         }
         scanLog.log("crawl wait ended (requests stable / timeout).");
@@ -1178,11 +1214,21 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             }
 
             for (String[] cred : DEFAULT_CREDS) {
+                // Re-measure the "bad" control IMMEDIATELY before THIS candidate rather than reusing the single
+                // control captured once before the whole battery: edge/framework cookie churn over the course of
+                // a multi-credential run (CDN/WAF cookies, a rotating anti-CSRF cookie, …) can introduce a cookie
+                // name that first appears partway through the battery — unrelated to which credential is being
+                // tried — and the "a cookie the bad attempt didn't have" signal below would misattribute it to
+                // whichever candidate happened to run at that point (e.g. every attempt gets the identical 302 to
+                // a generic sign-in page, yet a late attempt is flagged because an unrelated cookie appeared
+                // mid-run — a false "Default/Weak Credentials"). Pairing each candidate with its own
+                // freshly-measured control cancels out any drift that isn't actually caused by the credential.
+                HttpRequestResponse freshBad = tryLogin(base, userParam, "zzinvalid_ai_x", passParam, "zzinvalid_ai_x");
                 HttpRequestResponse resp = tryLogin(base, userParam, cred[0], passParam, cred[1]);
                 int sc = status(resp);
                 scanLog.log("    try " + cred[0] + "/" + cred[1] + " → HTTP "
                         + sc + ", " + bodyLen(resp) + "b" + locSuffix(resp));
-                if (looksLikeSuccess(resp, bad, cred[0], cred[1])) {
+                if (looksLikeSuccess(resp, freshBad, cred[0], cred[1])) {
                     // Evidence = the successful login POST (carries the working credentials payload).
                     captureSession(resp, resp, hostOf(base.url()), cred[0], cred[1]);
                     return;
@@ -1205,7 +1251,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         // request or regenerate the session id on login (DVWA, PHP session_regenerate_id, Django, Rails) — the
         // login 302s to the landing yet the cookie stays unauthenticated, so every protected page bounces to login.
         // Generic for any token-bearing form.
-        HttpRequestResponse gr = api.http().sendRequest(
+        HttpRequestResponse gr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, 
                 HttpRequest.httpRequestFromUrl(base.url()).withMethod("GET"), RequestOptions.requestOptions().withResponseTimeout(12000L));
         String freshCookie = buildCookieHeader(gr);
         String body = base.bodyToString();
@@ -1222,7 +1268,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         }
         HttpRequest req = base.withBody(body);
         if (!freshCookie.isBlank()) req = req.withHeader("Cookie", freshCookie);
-        return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+        return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
     }
 
     /** Fresh value of a hidden anti-CSRF field from a just-fetched form (handles name-before-value and value-before-name). */
@@ -1278,7 +1324,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         List<HttpRequestResponse> out = new ArrayList<>();
         for (HttpRequest login : scanner.discoverAuthRequests(host)) {
             try {
-                HttpRequestResponse rr = api.http().sendRequest(login,
+                HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, login,
                         RequestOptions.requestOptions().withResponseTimeout(12000L));
                 if (rr == null || rr.response() == null) continue;
                 try { api.siteMap().add(rr); } catch (Exception ignore) { }   // so auditAuthPages covers it
@@ -1394,7 +1440,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             HttpRequest u = HttpRequest.httpRequestFromUrl(root + "/api/Users").withMethod("GET");
             if (session.has()) u = u.withHeader("Cookie", session.cookieHeader());
             if (session.hasBearer()) u = u.withHeader("Authorization", "Bearer " + session.bearer());
-            HttpRequestResponse rr = api.http().sendRequest(u, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            HttpRequestResponse rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, u, RequestOptions.requestOptions().withResponseTimeout(12000L));
             if (rr != null && rr.response() != null) {
                 Matcher m = EMAIL.matcher(rr.response().bodyToString());
                 while (m.find() && out.size() < 100) out.add(m.group().toLowerCase());
@@ -1408,7 +1454,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         if (userKey != null) body = replaceJsonValue(body, userKey, user);
         body = replaceJsonValue(body, passKey, pass);
         HttpRequest req = base.withBody(body);
-        return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+        return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
     }
 
     private static String replaceJsonValue(String body, String key, String value) {
@@ -1639,7 +1685,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             try {
                 HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
                 if (session.has()) req = req.withHeader("Cookie", session.cookieHeader());
-                rr = api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+                rr = com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
             } catch (Exception e) { return; }
             if (rr == null || rr.response() == null) return;
 
@@ -1866,12 +1912,18 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
             // field values). Generic; harmless if the send failed.
             if (bad != null && bad.request() != null) { try { api.siteMap().add(bad); } catch (Throwable ignore) { } }
             for (String[] cred : DEFAULT_CREDS) {
+                // Re-measure the control immediately before this candidate — see the site-1 battery above for why
+                // a single control snapshotted once before the whole run is unsafe (edge/framework cookie drift
+                // over a multi-credential battery can masquerade as "this credential gained a session").
+                HttpRequestResponse freshBad = csrf
+                        ? attemptFresh(pageUrl, actionUrl, svc, uf, pf, "zzinvalid_ai_x", "zzinvalid_ai_x")
+                        : postForm(actionUrl, svc, fields, uf, "zzinvalid_ai_x", pf, "zzinvalid_ai_x", cookie);
                 HttpRequestResponse resp = csrf
                         ? attemptFresh(pageUrl, actionUrl, svc, uf, pf, cred[0], cred[1])
                         : postForm(actionUrl, svc, fields, uf, cred[0], pf, cred[1], cookie);
                 scanLog.log("    try " + cred[0] + "/" + cred[1] + " → HTTP "
                         + status(resp) + ", " + bodyLen(resp) + "b" + locSuffix(resp));
-                if (looksLikeSuccess(resp, bad, cred[0], cred[1])) {
+                if (looksLikeSuccess(resp, freshBad, cred[0], cred[1])) {
                     // Evidence: ALWAYS the successful login POST (that's what proves the finding).
                     session.rememberLogin(pageUrl, cred[0], cred[1]);   // enable re-auth if crawl logs us out
                     captureSession(resp, resp, hostOf(actionUrl), cred[0], cred[1]);
@@ -1920,7 +1972,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (req.httpService() == null && svc != null) req = req.withService(svc);
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Exception e) {
             return null;
         }
@@ -1932,7 +1984,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
         try {
             HttpRequest req = HttpRequest.httpRequestFromUrl(url).withMethod("GET");
             if (session.has()) req = req.withHeader("Cookie", session.cookieHeader());
-            return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+            return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
         } catch (Exception e) {
             return null;
         }
@@ -1969,7 +2021,7 @@ public final class AiContextMenuProvider implements ContextMenuItemsProvider {
                 .withBody(body.toString());
         if (req.httpService() == null && svc != null) req = req.withService(svc);
         if (cookie != null && !cookie.isBlank()) req = req.withHeader("Cookie", cookie);
-        return api.http().sendRequest(req, RequestOptions.requestOptions().withResponseTimeout(12000L));
+        return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, RequestOptions.requestOptions().withResponseTimeout(12000L));
     }
 
     private static String attr(String tag, String name) {

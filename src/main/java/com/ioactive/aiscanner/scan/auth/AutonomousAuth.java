@@ -274,7 +274,7 @@ public final class AutonomousAuth {
             if (fetched >= 10) break;
             if (pages.containsKey(u)) continue;                  // already have this body from the site map
             try {
-                HttpRequestResponse rr = com.ioactive.aiscanner.scan.AiScanner.decompress(api.http().sendRequest(
+                HttpRequestResponse rr = com.ioactive.aiscanner.scan.AiScanner.decompress(com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, 
                         HttpRequest.httpRequestFromUrl(u),
                         burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(10000L)));
                 fetched++;
@@ -334,7 +334,7 @@ public final class AutonomousAuth {
                     HttpRequest req = HttpRequest.httpRequestFromUrl(turl).withMethod("POST")
                             .withAddedHeader("Content-Type", "application/x-www-form-urlencoded").withBody(form);
                     HttpRequestResponse rr = com.ioactive.aiscanner.scan.AiScanner.decompress(
-                            api.http().sendRequest(req, burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(12000L)));
+                            com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, req, burp.api.montoya.http.RequestOptions.requestOptions().withResponseTimeout(12000L)));
                     String body = bodyOf(rr);
                     if (body == null || !body.contains("access_token")) continue;
                     String tok = new JSONObject(body).optString("access_token", "");
@@ -499,7 +499,7 @@ public final class AutonomousAuth {
     }
 
     private HttpRequestResponse httpGet(String url) {
-        try { return api.http().sendRequest(HttpRequest.httpRequestFromUrl(url).withMethod("GET"),
+        try { return com.ioactive.aiscanner.scan.SafeHttp.sendRequest(api, HttpRequest.httpRequestFromUrl(url).withMethod("GET"),
                 RequestOptions.requestOptions().withResponseTimeout(15000L)); } catch (Throwable t) { return null; }
     }
     private org.json.JSONArray parseLoginSteps(String out) {
